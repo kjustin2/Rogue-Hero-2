@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/)",
+      "Bash(python -m http.server 8000)",
+      "Bash(claude mcp:*)",
+      "mcp__puppeteer__puppeteer_navigate",
+      "mcp__puppeteer__puppeteer_screenshot",
+      "mcp__puppeteer__puppeteer_click",
+      "mcp__puppeteer__puppeteer_evaluate",
+      "Bash(node -c src/state.js)",
+      "Bash(node -c src/tempo.js)",
+      "Bash(node -c src/effects.js)",
+      "Bash(node -c src/room.js)",
+      "Bash(node -c src/enemies.js)",
+      "Bash(node -c src/player.js)",
+      "Bash(node -c src/ui.js)",
+      "Bash(node -c src/main.js)",
+      "Bash(node -c src/pressure.js)",
+      "Bash(grep -o \"Effects\\\\.[a-zA-Z_]*\" /e/Storage/SAAS/Rogue-Hero/src/*.js)",
+      "Bash(grep -o \"Tempo\\\\.[a-zA-Z_]*\" /e/Storage/SAAS/Rogue-Hero/src/*.js)",
+      "Bash(grep -o \"RunState\\\\.items\\\\.includes\\(''''[^'''']*''''\\)\" /e/Storage/SAAS/Rogue-Hero/src/*.js)",
+      "Bash(grep -o \"Player\\\\.[a-zA-Z_]*\" /e/Storage/SAAS/Rogue-Hero/src/*.js)",
+      "Bash(node --check src/state.js src/tempo.js src/effects.js src/room.js src/enemies.js src/player.js src/ui.js src/main.js)",
+      "Bash(node --input-type=module --experimental-vm-modules)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('index.html'\\)\")",
+      "Bash(node -e ':*)",
+      "Bash(node --experimental-vm-modules -e ':*)",
+      "Bash(node --input-type=module --eval \"import\\('./src/DeckManager.js'\\).then\\(m => { const keys = Object.keys\\(m.CardDefinitions\\); console.log\\('Cards:', keys.length\\); const missing = keys.filter\\(k => !m.CardDefinitions[k].rarity\\); console.log\\('Missing rarity:', missing\\); }\\).catch\\(e => console.error\\(e\\)\\)\")",
+      "Bash(node --input-type=module --eval \"import\\('./src/Enemy.js'\\).then\\(m => console.log\\('Enemy exports:', Object.keys\\(m\\).join\\(', '\\)\\)\\).catch\\(e => console.error\\(e\\)\\)\")",
+      "Bash(node --input-type=module --eval \"import\\('./src/tempo.js'\\).then\\(m => { const t = new m.TempoSystem\\(\\); console.log\\('DECAY_RATE:', t.DECAY_RATE\\); }\\).catch\\(e => console.error\\(e\\)\\)\")",
+      "Bash(node --input-type=module --eval \"import\\('./src/Particles.js'\\).then\\(m => { const p = new m.ParticleSystem\\(\\); console.log\\('Has spawnRoomEntryFlash:', typeof p.spawnRoomEntryFlash, '| Has spawnCrashFlash:', typeof p.spawnCrashFlash\\); }\\).catch\\(e => console.error\\(e\\)\\)\")",
+      "Bash(node check-syntax.js)",
+      "Bash(ls src/*.js)",
+      "Bash(grep -v \"//\")",
+      "Bash(wc -l /e/Storage/SAAS/Rogue-Hero/src/*.js)",
+      "Bash(python3:*)"
+    ]
+  },
+  "prefersReducedMotion": true
+}

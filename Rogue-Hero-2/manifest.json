@@ -1,0 +1,10 @@
+{
+  "name": "Rogue Hero",
+  "short_name": "RogueHero",
+  "start_url": ".",
+  "display": "fullscreen",
+  "background_color": "#0a0a12",
+  "theme_color": "#0a0a12",
+  "description": "A tempo-driven roguelike deck builder",
+  "icons": []
+}

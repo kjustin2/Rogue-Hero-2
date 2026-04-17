@@ -1,0 +1,53 @@
+{
+  "name": "rogue-hero",
+  "version": "1.0.0",
+  "description": "A tempo-driven roguelike deck builder",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --publish never",
+    "dist:mac": "electron-builder --mac --publish never",
+    "dist:linux": "electron-builder --linux --publish never"
+  },
+  "build": {
+    "appId": "com.roguehero.game",
+    "productName": "Rogue Hero",
+    "copyright": "Copyright © 2026",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "index.html",
+      "style.css",
+      "manifest.json",
+      "src/**/*",
+      "imgs/**/*",
+      "music/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "imgs/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "imgs/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "imgs/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "imgs/icon.ico",
+      "shortcutName": "Rogue Hero"
+    }
+  },
+  "devDependencies": {
+    "electron": "^34.0.0",
+    "electron-builder": "^25.0.0"
+  }
+}

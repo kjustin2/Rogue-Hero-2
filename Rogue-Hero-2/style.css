@@ -1,0 +1,15 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { 
+  background: radial-gradient(circle at center, #1a1a24 0%, #0d0d12 100%); 
+  display: flex; justify-content: center; align-items: center; 
+  height: 100vh; overflow: hidden; 
+}
+canvas { 
+  display: block; 
+  image-rendering: auto; 
+  max-width: 100vw; 
+  max-height: 100vh;
+  box-shadow: 0 0 30px rgba(0, 0, 0, 0.8), 0 0 100px rgba(68, 170, 255, 0.05);
+  border: 1px solid #222233;
+  border-radius: 8px;
+}
