@@ -141,23 +141,37 @@ export class ProjectileManager {
         if (shouldRemove) { this._remove(i); continue; }
       }
 
-      // Enemy/boss projectile hits player (skip if dodging — i-frames)
-      if (p.source !== 'player' && player && player.alive && !player.dodging) {
-        const dx = p.x - player.x, dy = p.y - player.y;
-        if (dx * dx + dy * dy < (p.r + player.r) * (p.r + player.r)) {
-          events.emit('ENEMY_MELEE_HIT', { damage: p.damage, source: p });
+      // Enemy/boss projectile hits any alive player (skip if dodging — i-frames)
+      // RH2: `player` can be a single player or an array (local co-op)
+      const _targets = Array.isArray(player) ? player : (player ? [player] : []);
+      let _hitPlayer = null;
+      if (p.source !== 'player') {
+        for (const _pl of _targets) {
+          if (!_pl.alive || _pl.dodging) continue;
+          const dx = p.x - _pl.x, dy = p.y - _pl.y;
+          if (dx * dx + dy * dy < (p.r + _pl.r) * (p.r + _pl.r)) {
+            _hitPlayer = _pl;
+            break;
+          }
+        }
+        if (_hitPlayer) {
+          events.emit('ENEMY_MELEE_HIT', { damage: p.damage, source: p, target: _hitPlayer });
           this._remove(i);
           continue;
         }
       }
 
       // Perfect dodge detection — projectile passes through player during i-frames (once per projectile)
-      if (player && player.alive && player.dodging && !p.nearMissTriggered) {
-        const dx = p.x - player.x, dy = p.y - player.y;
-        const threshold = p.r + player.r + 22;
-        if (dx * dx + dy * dy < threshold * threshold) {
-          p.nearMissTriggered = true;
-          events.emit('NEAR_MISS_PROJECTILE', { x: p.x, y: p.y });
+      if (!p.nearMissTriggered) {
+        for (const _pl of _targets) {
+          if (!_pl.alive || !_pl.dodging) continue;
+          const dx = p.x - _pl.x, dy = p.y - _pl.y;
+          const threshold = p.r + _pl.r + 22;
+          if (dx * dx + dy * dy < threshold * threshold) {
+            p.nearMissTriggered = true;
+            events.emit('NEAR_MISS_PROJECTILE', { x: p.x, y: p.y, target: _pl });
+            break;
+          }
         }
       }
     }

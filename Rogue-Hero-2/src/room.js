@@ -103,9 +103,33 @@ export class RoomManager {
   }
 
   _getThemeColors() {
+    // RH2: prefer biome palette when set; falls back to legacy theme rotation.
+    if (this.biome && this.biome.palette) {
+      const p = this.biome.palette;
+      // Background = darker than floor; pillarStroke = brighter accent variant
+      const bg = this._darker(p.floor, 0.55);
+      return {
+        bg,
+        floor: p.floor,
+        grid: p.grid,
+        pillar: p.pillar,
+        pillarStroke: p.accent,
+        accent: p.accent,
+      };
+    }
     if (this.theme === 1) return { bg: '#1a1820', floor: '#12110e', grid: 'rgba(255,200,100,0.025)', pillar: '#332a1e', pillarStroke: '#554422' };
     if (this.theme === 2) return { bg: '#1a1424', floor: '#0e0a14', grid: 'rgba(180,100,255,0.025)', pillar: '#2a1e33', pillarStroke: '#442255' };
     return { bg: '#1a1a24', floor: '#0e0e14', grid: 'rgba(255,255,255,0.03)', pillar: '#222233', pillarStroke: '#334455' };
+  }
+
+  _darker(hex, k) {
+    const m = /^#([0-9a-f]{6})$/i.exec(hex);
+    if (!m) return hex;
+    const v = parseInt(m[1], 16);
+    const r = Math.max(0, Math.floor(((v >> 16) & 0xff) * k));
+    const g = Math.max(0, Math.floor(((v >>  8) & 0xff) * k));
+    const b = Math.max(0, Math.floor((v        & 0xff) * k));
+    return '#' + ((r << 16) | (g << 8) | b).toString(16).padStart(6, '0');
   }
 
   _buildGridCache() {

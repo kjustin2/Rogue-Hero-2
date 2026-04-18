@@ -10,6 +10,18 @@ export class InputManager {
     this.touchJoystick = { active: false, startX: 0, startY: 0, dx: 0, dy: 0 };
     this.touchButtons = [];
 
+    // Gamepad state — populated by pollGamepads() each frame
+    this._gpState = [null, null, null, null];
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('gamepadconnected', e => {
+        console.log('[Input] Gamepad connected:', e.gamepad?.id || '?');
+      });
+      window.addEventListener('gamepaddisconnected', e => {
+        console.log('[Input] Gamepad disconnected:', e.gamepad?.id || '?');
+      });
+    }
+
     window.addEventListener('keydown', e => {
       const k = e.key.toLowerCase();
       this.keys.add(k);
@@ -133,19 +145,100 @@ export class InputManager {
       if (key === 'w' || key === 'arrowup')    return this.touchJoystick.dy < -deadzone;
       if (key === 's' || key === 'arrowdown')  return this.touchJoystick.dy > deadzone;
     }
+    // Map gamepad #0 left stick → P1's arrows
+    const gp0 = this._gpState[0];
+    if (gp0 && gp0.connected) {
+      const dz = 0.30;
+      if (key === 'arrowleft'  && gp0.lx < -dz) return true;
+      if (key === 'arrowright' && gp0.lx >  dz) return true;
+      if (key === 'arrowup'    && gp0.ly < -dz) return true;
+      if (key === 'arrowdown'  && gp0.ly >  dz) return true;
+    }
+    // Gamepad #1 left stick → P2's WASD
+    const gp1 = this._gpState[1];
+    if (gp1 && gp1.connected) {
+      const dz = 0.30;
+      if (key === 'a' && gp1.lx < -dz) return true;
+      if (key === 'd' && gp1.lx >  dz) return true;
+      if (key === 'w' && gp1.ly < -dz) return true;
+      if (key === 's' && gp1.ly >  dz) return true;
+    }
     return false;
   }
 
-  // ── RH2: Player-2 view (arrow keys + numpad). Returns an object that
-  // looks enough like the primary InputManager that player.updateLogic
-  // can run unchanged. mouse.x/y track the P2 reticle (numpad-aimed).
-  // P2 controls:
-  //   movement: arrow keys
-  //   dodge: rshift (Right Shift) — Space stays for P1
-  //   aim: numpad 4/8/6/2 (or hold-and-rotate), reticle follows P2
-  //   fire: numpad 0
-  //   cycle card: numpad . (period)
-  //   card slots: numpad 1/2/3/4
+  // RH2: poll connected gamepads each frame. P1 = pad 0, P2 = pad 1.
+  // Buttons: A(0)=attack, B(1)=dodge, X(2)=card prev, Y(3)=card next.
+  // Right stick on pad 0 moves the mouse cursor for aim.
+  pollGamepads() {
+    if (!this._gpState) this._gpState = [null, null, null, null];
+    const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
+    for (let i = 0; i < 4; i++) {
+      const pad = pads && pads[i];
+      const prev = this._gpState[i];
+      if (!pad || !pad.connected) {
+        if (prev) this._gpState[i] = { connected: false, lx: 0, ly: 0, btns: [] };
+        continue;
+      }
+      const lx = pad.axes[0] || 0;
+      const ly = pad.axes[1] || 0;
+      const rx = pad.axes[2] || 0;
+      const ry = pad.axes[3] || 0;
+      const btns = pad.buttons.map(b => !!b.pressed);
+      const prevBtns = (prev && prev.btns) || [];
+      const newState = { connected: true, lx, ly, rx, ry, btns };
+      this._gpState[i] = newState;
+
+      // Edge-trigger buttons → justPressed map
+      // P1 (pad 0) uses ' ' for dodge and 1-4/cards; P2 (pad 1) uses 'e'/'q'/1-4
+      const isP1 = i === 0;
+      const dodgeKey = isP1 ? ' ' : 'e';
+      const fireKey  = isP1 ? null : 'q';   // P1 fires via mouse click below
+      const cardKeys = isP1 ? ['7','8','9','0'] : ['1','2','3','4'];
+
+      // A button (idx 0)
+      if (btns[0] && !prevBtns[0]) {
+        if (isP1) {
+          this.mouse.justClicked = true;
+          this.mouse.leftDown = true;
+        } else if (fireKey) {
+          this.justPressed.add(fireKey);
+        }
+      } else if (!btns[0] && prevBtns[0] && isP1) {
+        this.mouse.leftDown = false;
+      }
+      // B button (idx 1) → dodge
+      if (btns[1] && !prevBtns[1]) this.justPressed.add(dodgeKey);
+      // X / Y → cycle card slot
+      if (btns[2] && !prevBtns[2]) this.justPressed.add(cardKeys[0]);
+      if (btns[3] && !prevBtns[3]) this.justPressed.add(cardKeys[1]);
+      // Bumpers (4/5) → card 3/4
+      if (btns[4] && !prevBtns[4]) this.justPressed.add(cardKeys[2]);
+      if (btns[5] && !prevBtns[5]) this.justPressed.add(cardKeys[3]);
+
+      // Right stick on P1's pad → move the mouse cursor for aim
+      if (isP1 && this.canvas) {
+        const mag2 = rx * rx + ry * ry;
+        if (mag2 > 0.04) {
+          const speed = 12; // px/frame at full deflection
+          this.mouse.x = Math.max(0, Math.min(this.canvas.width,  this.mouse.x + rx * speed));
+          this.mouse.y = Math.max(0, Math.min(this.canvas.height, this.mouse.y + ry * speed));
+        }
+      }
+    }
+  }
+
+  // True if any gamepad is currently connected (UI hint)
+  hasGamepad() {
+    if (!this._gpState) return false;
+    return this._gpState.some(g => g && g.connected);
+  }
+
+  // ── RH2: Player-2 view (left-hand cluster, no mouse).
+  //   movement: W A S D
+  //   aim:      auto — toward nearest alive enemy (set by updateP2Reticle)
+  //   attack:   Q   (becomes p2View.mouse.justClicked)
+  //   dodge:    E   (mapped from consumeKey(' '))
+  //   cards:    1 / 2 / 3 / 4 → consumeKey('1'..'4') passes through directly
   player2View() {
     const self = this;
     if (this._p2View) return this._p2View;
@@ -153,16 +246,16 @@ export class InputManager {
       _aimX: 0, _aimY: 0,
       mouse: { x: 0, y: 0, leftDown: false, rightDown: false, justClicked: false, justRightClicked: false },
       isDown(key) {
-        // remap WASD calls in player.js to arrow keys
-        if (key === 'a' || key === 'arrowleft')  return self.keys.has('arrowleft');
-        if (key === 'd' || key === 'arrowright') return self.keys.has('arrowright');
-        if (key === 'w' || key === 'arrowup')    return self.keys.has('arrowup');
-        if (key === 's' || key === 'arrowdown')  return self.keys.has('arrowdown');
+        // P2 owns WASD only — never arrows
+        if (key === 'a') return self.keys.has('a');
+        if (key === 'd') return self.keys.has('d');
+        if (key === 'w') return self.keys.has('w');
+        if (key === 's') return self.keys.has('s');
+        // Block arrow lookups so player.js movement check never reads P1's keys
         return false;
       },
       consumeKey(key) {
-        // Space → numpad 5 / RShift for P2 dodge
-        if (key === ' ') return self._consumeAny(['shift', 'numpad5']);
+        if (key === ' ') return self._consumeAny(['e']);  // P2 dodge
         return self.consumeKey(key);
       },
     };
@@ -170,37 +263,44 @@ export class InputManager {
     return view;
   }
 
-  // Update P2 reticle relative to a player position; called each frame
-  // by main.js with players.list[1] before player2.updateLogic.
-  updateP2Reticle(p2, dt) {
+  // Update P2 reticle: auto-aim toward the closest alive enemy.
+  // Called each frame by main.js before p2.updateLogic, with the enemies list.
+  updateP2Reticle(p2, dt, enemies) {
     if (!this._p2View) return;
     const v = this._p2View;
-    let dx = 0, dy = 0;
-    if (this.keys.has('numpad4')) dx -= 1;
-    if (this.keys.has('numpad6')) dx += 1;
-    if (this.keys.has('numpad8')) dy -= 1;
-    if (this.keys.has('numpad2')) dy += 1;
-    // Move reticle relative to p2; default 220 px ahead of P2
     if (!v._aimInit) { v._aimX = p2.x + 60; v._aimY = p2.y; v._aimInit = true; }
-    if (dx || dy) {
-      const len = Math.sqrt(dx * dx + dy * dy);
-      v._aimX += (dx / len) * 600 * dt;
-      v._aimY += (dy / len) * 600 * dt;
+    // Find closest alive enemy
+    let target = null, bestD = Infinity;
+    if (enemies) {
+      for (const e of enemies) {
+        if (!e.alive || e._dying) continue;
+        const dx = e.x - p2.x, dy = e.y - p2.y;
+        const d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; target = e; }
+      }
     }
-    // Keep reticle near P2 (radius cap)
-    const rdx = v._aimX - p2.x, rdy = v._aimY - p2.y;
-    const d = Math.sqrt(rdx * rdx + rdy * rdy);
-    const max = 320;
-    if (d > max) { v._aimX = p2.x + (rdx / d) * max; v._aimY = p2.y + (rdy / d) * max; }
+    if (target) {
+      // Smooth-chase the target so the reticle isn't snappy
+      const tx = target.x, ty = target.y;
+      const lerp = Math.min(1, dt * 8);
+      v._aimX += (tx - v._aimX) * lerp;
+      v._aimY += (ty - v._aimY) * lerp;
+    } else {
+      // Idle: park reticle slightly ahead of P2's facing
+      const tx = p2.x + 80, ty = p2.y;
+      const lerp = Math.min(1, dt * 4);
+      v._aimX += (tx - v._aimX) * lerp;
+      v._aimY += (ty - v._aimY) * lerp;
+    }
     v.mouse.x = v._aimX; v.mouse.y = v._aimY;
-    // Fire: numpad 0
-    if (this.justPressed.has('numpad0')) {
-      this.justPressed.delete('numpad0');
+    // Q press → fire selected card
+    if (this.justPressed.has('q')) {
+      this.justPressed.delete('q');
       v.mouse.justClicked = true;
       v.mouse.leftDown = true;
     } else {
       v.mouse.justClicked = false;
-      v.mouse.leftDown = this.keys.has('numpad0');
+      v.mouse.leftDown = this.keys.has('q');
     }
   }
 

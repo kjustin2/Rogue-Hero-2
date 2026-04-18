@@ -74,13 +74,19 @@ export class Player extends Entity {
       }
     }
 
-    // Movement
+    // Movement — input scheme controls which keys are accepted:
+    //   'arrows' = arrows only (P1 in 2P co-op)
+    //   'wasd'   = WASD only (P2 in 2P co-op — uses player2View)
+    //   'both' (default) = arrows + WASD (solo)
     if (!this.dodging) {
       let mx = 0, my = 0;
-      if (input.isDown('a') || input.isDown('arrowleft'))  mx -= 1;
-      if (input.isDown('d') || input.isDown('arrowright')) mx += 1;
-      if (input.isDown('w') || input.isDown('arrowup'))    my -= 1;
-      if (input.isDown('s') || input.isDown('arrowdown'))  my += 1;
+      const scheme = this._inputScheme || 'both';
+      const wantArrows = scheme === 'both' || scheme === 'arrows';
+      const wantWASD   = scheme === 'both' || scheme === 'wasd';
+      if ((wantWASD && input.isDown('a')) || (wantArrows && input.isDown('arrowleft')))  mx -= 1;
+      if ((wantWASD && input.isDown('d')) || (wantArrows && input.isDown('arrowright'))) mx += 1;
+      if ((wantWASD && input.isDown('w')) || (wantArrows && input.isDown('arrowup')))    my -= 1;
+      if ((wantWASD && input.isDown('s')) || (wantArrows && input.isDown('arrowdown')))  my += 1;
 
       if (mx !== 0 || my !== 0) {
         const len = Math.sqrt(mx * mx + my * my);
@@ -93,8 +99,9 @@ export class Player extends Entity {
         this.vy = 0;
       }
 
-      // Dodge trigger (disabled while downed)
-      if (!this.downed && input.consumeKey(' ') && this.dodgeCooldown <= 0) {
+      // Dodge trigger (disabled while downed) — _dodgeKey defaults to space
+      const dodgeKey = this._dodgeKey || ' ';
+      if (!this.downed && input.consumeKey(dodgeKey) && this.dodgeCooldown <= 0) {
         const fortifiedDodge = this.classPassives && this.classPassives.fortifiedDodge;
         // Can't dodge in Critical (90+) unless Fortified Dodge
         if (tempo.value >= 90 && !fortifiedDodge) {

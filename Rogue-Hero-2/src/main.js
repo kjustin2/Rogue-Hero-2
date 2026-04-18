@@ -8,7 +8,7 @@ import { TempoSystem } from './tempo.js';
 import { CombatManager } from './Combat.js';
 import { ParticleSystem } from './Particles.js';
 import { AudioSynthesizer } from './audio.js';
-import { UI } from './ui.js';
+import { UI, rangeLabel } from './ui.js';
 import { RoomManager } from './room.js';
 import { DeckManager, CardDefinitions, CARD_UNLOCK_TIERS } from './DeckManager.js';
 import { RunManager } from './RunManager.js';
@@ -24,6 +24,8 @@ import { Biomes, pickBiomeForFloor } from './Biomes.js';
 import { Net } from './net/Net.js';
 import { HostSim } from './net/HostSim.js';
 import { Lobby } from './net/Lobby.js';
+import { SnapshotDecoder } from './net/Snapshot.js';
+import { Reconcile } from './net/Reconcile.js';
 import { TetherWitch, MireToad, Bloomspawn, IronChoir, StaticHound, BossHollowKing, BossVaultEngine, BossAurora } from './EnemiesRH2.js';
 
 // Expose defs for UI (avoids circular imports)
@@ -131,6 +133,8 @@ console.log('[Init] All systems created. Cards:', Object.keys(CardDefinitions).l
 audio.setMasterVolume(meta.getMasterVolume());
 
 let player = new Player(400, 360);
+player.id = 'p1';            // RH2: stable id for net snapshots / Reconcile
+player.playerIndex = 0;
 let enemies = [];
 combat.setLists(enemies, player);
 
@@ -145,6 +149,31 @@ const spatialHash = new SpatialHash(64);
 const net = new Net({ role: 'solo' });
 const lobby = new Lobby(net);
 const hostSim = new HostSim(net);
+const snapDecoder = new SnapshotDecoder();
+const reconcile = new Reconcile();
+// Apply incoming position snapshots to the player & remote-entity placeholders.
+// Solo: never fires (Net.connect is no-op).
+net.on('snap', (snap) => {
+  // Hosts are authoritative — they should never reconcile against
+  // an incoming snapshot of themselves.
+  if (net.role === 'host') return;
+  if (!snap || !snap.e) return;
+  snapDecoder.apply(snap);
+  // Reconcile own player against the host's authoritative position
+  if (player && player.id) {
+    const own = snapDecoder.positions.get(player.id);
+    if (own) reconcile.applyOwn(player, own.x, own.y, snap.n || 0);
+  }
+  // Smoothly interpolate any remote allies present in the snapshot
+  if (players.count > 1) {
+    for (let i = 1; i < players.list.length; i++) {
+      const p = players.list[i];
+      if (!p || !p.id) continue;
+      const remote = snapDecoder.positions.get(p.id);
+      if (remote) reconcile.interpolateRemote(p, remote);
+    }
+  }
+});
 let localCoop = false;             // toggled by F2 in char select
 let currentBiome = Biomes.verdant; // updated per floor in startNewRun
 window._biome = currentBiome;
@@ -169,6 +198,7 @@ const FLOORS_TO_WIN = 5;
 
 // Active card slot (left-click fires this, right-click cycles)
 let selectedCardSlot = 0;
+let selectedCardSlotP2 = 0;
 
 // Slow-mo state
 let slowMoTimer = 0;
@@ -207,6 +237,15 @@ let playerDeathTimer = 0;
 let _victoryAnimStart = null; // timestamp when victory state began
 let _victoryReady = false;    // player can advance after 2.5s
 
+// RH2: brief edge-glow when Group Tempo Resonance activates
+let _resonanceFlashTimer = 0;
+
+// RH2 multiplayer lobby state
+let lobbyMode = 'menu';          // 'menu' | 'hosting' | 'joining'
+let lobbyJoinCode = '';          // text being typed for join
+let lobbyStatusMsg = '';         // bottom-line status text
+let lobbyBoxes = [];
+
 // Cosmetics state
 let lootBoxOpen = null;         // { boxTier, result, elapsed, isSL, waitingDismiss }
 let cosmeticPanelCharId = null;
@@ -217,6 +256,31 @@ let seenZones = new Set();
 let zoneTooltip = null; // { text, color, timer }
 
 // ── Visual systems ────────────────────────────────────────────────
+// RH2: cached background canvas for menu screens (intro/charSelect/lobby)
+// share the same gradient + radial accents. Rebuilt only on resize.
+let _menuBgCanvas = null;
+let _menuBgKey = '';
+function getMenuBackground() {
+  const key = canvas.width + 'x' + canvas.height;
+  if (_menuBgCanvas && _menuBgKey === key) return _menuBgCanvas;
+  const off = document.createElement('canvas');
+  off.width = canvas.width; off.height = canvas.height;
+  const c = off.getContext('2d');
+  const g = c.createLinearGradient(0, 0, 0, canvas.height);
+  g.addColorStop(0, '#08111a');
+  g.addColorStop(0.6, '#0a0f22');
+  g.addColorStop(1, '#160a1a');
+  c.fillStyle = g; c.fillRect(0, 0, canvas.width, canvas.height);
+  const rg1 = c.createRadialGradient(canvas.width * 0.22, canvas.height * 0.30, 20, canvas.width * 0.22, canvas.height * 0.30, 420);
+  rg1.addColorStop(0, 'rgba(64,200,200,0.18)'); rg1.addColorStop(1, 'rgba(64,200,200,0)');
+  c.fillStyle = rg1; c.fillRect(0, 0, canvas.width, canvas.height);
+  const rg2 = c.createRadialGradient(canvas.width * 0.78, canvas.height * 0.72, 20, canvas.width * 0.78, canvas.height * 0.72, 460);
+  rg2.addColorStop(0, 'rgba(200,140,80,0.14)'); rg2.addColorStop(1, 'rgba(200,140,80,0)');
+  c.fillStyle = rg2; c.fillRect(0, 0, canvas.width, canvas.height);
+  _menuBgCanvas = off; _menuBgKey = key;
+  return off;
+}
+
 // Menu/charSelect ambient floating particles (small pool, reused)
 const MENU_PARTICLE_COUNT = 28;
 const _menuParts = Array.from({ length: MENU_PARTICLE_COUNT }, (_, i) => ({
@@ -301,54 +365,61 @@ events.on('PLAYER_SHOT_HIT', ({ enemy, damage, freeze, clusterAoE, executeLowSho
   }
 });
 
-events.on('ENEMY_MELEE_HIT', ({ damage, source }) => {
-  if (!player.alive) return; // Ignore hits on already-dead player
+events.on('ENEMY_MELEE_HIT', ({ damage, source, target }) => {
+  // RH2: route to the hit player (P1 or P2 in local co-op). Default to P1.
+  const tgt = target || (source && source._currentTarget) || player;
+  if (!tgt.alive) return; // Ignore hits on already-dead player
   // Parry check
-  if (player.parryWindow && player.parryWindow.timer > 0) {
-    player.parryWindow.timer = 0;
-    events.emit('COUNTER_STRIKE', { source, power: player.parryWindow.power, def: player.parryWindow.def });
-    particles.spawnDamageNumber(player.x, player.y - 30, 'PARRY!');
+  if (tgt.parryWindow && tgt.parryWindow.timer > 0) {
+    tgt.parryWindow.timer = 0;
+    events.emit('COUNTER_STRIKE', { source, power: tgt.parryWindow.power, def: tgt.parryWindow.def });
+    particles.spawnDamageNumber(tgt.x, tgt.y - 30, 'PARRY!');
     events.emit('HIT_STOP', 0.15);
     events.emit('SCREEN_SHAKE', { duration: 0.2, intensity: 0.3 });
     events.emit('PLAY_SOUND', 'perfect');
     return;
   }
-  // Blood Rune sigil trigger
-  for (let si = sigils.length - 1; si >= 0; si--) {
-    if (sigils[si].def.sigilTrigger === 'takeDamage' && !sigils[si].triggered) {
-      sigils[si].triggered = true;
-      player.heal(2);
-      tempo._add(30);
-      particles.spawnDamageNumber(player.x, player.y - 40, 'BLOOD RUNE!');
-      particles.spawnBurst(player.x, player.y, '#ff2255');
+  // Blood Rune sigil trigger (P1 only — sigils belong to the host run)
+  if (tgt === player) {
+    for (let si = sigils.length - 1; si >= 0; si--) {
+      if (sigils[si].def.sigilTrigger === 'takeDamage' && !sigils[si].triggered) {
+        sigils[si].triggered = true;
+        tgt.heal(2);
+        tempo._add(30);
+        particles.spawnDamageNumber(tgt.x, tgt.y - 40, 'BLOOD RUNE!');
+        particles.spawnBurst(tgt.x, tgt.y, '#ff2255');
+      }
     }
   }
   damage = Math.round(damage * (DIFFICULTY_MODS[selectedDifficulty]?.dmgMult || 1));
-  const passives = Characters[selectedCharId]?.passives;
+  const charId = tgt._charId || selectedCharId;
+  const passives = Characters[charId]?.passives;
   // Frost Cold damage reduction
   if (passives?.coldDamageReduction && tempo.value < 30) {
     damage = Math.round(damage * (1 - passives.coldDamageReduction));
   }
   // Vanguard Guard stack damage reduction
-  if (passives?.ironGuard && player.guardStacks > 0) {
+  if (passives?.ironGuard && tgt.guardStacks > 0) {
     const reduction = Math.min(damage, passives.guardDamageReduction || 2);
     damage = Math.max(0, damage - reduction);
-    player.guardStacks--;
-    player._guardDecayTimer = 0;
-    particles.spawnDamageNumber(player.x, player.y - 20, 'GUARD');
+    tgt.guardStacks--;
+    tgt._guardDecayTimer = 0;
+    particles.spawnDamageNumber(tgt.x, tgt.y - 20, 'GUARD');
   }
-  player.takeDamage(damage);
+  tgt.takeDamage(damage);
   // Vanguard: build guard stack on hit
   if (passives?.ironGuard && damage > 0) {
-    if (player.guardStacks === undefined) player.guardStacks = 0;
-    player.guardStacks = Math.min(player.guardStacks + 1, passives.maxGuardStacks || 4);
-    player._guardDecayTimer = 0;
+    if (tgt.guardStacks === undefined) tgt.guardStacks = 0;
+    tgt.guardStacks = Math.min(tgt.guardStacks + 1, passives.maxGuardStacks || 4);
+    tgt._guardDecayTimer = 0;
   }
   // DAMAGE_TAKEN is emitted by player.takeDamage() for Frost passive
   particles.spawnKillFlash('#ff2222');
   events.emit('HIT_STOP', 0.08);
   events.emit('SCREEN_SHAKE', { duration: 0.2, intensity: 0.4 });
   renderer.triggerCA();
+  // Game-over only when P1 dies (P2 just goes downed; players.update handles revive)
+  if (tgt !== player) return;
   if (!player.alive) {
     // Wraith Undying: first death per room revives at 1 HP + crash
     if (passives?.undying && !player._undyingUsed) {
@@ -599,6 +670,9 @@ function startNewRun() {
   player.charId = selectedCharId;
   player.haloColor = PLAYER_HALO_COLORS[0];
   player._coopMode = !!localCoop;
+  // Coop input scheme: P1 → arrows + mouse + '/' dodge. Solo → both schemes + space dodge.
+  player._inputScheme = localCoop ? 'arrows' : 'both';
+  player._dodgeKey    = localCoop ? '/' : ' ';
 
   // RH2: rebuild Players list. P2 (and beyond) get the same character
   // for now; the lobby UI will let users pick separate chars later.
@@ -607,6 +681,8 @@ function startNewRun() {
   if (localCoop) {
     const p2 = makePlayer(charDef, 500, 360);
     p2._coopMode = true;
+    p2._inputScheme = 'wasd';
+    p2._dodgeKey    = ' '; // player2View maps consumeKey(' ') → 'e'
     players.add(p2);
   }
   window._players = players;
@@ -992,6 +1068,10 @@ function handleCombatClear() {
     runManager.floor++;
     console.log(`[Run] Floor cleared! Now Floor ${runManager.floor}`);
     runManager.generateMap();
+    // RH2: re-pick biome for the new floor so palette updates per zone
+    currentBiome = pickBiomeForFloor(runManager.floor, runManager.getRng());
+    window._biome = currentBiome;
+    if (room) room.biome = currentBiome;
   }
   currentCombatNode = null;
 
@@ -1127,7 +1207,7 @@ function handleEvent(choiceIdx) {
         if (deckManager.collection.length > 1) {
           const sold = deckManager.collection[0];
           deckManager.removeCard(sold);
-          player.heal(3);
+          healAllPlayers(3);
           particles.spawnDamageNumber(player.x || 640, 300, `Sold "${CardDefinitions[sold]?.name || sold}" +3 HP`);
           events.emit('PLAY_SOUND', 'upgrade');
         }
@@ -1153,7 +1233,7 @@ function handleEvent(choiceIdx) {
         if (upgradeChoices.length > 0) { gameState = 'upgrade'; return; }
         break;
       case 1: // Forge warmth — heal 1 HP
-        player.heal(1);
+        healAllPlayers(1);
         break;
       case 2: break; // pass
     }
@@ -1173,15 +1253,26 @@ function handleEvent(choiceIdx) {
         }
         break;
       case 1: // Heal 2 HP
-        player.heal(2);
+        healAllPlayers(2);
         break;
       case 2: // Gamble (BUG-06: seeded RNG)
-        if (runManager.getRng()() < 0.5) { player.heal(2); }
+        if (runManager.getRng()() < 0.5) { healAllPlayers(2); }
         else { player.hp = Math.max(1, player.hp - 1); }
         break;
     }
   }
   gameState = 'map';
+}
+
+// RH2: out-of-combat healing (rest nodes, events) heals every alive co-op player.
+function healAllPlayers(amt) {
+  player.heal(amt);
+  if (players.count > 1) {
+    for (let i = 1; i < players.list.length; i++) {
+      const p = players.list[i];
+      if (p && p.alive) p.heal(amt);
+    }
+  }
 }
 
 // Track healing for Frost unlock
@@ -1210,6 +1301,8 @@ function buildEquippedCosmetics(eq) {
 
 function update(logicDt, realDt) {
   runStats.elapsedTime += realDt;
+  // Poll Xbox / standard gamepads each frame so they feed key & mouse state
+  input.pollGamepads();
 
   // Set cosmetic context for this frame (used by player.js trail + draw)
   if (selectedCharId && meta.cosmeticsUnlocked()) {
@@ -1252,7 +1345,9 @@ function update(logicDt, realDt) {
       const mx = input.mouse.x, my = input.mouse.y;
       for (const b of introBoxes) {
         if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
-          if (b.action === 'continue') { audio.init(); audio.playBGM('menu'); gameState = 'charSelect'; }
+          if (b.action === 'continue' || b.action === 'mode_solo') { localCoop = false; audio.init(); audio.playBGM('menu'); gameState = 'charSelect'; }
+          else if (b.action === 'mode_local') { localCoop = true; audio.init(); audio.playBGM('menu'); gameState = 'charSelect'; }
+          else if (b.action === 'mode_remote') { localCoop = false; audio.init(); audio.playBGM('menu'); lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; gameState = 'lobby'; }
           else if (b.action === 'vol_down') { const v = Math.max(0, audio.getMasterVolume() - 0.1); audio.setMasterVolume(v); meta.setMasterVolume(v); }
           else if (b.action === 'vol_up')   { const v = Math.min(1, audio.getMasterVolume() + 0.1); audio.setMasterVolume(v); meta.setMasterVolume(v); }
           else if (b.action === 'reset_confirm') { introResetConfirm = true; }
@@ -1359,6 +1454,78 @@ function update(logicDt, realDt) {
     if (input.consumeKey('f2')) {
       localCoop = !localCoop;
       console.log('[RH2] Local co-op:', localCoop ? 'ON' : 'OFF');
+    }
+    input.clearFrame();
+    return;
+  }
+
+  // ── LOBBY (remote co-op) ──
+  if (gameState === 'lobby') {
+    if (input.consumeKey('escape')) {
+      if (lobbyMode === 'menu') { gameState = 'charSelect'; input.clearFrame(); return; }
+      lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = '';
+      input.clearFrame(); return;
+    }
+    // Text input for join code (alphanumeric, max 6, uppercase)
+    if (lobbyMode === 'joining') {
+      if (input.consumeKey('backspace')) {
+        lobbyJoinCode = lobbyJoinCode.slice(0, -1);
+      } else if (input.consumeKey('enter') && lobbyJoinCode.length === 6) {
+        net.role = 'client';
+        lobbyStatusMsg = `Connecting…`;
+        lobby.join(lobbyJoinCode).then(() => {
+          lobbyStatusMsg = net.connected
+            ? `Connected — waiting for host`
+            : `⚠ Connection failed — check the code or internet`;
+        }).catch(() => {
+          lobbyStatusMsg = `⚠ Connection failed — check the code or internet`;
+        });
+      } else if (lobbyJoinCode.length < 6) {
+        const allowed = 'abcdefghjklmnpqrstuvwxyz23456789';
+        for (const k of Array.from(input.justPressed)) {
+          if (k.length === 1 && allowed.includes(k)) {
+            lobbyJoinCode += k.toUpperCase();
+            input.justPressed.delete(k);
+            if (lobbyJoinCode.length >= 6) break;
+          }
+        }
+      }
+    }
+    if (input.consumeClick()) {
+      const mx = input.mouse.x, my = input.mouse.y;
+      for (const b of lobbyBoxes) {
+        if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
+          if (b.action === 'back') { gameState = 'charSelect'; break; }
+          if (b.action === 'host') {
+            const code = lobby.createHosted({ seed: Math.floor(Math.random() * 1e9), difficulty: selectedDifficulty });
+            lobbyMode = 'hosting';
+            net.role = 'host';
+            lobbyStatusMsg = `Connecting…`;
+            net.connect(code).then(() => {
+              lobbyStatusMsg = net.connected
+                ? `Share code ${code} with friends`
+                : `⚠ Connection failed — check internet`;
+            }).catch(() => {
+              lobbyStatusMsg = `⚠ Connection failed — check internet`;
+            });
+            break;
+          }
+          if (b.action === 'join') { lobbyMode = 'joining'; lobbyJoinCode = ''; lobbyStatusMsg = 'Type the 6-character room code, press ENTER'; break; }
+          if (b.action === 'lobby_back') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; net.disconnect(); net.role = 'solo'; break; }
+          if (b.action === 'join_confirm' && lobbyJoinCode.length === 6) {
+            net.role = 'client';
+            lobbyStatusMsg = `Connecting…`;
+            lobby.join(lobbyJoinCode).then(() => {
+              lobbyStatusMsg = net.connected
+                ? `Connected — waiting for host`
+                : `⚠ Connection failed — check the code or internet`;
+            }).catch(() => {
+              lobbyStatusMsg = `⚠ Connection failed — check the code or internet`;
+            });
+            break;
+          }
+        }
+      }
     }
     input.clearFrame();
     return;
@@ -1504,7 +1671,7 @@ function update(logicDt, realDt) {
       for (const b of restChoiceBoxes) {
         if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
           if (b.action === 'heal') {
-            player.heal(3);
+            healAllPlayers(3);
             console.log(`[Rest] Healed 3 HP: ${player.hp}/${player.maxHp}`);
             gameState = 'map';
           } else if (b.action === 'upgrade') {
@@ -1688,14 +1855,23 @@ function update(logicDt, realDt) {
   ui.update(logicDt);
   audio.updateTempoHum(tempo.value, true);
 
-  // Right-click: cycle selected card slot
+  // Right-click: cycle selected card slot (P1 only)
   if (input.consumeRightClick()) {
     selectedCardSlot = (selectedCardSlot + 1) % 4;
   }
-  // Number keys still work as quick-select
-  for (let i = 0; i < 4; i++) {
-    if (input.consumeKey((i + 1).toString())) {
-      selectedCardSlot = i;
+  // P1 number keys: solo uses 1-4; co-op uses 7/8/9/0 (right-side cluster)
+  if (localCoop) {
+    const p1Keys = ['7', '8', '9', '0'];
+    for (let i = 0; i < 4; i++) {
+      if (input.consumeKey(p1Keys[i])) selectedCardSlot = i;
+    }
+    // P2 picks card with 1-4 (left-side cluster)
+    for (let i = 0; i < 4; i++) {
+      if (input.consumeKey((i + 1).toString())) selectedCardSlotP2 = i;
+    }
+  } else {
+    for (let i = 0; i < 4; i++) {
+      if (input.consumeKey((i + 1).toString())) selectedCardSlot = i;
     }
   }
 
@@ -1736,12 +1912,47 @@ function update(logicDt, realDt) {
   // RH2: P2 update + revives + Group Tempo Resonance
   if (players.count > 1) {
     const p2 = players.list[1];
-    input.updateP2Reticle(p2, logicDt);
+    input.updateP2Reticle(p2, logicDt, enemies);
+    // Q-press: P2 fires its selected card with auto-aim target
+    const p2v = input._p2View;
+    if (p2v && p2v.mouse.justClicked && p2.alive && !p2.downed && !p2.silenced) {
+      p2v.mouse.justClicked = false;
+      const cardId2 = deckManager.hand[selectedCardSlotP2];
+      if (cardId2) {
+        const def2 = deckManager.getCardDef(cardId2);
+        if (p2.budget >= def2.cost) {
+          combat.executeCard(p2, def2, p2v.mouse);
+          runStats.cardsPlayed++;
+          if (def2.type !== 'echo') _lastCardPlayed = def2;
+        } else {
+          events.emit('PLAY_SOUND', 'miss');
+        }
+      }
+    } else if (p2v) {
+      p2v.mouse.justClicked = false;
+    }
     if (p2.alive) p2.updateLogic(logicDt, input.player2View(), tempo, room);
     players.updateRevives(logicDt);
-    // Compute group resonance multiplier (single shared tempo bar for now)
-    const zones = players.list.filter(p => p.alive && !p.downed).map(_ => tempo.stateName());
-    tempo.computeGroupResonance(zones);
+    // Group resonance: shared tempo bar → all alive non-downed share the
+    // same zone, so the count alone drives the multiplier. Avoid the
+    // per-frame array+filter+map churn that the obvious version produces.
+    let active = 0;
+    const list = players.list;
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (p.alive && !p.downed) active++;
+    }
+    let bonus = 0;
+    if (active === 2) bonus = 0.10;
+    else if (active === 3) bonus = 0.20;
+    else if (active >= 4) bonus = 0.30;
+    if (bonus > 0 && itemManager.has && itemManager.has('resonant_anchor')) bonus *= 1.5;
+    const newMult = 1.0 + bonus;
+    // One-shot flash on activation (mult crossed >1 from 1)
+    if (newMult > 1.001 && (tempo._groupResonanceMult || 1) <= 1.001) {
+      _resonanceFlashTimer = 0.6;
+    }
+    tempo._groupResonanceMult = newMult;
   }
 
   // IDEA-12: Brutal floor curse effects
@@ -1843,7 +2054,19 @@ function update(logicDt, realDt) {
         }
       }
     }
-    e.updateLogic(logicDt, player, tempo, room, enemies, projectiles);
+    // RH2: pick nearest alive player so enemies engage P2 too
+    let _tgt = player;
+    if (players.count > 1) {
+      let bestD = Infinity;
+      for (const pp of players.list) {
+        if (!pp.alive) continue;
+        const ddx = pp.x - e.x, ddy = pp.y - e.y;
+        const dd = ddx * ddx + ddy * ddy;
+        if (dd < bestD) { bestD = dd; _tgt = pp; }
+      }
+    }
+    e._currentTarget = _tgt;
+    e.updateLogic(logicDt, _tgt, tempo, room, enemies, projectiles);
     if (!e.alive) {
       // Item on-kill effects
       itemManager.onKill(tempo.value, player);
@@ -1876,7 +2099,7 @@ function update(logicDt, realDt) {
   }
 
   // Update projectiles
-  projectiles.update(logicDt, player, room);
+  projectiles.update(logicDt, players.count > 1 ? players.list : player, room);
 
   // Check enemy melee near-miss for perfect dodge
   if (player.dodging && player.perfectDodgeWindow > 0) {
@@ -2145,6 +2368,9 @@ function update(logicDt, realDt) {
   }
 
   particles.update(logicDt);
+  // RH2: host broadcasts position snapshots after sim step (no-op in solo)
+  hostSim.tick(logicDt, players.list, enemies);
+  if (_resonanceFlashTimer > 0) _resonanceFlashTimer = Math.max(0, _resonanceFlashTimer - realDt);
   renderer.updateShake(realDt);
   renderer.updateCA(realDt);
   // Tick zone tooltip
@@ -2177,6 +2403,8 @@ function handleCharSelectClick(mx, my) {
         return 'difficulty';
       }
       if (b.action === 'mainMenu') return 'mainMenu';
+      if (b.action === 'toggleCoop') { localCoop = !localCoop; return 'toggleCoop'; }
+      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; gameState = 'lobby'; return 'lobby'; }
       if (b.action === 'cosmetics') {
         gameState = 'cosmeticShop';
         return 'cosmetics';
@@ -2365,17 +2593,28 @@ function render() {
   if (gameState === 'intro') {
     const ctx = renderer.ctx;
 
-    // Gradient background
-    const bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    bgGrad.addColorStop(0, '#06060e');
-    bgGrad.addColorStop(1, '#0d0a1a');
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // RH2: cached background + animated schematic grid overlay
+    ctx.drawImage(getMenuBackground(), 0, 0);
+    {
+      const _tBg = performance.now() / 1000;
+      ctx.save();
+      ctx.globalAlpha = 0.05;
+      ctx.strokeStyle = '#66ddcc';
+      ctx.lineWidth = 1;
+      const step = 80;
+      for (let gx = (Math.floor(_tBg * 6) % step); gx < canvas.width; gx += step) {
+        ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
+      }
+      for (let gy = 0; gy < canvas.height; gy += step) {
+        ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
+      }
+      ctx.restore();
+    }
 
-    // ── Ambient menu particles ──
+    // ── Ambient menu particles ── RH2 palette: teal / amber / violet
     {
       const _mdt = 1 / 60;
-      const _mcols = ['#4466ff', '#aa44ff', '#44aaff', '#ffffff', '#ff44aa', '#44ffaa'];
+      const _mcols = ['#44ddcc', '#ffaa66', '#aa66ff', '#ffffff', '#66ffdd', '#ffcc88'];
       if (!_menuPartsInit) {
         _menuPartsInit = true;
         for (let _mi = 0; _mi < _menuParts.length; _mi++) {
@@ -2452,26 +2691,44 @@ function render() {
       ctx.restore();
     }
 
-    // Title glow — prismatic shimmer
+    // RH2 Title — split words, teal glow + amber "2" badge
     {
       const _tTitle = performance.now() / 1000;
+      const cx = canvas.width / 2;
+      // ROGUE HERO base
       ctx.save();
-      ctx.shadowColor = getPrismaticColor(_tTitle, 100, 55);
-      ctx.shadowBlur = 44;
-      ctx.fillStyle = getPrismaticColor(_tTitle, 75, 82);
-      ctx.font = 'bold 62px monospace';
+      ctx.shadowColor = '#44ddcc';
+      ctx.shadowBlur = 32;
+      ctx.fillStyle = '#e8fffa';
+      ctx.font = 'bold 60px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('ROGUE HERO', canvas.width / 2, 112);
+      ctx.fillText('ROGUE HERO', cx - 38, 116);
+      ctx.restore();
+      // Big "2" amber pulse
+      const pulse = 0.85 + Math.sin(_tTitle * 2.4) * 0.15;
+      ctx.save();
+      ctx.shadowColor = '#ffaa44';
+      ctx.shadowBlur = 38 * pulse;
+      ctx.fillStyle = '#ffcc66';
+      ctx.font = 'bold 88px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText('2', cx + 222, 124);
       ctx.restore();
     }
 
-    // Subtitle bar
-    ctx.fillStyle = 'rgba(68,170,255,0.12)';
-    ctx.fillRect(canvas.width / 2 - 240, 122, 480, 2);
-    ctx.fillStyle = '#44aaff';
-    ctx.font = 'bold 17px monospace';
+    // Subtitle bar — twin gradient line + RH2 tagline
+    {
+      const _bandGrad = ctx.createLinearGradient(canvas.width / 2 - 280, 0, canvas.width / 2 + 280, 0);
+      _bandGrad.addColorStop(0, 'rgba(68,221,204,0)');
+      _bandGrad.addColorStop(0.5, 'rgba(255,170,68,0.45)');
+      _bandGrad.addColorStop(1, 'rgba(68,221,204,0)');
+      ctx.fillStyle = _bandGrad;
+      ctx.fillRect(canvas.width / 2 - 280, 134, 560, 2);
+    }
+    ctx.fillStyle = '#88ccdd';
+    ctx.font = 'bold 16px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('A Tempo-Driven Roguelike Deck Builder', canvas.width / 2, 148);
+    ctx.fillText('Tempo-Driven Co-op Roguelike  ◆  Up to 4 Players', canvas.width / 2, 158);
 
     const bx = Math.max(40, Math.floor(canvas.width * 0.1));
     const bw = canvas.width - bx * 2;
@@ -2519,24 +2776,37 @@ function render() {
       ctx.fillText(lines[i].trim(), indent, by + 62 + i * lineH);
     }
 
-    // CONTINUE button
-    const btnW = 300, btnH = 54;
-    const btnX = (canvas.width - btnW) / 2;
-    const btnY = by + bh + 14;
-    ctx.fillStyle = '#225533';
-    ctx.beginPath();
-    ctx.roundRect(btnX, btnY, btnW, btnH, 10);
-    ctx.fill();
-    ctx.strokeStyle = '#33dd66';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.fillStyle = '#33dd66';
-    ctx.font = 'bold 24px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('CONTINUE  ▶', canvas.width / 2, btnY + 29);
-    ctx.fillStyle = 'rgba(100,220,140,0.6)';
+    // PLAY MODE buttons — SOLO / 2P LOCAL / REMOTE CO-OP
+    const modeBtnH = 64, modeBtnGap = 12;
+    const modeRowY = by + bh + 14;
+    const modeBtnW = Math.min(260, Math.floor((canvas.width - 80 - 2 * modeBtnGap) / 3));
+    const modeRowW = 3 * modeBtnW + 2 * modeBtnGap;
+    const modeRowX = (canvas.width - modeRowW) / 2;
+    const _modes = [
+      { label: '👤  SOLO', sub: '1 player', color: '#33dd66', fill: '#0d2a16', action: 'mode_solo' },
+      { label: '👥  2P LOCAL CO-OP', sub: 'Same keyboard', color: '#88dd66', fill: '#1d2a18', action: 'mode_local' },
+      { label: '🌐  REMOTE CO-OP', sub: 'Up to 4, room code', color: '#44ddcc', fill: '#0d2222', action: 'mode_remote' },
+    ];
+    const introModeBoxes = [];
+    for (let mi = 0; mi < _modes.length; mi++) {
+      const m = _modes[mi];
+      const mbx = modeRowX + mi * (modeBtnW + modeBtnGap);
+      ctx.fillStyle = m.fill;
+      ctx.beginPath(); ctx.roundRect(mbx, modeRowY, modeBtnW, modeBtnH, 10); ctx.fill();
+      ctx.strokeStyle = m.color; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = m.color;
+      ctx.font = 'bold 17px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(m.label, mbx + modeBtnW / 2, modeRowY + 28);
+      ctx.fillStyle = 'rgba(220,235,225,0.55)';
+      ctx.font = '11px monospace';
+      ctx.fillText(m.sub, mbx + modeBtnW / 2, modeRowY + 48);
+      introModeBoxes.push({ x: mbx, y: modeRowY, w: modeBtnW, h: modeBtnH, action: m.action });
+    }
+    ctx.fillStyle = 'rgba(160,200,180,0.45)';
     ctx.font = '11px monospace';
-    ctx.fillText('or press ENTER', canvas.width / 2, btnY + 46);
+    ctx.fillText('Click a mode  ◆  ENTER picks SOLO', canvas.width / 2, modeRowY + modeBtnH + 14);
+    // Compatibility: keep btnY/btnW for layout below; alias to mode row
+    const btnY = modeRowY, btnH = modeBtnH + 18, btnW = modeRowW, btnX = modeRowX;
 
     // Volume control row
     const volY = btnY + btnH + 16;
@@ -2600,7 +2870,7 @@ function render() {
       ctx.fillText('EXIT GAME', canvas.width / 2, exitY + 24);
 
       introBoxes = [
-        { x: btnX, y: btnY, w: btnW, h: btnH, action: 'continue' },
+        ...introModeBoxes,
         { x: vDownX, y: volY + 4, w: vBtnW, h: vBtnH, action: 'vol_down' },
         { x: vUpX, y: volY + 4, w: vBtnW, h: vBtnH, action: 'vol_up' },
         { x: rstX, y: rstY, w: rstW, h: rstH, action: 'reset_confirm' },
@@ -2625,7 +2895,7 @@ function render() {
       ctx.fillStyle = '#44dd88'; ctx.font = 'bold 13px monospace';
       ctx.fillText('NO — CANCEL', noX + noW / 2, rstY + 43);
       introBoxes = [
-        { x: btnX, y: btnY, w: btnW, h: btnH, action: 'continue' },
+        ...introModeBoxes,
         { x: vDownX, y: volY + 4, w: vBtnW, h: vBtnH, action: 'vol_down' },
         { x: vUpX, y: volY + 4, w: vBtnW, h: vBtnH, action: 'vol_up' },
         { x: yesX, y: rstY + 22, w: yesW, h: 32, action: 'reset_do' },
@@ -2639,26 +2909,28 @@ function render() {
   if (gameState === 'charSelect') {
     const ctx = renderer.ctx;
 
-    // Gradient background
-    const bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    bgGrad.addColorStop(0, '#070710');
-    bgGrad.addColorStop(1, '#0d0c1c');
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // RH2 char-select background — shared cached gradient
+    ctx.drawImage(getMenuBackground(), 0, 0);
 
     ctx.save();
-    ctx.shadowColor = '#8866ff';
-    ctx.shadowBlur = 30;
-    ctx.fillStyle = '#ffffff';
+    ctx.shadowColor = '#44ddcc';
+    ctx.shadowBlur = 22;
+    ctx.fillStyle = '#e8fffa';
     ctx.font = 'bold 38px monospace';
     ctx.textAlign = 'center';
     ctx.fillText('CHOOSE YOUR HERO', canvas.width / 2, 58);
     ctx.restore();
 
-    ctx.fillStyle = 'rgba(136,102,255,0.15)';
-    ctx.fillRect(canvas.width / 2 - 200, 66, 400, 2);
+    {
+      const _bandGrad = ctx.createLinearGradient(canvas.width / 2 - 220, 0, canvas.width / 2 + 220, 0);
+      _bandGrad.addColorStop(0, 'rgba(68,221,204,0)');
+      _bandGrad.addColorStop(0.5, 'rgba(255,170,68,0.45)');
+      _bandGrad.addColorStop(1, 'rgba(68,221,204,0)');
+      ctx.fillStyle = _bandGrad;
+      ctx.fillRect(canvas.width / 2 - 220, 66, 440, 2);
+    }
 
-    ctx.fillStyle = '#7777aa';
+    ctx.fillStyle = '#88aabb';
     ctx.font = '14px monospace';
     ctx.fillText(`Runs: ${meta.state.totalRuns}  |  Wins: ${meta.state.totalWins}  |  Best Floor: ${meta.state.bestFloor}`, canvas.width / 2, 90);
 
@@ -2680,6 +2952,71 @@ function render() {
       ctx2.textAlign = 'center';
       ctx2.fillText('◀  MAIN MENU', mbX + mbW / 2, mbY + 24);
       charSelectBoxes.push({ x: mbX, y: mbY, w: mbW, h: mbH, action: 'mainMenu' });
+
+      // ── REMOTE MULTIPLAYER button — to the right of MAIN MENU ──
+      const lbW = 200, lbH = 38, lbX = mbX + mbW + 10, lbY = mbY;
+      ctx2.fillStyle = '#10202a';
+      ctx2.beginPath();
+      ctx2.roundRect(lbX, lbY, lbW, lbH, 7);
+      ctx2.fill();
+      ctx2.strokeStyle = '#44ddcc';
+      ctx2.lineWidth = 1.5;
+      ctx2.stroke();
+      ctx2.fillStyle = '#88eedd';
+      ctx2.font = 'bold 13px monospace';
+      ctx2.textAlign = 'center';
+      ctx2.fillText('🌐  REMOTE LOBBY', lbX + lbW / 2, lbY + 24);
+      charSelectBoxes.push({ x: lbX, y: lbY, w: lbW, h: lbH, action: 'lobby' });
+    }
+
+    // ── PLAYERS toggle button (1P / 2P local co-op) — top-right ──
+    {
+      const ctx2 = renderer.ctx;
+      const cbW = 224, cbH = 38, cbX = canvas.width - cbW - 16, cbY = 14;
+      const on = localCoop;
+      ctx2.fillStyle = on ? '#1d2a18' : '#1a1520';
+      ctx2.beginPath();
+      ctx2.roundRect(cbX, cbY, cbW, cbH, 7);
+      ctx2.fill();
+      ctx2.strokeStyle = on ? '#88dd66' : '#6655aa';
+      ctx2.lineWidth = 1.5;
+      ctx2.stroke();
+      ctx2.fillStyle = on ? '#aaff88' : '#bbaadd';
+      ctx2.font = 'bold 14px monospace';
+      ctx2.textAlign = 'center';
+      ctx2.font = 'bold 13px monospace';
+      ctx2.fillText(on ? '👥  2P CO-OP — ON' : '👤  SOLO — CLICK FOR 2P', cbX + cbW / 2, cbY + 24);
+      charSelectBoxes.push({ x: cbX, y: cbY, w: cbW, h: cbH, action: 'toggleCoop' });
+
+      // P2 controls help panel — visible when 2P is on
+      if (on) {
+        // Horizontal strip across the bottom — two rows so P1 and P2 don't overlap
+        const helpW = Math.min(640, canvas.width - 32);
+        const helpH = 64;
+        const hX = (canvas.width - helpW) / 2;
+        // Lift above the "Bonus Cards Unlocked" line at canvas.height - 20
+        const hY = canvas.height - helpH - 36;
+        ctx2.fillStyle = 'rgba(18,26,14,0.94)';
+        ctx2.beginPath();
+        ctx2.roundRect(hX, hY, helpW, helpH, 8);
+        ctx2.fill();
+        ctx2.strokeStyle = 'rgba(136,221,102,0.6)';
+        ctx2.lineWidth = 1.2;
+        ctx2.stroke();
+        ctx2.font = 'bold 11px monospace';
+        ctx2.textAlign = 'left';
+        ctx2.fillStyle = '#88ddff';
+        ctx2.fillText('P1', hX + 14, hY + 22);
+        ctx2.fillStyle = '#cce0c0';
+        ctx2.font = '11px monospace';
+        ctx2.fillText('Arrows move  |  Mouse aim/attack  |  /  Dodge  |  7 8 9 0  Cards', hX + 36, hY + 22);
+        ctx2.fillStyle = '#ff9944';
+        ctx2.font = 'bold 11px monospace';
+        ctx2.fillText('P2', hX + 14, hY + 46);
+        ctx2.fillStyle = '#cce0c0';
+        ctx2.font = '11px monospace';
+        ctx2.fillText('WASD move  |  Q Attack (auto-aim)  |  E  Dodge  |  1 2 3 4  Cards', hX + 36, hY + 46);
+      }
     }
     const chars = CharacterList;
     const GAP = 10;
@@ -2956,6 +3293,207 @@ function render() {
     return;
   }
 
+  // ── LOBBY (remote co-op) ──
+  if (gameState === 'lobby') {
+    const ctx = renderer.ctx;
+    // Background — shared cached gradient
+    ctx.drawImage(getMenuBackground(), 0, 0);
+
+    // Title
+    ctx.save();
+    ctx.shadowColor = '#44ddcc';
+    ctx.shadowBlur = 22;
+    ctx.fillStyle = '#e8fffa';
+    ctx.font = 'bold 36px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('MULTIPLAYER LOBBY', canvas.width / 2, 64);
+    ctx.restore();
+
+    lobbyBoxes = [];
+
+    // Back button — top-left
+    const bbW = 140, bbH = 36, bbX = 16, bbY = 16;
+    ctx.fillStyle = '#1a1520';
+    ctx.beginPath(); ctx.roundRect(bbX, bbY, bbW, bbH, 7); ctx.fill();
+    ctx.strokeStyle = '#6655aa'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = '#bbaadd';
+    ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('◀  CHAR SELECT', bbX + bbW / 2, bbY + 23);
+    lobbyBoxes.push({ x: bbX, y: bbY, w: bbW, h: bbH, action: 'back' });
+
+    const cx = canvas.width / 2;
+
+    if (lobbyMode === 'menu') {
+      // Description
+      ctx.fillStyle = '#88aabb';
+      ctx.font = '14px monospace';
+      ctx.fillText('Play with up to 4 players over the internet', cx, 110);
+
+      // Simple connection banner — just connected/not connected
+      {
+        const wbW = 420, wbH = 38, wbX = cx - wbW / 2, wbY = 138;
+        const ok = net.connected;
+        ctx.fillStyle = ok ? 'rgba(12,40,24,0.85)' : 'rgba(40,16,12,0.85)';
+        ctx.beginPath(); ctx.roundRect(wbX, wbY, wbW, wbH, 8); ctx.fill();
+        ctx.strokeStyle = ok ? '#44dd99' : '#ff7755'; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = ok ? '#88ffcc' : '#ff9988';
+        ctx.font = 'bold 13px monospace';
+        ctx.fillText(ok ? '✓  CONNECTED — READY TO PLAY' : '○  NOT CONNECTED — CHECK INTERNET', cx, wbY + 24);
+      }
+
+      // HOST button
+      const hbW = 280, hbH = 84, hbX = cx - hbW - 30, hbY = 200;
+      ctx.fillStyle = '#0d2222';
+      ctx.beginPath(); ctx.roundRect(hbX, hbY, hbW, hbH, 12); ctx.fill();
+      ctx.strokeStyle = '#44ddcc'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#aaffee'; ctx.font = 'bold 22px monospace';
+      ctx.fillText('🌐  HOST GAME', hbX + hbW / 2, hbY + 38);
+      ctx.fillStyle = '#66bbaa'; ctx.font = '12px monospace';
+      ctx.fillText('Generate a room code, share with friends', hbX + hbW / 2, hbY + 62);
+      lobbyBoxes.push({ x: hbX, y: hbY, w: hbW, h: hbH, action: 'host' });
+
+      // JOIN button
+      const jbW = 280, jbH = 84, jbX = cx + 30, jbY = 200;
+      ctx.fillStyle = '#221a0d';
+      ctx.beginPath(); ctx.roundRect(jbX, jbY, jbW, jbH, 12); ctx.fill();
+      ctx.strokeStyle = '#ffaa44'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#ffd699'; ctx.font = 'bold 22px monospace';
+      ctx.fillText('✦  JOIN GAME', jbX + jbW / 2, jbY + 38);
+      ctx.fillStyle = '#bb8855'; ctx.font = '12px monospace';
+      ctx.fillText('Enter the host\u2019s 6-character code', jbX + jbW / 2, jbY + 62);
+      lobbyBoxes.push({ x: jbX, y: jbY, w: jbW, h: jbH, action: 'join' });
+
+      // Footer
+      ctx.fillStyle = '#556677';
+      ctx.font = '11px monospace';
+      ctx.fillText('Local 2-player co-op (no internet) is on the char-select screen.', cx, canvas.height - 50);
+
+    }
+
+    if (lobbyMode === 'hosting') {
+      const code = lobby.roomCode || '------';
+      ctx.fillStyle = '#88aabb';
+      ctx.font = '14px monospace';
+      ctx.fillText('Share this code with up to 3 friends:', cx, 130);
+
+      // Big room code
+      ctx.save();
+      ctx.shadowColor = '#44ddcc'; ctx.shadowBlur = 28;
+      ctx.fillStyle = '#e8fffa';
+      ctx.font = 'bold 96px monospace';
+      ctx.fillText(code, cx, 250);
+      ctx.restore();
+
+      // Slot list
+      const slotY = 290;
+      ctx.fillStyle = '#aabbcc'; ctx.font = 'bold 13px monospace';
+      ctx.fillText('CONNECTED PLAYERS', cx, slotY);
+      const slots = lobby.slots.length ? lobby.slots : [{ name: 'P1 (you)', peerId: 'host', ready: false }];
+      for (let i = 0; i < 4; i++) {
+        const sX = cx - 200, sW = 400, sH = 28, sY = slotY + 14 + i * 34;
+        const filled = i < slots.length;
+        ctx.fillStyle = filled ? '#162028' : '#0a0e14';
+        ctx.beginPath(); ctx.roundRect(sX, sY, sW, sH, 5); ctx.fill();
+        ctx.strokeStyle = filled ? '#44ddcc' : '#33445566'; ctx.lineWidth = 1; ctx.stroke();
+        ctx.fillStyle = filled ? '#cce0d8' : '#445566';
+        ctx.font = '13px monospace'; ctx.textAlign = 'left';
+        ctx.fillText(filled ? `▶  ${slots[i].name || 'Player'}` : '   (waiting…)', sX + 12, sY + 19);
+        ctx.textAlign = 'center';
+      }
+
+      // Status
+      ctx.fillStyle = '#ff8866'; ctx.font = '12px monospace';
+      ctx.fillText(lobbyStatusMsg || '', cx, slotY + 14 + 4 * 34 + 24);
+
+      // Back
+      const xbW = 160, xbH = 38, xbX = cx - xbW / 2, xbY = canvas.height - 70;
+      ctx.fillStyle = '#1a1520';
+      ctx.beginPath(); ctx.roundRect(xbX, xbY, xbW, xbH, 7); ctx.fill();
+      ctx.strokeStyle = '#6655aa'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = '#bbaadd';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('CANCEL HOST', xbX + xbW / 2, xbY + 24);
+      lobbyBoxes.push({ x: xbX, y: xbY, w: xbW, h: xbH, action: 'lobby_back' });
+    }
+
+    if (lobbyMode === 'joining') {
+      ctx.fillStyle = '#88aabb';
+      ctx.font = '14px monospace';
+      ctx.fillText('Enter the host\u2019s 6-character room code:', cx, 130);
+
+      // Big text-input box for the code
+      const tW = 380, tH = 96, tX = cx - tW / 2, tY = 170;
+      ctx.fillStyle = '#0a1118';
+      ctx.beginPath(); ctx.roundRect(tX, tY, tW, tH, 12); ctx.fill();
+      ctx.strokeStyle = '#44ddcc'; ctx.lineWidth = 2; ctx.stroke();
+
+      // Slots for each character
+      const slotW = 50, slotGap = 8;
+      const totalW = 6 * slotW + 5 * slotGap;
+      const sStart = cx - totalW / 2;
+      const _t = performance.now() / 1000;
+      const cursorOn = (Math.floor(_t * 2) % 2) === 0;
+      for (let i = 0; i < 6; i++) {
+        const sX = sStart + i * (slotW + slotGap), sY = tY + 16;
+        const ch2 = lobbyJoinCode[i] || '';
+        const isCursor = (i === lobbyJoinCode.length) && cursorOn;
+        ctx.fillStyle = ch2 ? '#0e1c20' : '#070b0e';
+        ctx.beginPath(); ctx.roundRect(sX, sY, slotW, 64, 8); ctx.fill();
+        ctx.strokeStyle = isCursor ? '#ffcc66' : (ch2 ? '#44ddcc' : '#22404a');
+        ctx.lineWidth = isCursor ? 2 : 1;
+        ctx.stroke();
+        if (ch2) {
+          ctx.fillStyle = '#e8fffa';
+          ctx.font = 'bold 36px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(ch2, sX + slotW / 2, sY + 46);
+        } else if (isCursor) {
+          ctx.fillStyle = '#ffcc66';
+          ctx.font = 'bold 36px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText('_', sX + slotW / 2, sY + 46);
+        }
+      }
+
+      // Helper text
+      ctx.fillStyle = '#667788';
+      ctx.font = '11px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Letters & numbers only. BACKSPACE to delete. ENTER to confirm.', cx, tY + tH + 22);
+
+      // Status
+      if (lobbyStatusMsg) {
+        ctx.fillStyle = lobbyStatusMsg.startsWith('⚠') ? '#ff8866' : '#aaffcc';
+        ctx.font = '13px monospace';
+        ctx.fillText(lobbyStatusMsg, cx, tY + tH + 50);
+      }
+
+      // Buttons row
+      const btY = tY + tH + 90;
+      const cancelW = 140, cancelH = 38, cancelX = cx - cancelW - 10;
+      ctx.fillStyle = '#1a1520';
+      ctx.beginPath(); ctx.roundRect(cancelX, btY, cancelW, cancelH, 7); ctx.fill();
+      ctx.strokeStyle = '#6655aa'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = '#bbaadd'; ctx.font = 'bold 13px monospace';
+      ctx.fillText('CANCEL', cancelX + cancelW / 2, btY + 24);
+      lobbyBoxes.push({ x: cancelX, y: btY, w: cancelW, h: cancelH, action: 'lobby_back' });
+
+      const confirmW = 180, confirmH = 38, confirmX = cx + 10;
+      const ready = lobbyJoinCode.length === 6;
+      ctx.fillStyle = ready ? '#0d2222' : '#0a0a14';
+      ctx.beginPath(); ctx.roundRect(confirmX, btY, confirmW, confirmH, 7); ctx.fill();
+      ctx.strokeStyle = ready ? '#44ddcc' : '#33445566'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = ready ? '#aaffee' : '#445566';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText(ready ? 'JOIN ROOM ▶' : 'enter 6 chars…', confirmX + confirmW / 2, btY + 24);
+      if (ready) {
+        // Same path as ENTER — synthesize a justPressed enter
+        lobbyBoxes.push({ x: confirmX, y: btY, w: confirmW, h: confirmH, action: 'join_confirm' });
+      }
+    }
+    return;
+  }
+
   // ── MAP ──
   if (gameState === 'map') {
     runManager.drawMap(renderer.ctx, canvas.width, canvas.height, input.mouse.x, input.mouse.y);
@@ -2976,6 +3514,25 @@ function render() {
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 11px monospace';
     ctx.fillText(`${player.hp}/${player.maxHp} HP`, 18 + hpW + 8, 46);
+    // RH2: in 2P co-op, show P2's HP bar to the right of P1's
+    if (players.count > 1) {
+      const p2 = players.list[1];
+      const p2X = 18 + hpW + 90;
+      const p2Ch = Characters[p2._charId || selectedCharId];
+      ctx.fillStyle = p2Ch ? p2Ch.color : '#ff9944';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(`P2 ${p2Ch?.name || ''}`, p2X, 28);
+      ctx.fillStyle = '#331111';
+      ctx.fillRect(p2X, 34, hpW, hpH);
+      const p2col = p2.hp > 0 ? '#ee3333' : '#553333';
+      ctx.fillStyle = p2col;
+      ctx.fillRect(p2X, 34, Math.max(0, p2.hp / Math.max(1, p2.maxHp)) * hpW, hpH);
+      ctx.strokeStyle = '#553333'; ctx.lineWidth = 1; ctx.strokeRect(p2X, 34, hpW, hpH);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 11px monospace';
+      ctx.fillText(`${Math.max(0, p2.hp)}/${p2.maxHp} HP${p2.downed ? '  ▼DOWN' : (!p2.alive ? '  ✖DEAD' : '')}`, p2X + hpW + 8, 46);
+    }
     ctx.fillStyle = '#666';
     ctx.font = '11px monospace';
     const layersLeft = runManager.getLayersToEnd();
@@ -3217,6 +3774,33 @@ function render() {
   }
   if (gameState === 'playing') {
     combat.drawRangeIndicator(renderer.ctx, player, deckManager.hand, CardDefinitions, selectedCardSlot);
+    if (players.count > 1) {
+      const p2 = players.list[1];
+      if (p2 && p2.alive) {
+        combat.drawRangeIndicator(renderer.ctx, p2, deckManager.hand, CardDefinitions, selectedCardSlotP2);
+        // Draw P2 reticle (auto-aim crosshair) so the player can see what's targeted
+        const p2v = input._p2View;
+        if (p2v) {
+          const _c = renderer.ctx;
+          _c.save();
+          _c.strokeStyle = '#aaff88';
+          _c.globalAlpha = 0.7;
+          _c.lineWidth = 1.5;
+          _c.beginPath();
+          _c.arc(p2v.mouse.x, p2v.mouse.y, 10, 0, Math.PI * 2);
+          _c.moveTo(p2v.mouse.x - 16, p2v.mouse.y);
+          _c.lineTo(p2v.mouse.x - 6,  p2v.mouse.y);
+          _c.moveTo(p2v.mouse.x + 6,  p2v.mouse.y);
+          _c.lineTo(p2v.mouse.x + 16, p2v.mouse.y);
+          _c.moveTo(p2v.mouse.x, p2v.mouse.y - 16);
+          _c.lineTo(p2v.mouse.x, p2v.mouse.y - 6);
+          _c.moveTo(p2v.mouse.x, p2v.mouse.y + 6);
+          _c.lineTo(p2v.mouse.x, p2v.mouse.y + 16);
+          _c.stroke();
+          _c.restore();
+        }
+      }
+    }
     combat.drawReticles(renderer.ctx, deckManager.hand, CardDefinitions, now);
   }
   projectiles.draw(renderer.ctx);
@@ -3235,13 +3819,53 @@ function render() {
     }
   }
   player.draw(renderer.ctx, tempo);
-  // RH2: draw additional players + their downed/revive UI
+  // RH2: P1 down ring (so P2 can see they need to revive)
+  if (players.count > 1 && player.downed) {
+    const ctx = renderer.ctx;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (player.reviveProgress || 0));
+    ctx.strokeStyle = '#44ff88';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('DOWN', player.x, player.y - 28);
+  }
+  // RH2: draw additional players + their downed/revive UI + follow HP bar
   if (players.count > 1) {
+    // ── Revive instruction banner — only when at least one player is downed ──
+    let _anyDowned = false;
+    for (const _p of players.list) { if (_p.alive && _p.downed) { _anyDowned = true; break; } }
+    if (_anyDowned) {
+      const ctx = renderer.ctx;
+      const bw = 460, bh = 36;
+      const bx = (canvas.width - bw) / 2, by = 12;
+      ctx.fillStyle = 'rgba(20,40,20,0.92)';
+      ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 8); ctx.fill();
+      ctx.strokeStyle = '#44ff88'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = '#aaffbb';
+      ctx.font = 'bold 13px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('STAND ON YOUR DOWNED ALLY FOR 2s TO REVIVE THEM', canvas.width / 2, by + 23);
+    }
     for (let i = 1; i < players.list.length; i++) {
       const p = players.list[i];
       if (p.alive) p.draw(renderer.ctx, tempo);
+      const ctx = renderer.ctx;
+      // Follow HP bar above the player's head — small, color-keyed
+      if ((p.alive || p.downed) && p.maxHp) {
+        const bw = 36, bh = 4, bx = p.x - bw / 2, by = p.y - p.r - 12;
+        const frac = Math.max(0, Math.min(1, p.hp / p.maxHp));
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+        ctx.fillStyle = p.haloColor || '#ff7744';
+        ctx.fillRect(bx, by, bw * frac, bh);
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(bx, by, bw, bh);
+      }
       if (p.downed) {
-        const ctx = renderer.ctx;
         ctx.beginPath();
         ctx.arc(p.x, p.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (p.reviveProgress || 0));
         ctx.strokeStyle = '#44ff88';
@@ -3255,7 +3879,8 @@ function render() {
     }
     // P2 reticle
     const v = input._p2View;
-    if (v) renderer.drawCursor(v._aimX, v._aimY, players.list[1].haloColor || '#ff7744');
+    const _p2 = players.list[1];
+    if (v && _p2) renderer.drawCursor(v._aimX, v._aimY, _p2.haloColor || '#ff7744');
   }
   _drawOrbs(renderer.ctx);
   // Kill effects
@@ -3293,6 +3918,7 @@ function render() {
 
   if (gameState === 'playing' || gameState === 'paused') {
     ui.selectedCardSlot = selectedCardSlot;
+    ui.selectedCardSlotP2 = (players.count > 1) ? selectedCardSlotP2 : null;
     ui.battleMode = true;
     // Flag whether any enemy overlaps the card zone or tempo bar zone so they can fade
     const _cardZoneY = canvas.height - 192 - 22;
@@ -3301,26 +3927,113 @@ function render() {
     ui.tempoZoneOccupied = (player.y + player.r > _tempoZoneY) || enemies.some(e => e.alive && !e._dying && e.y + e.r > _tempoZoneY);
     ui.draw(renderer.ctx);
     const ctx = renderer.ctx;
-    // RH2: co-op HUD strip showing P2 HP + biome
+    // RH2: co-op HUD strip — biome label + per-player HP bars + resonance
+    // Positioned BELOW the existing HP/AP/Relics column (which lives at y=18..~92)
     if (players.count > 1 || currentBiome) {
       ctx.save();
-      ctx.fillStyle = 'rgba(0,0,0,0.55)';
-      ctx.fillRect(8, 8, 200, 22 + (players.count > 1 ? 16 : 0));
-      ctx.fillStyle = currentBiome.palette.accent;
-      ctx.font = 'bold 12px monospace';
+      const panelW = 230;
+      const hasP2 = players.count > 1;
+      const hasReso = tempo._groupResonanceMult && tempo._groupResonanceMult > 1.001;
+      // Height grows with content
+      let panelH = 8;
+      if (currentBiome) panelH += 18;
+      if (hasP2) panelH += 22 + 18 + 16; // P2 HP row + P2 AP row + P2 selected card row
+      if (hasReso) panelH += 18;
+      panelH += 4;
+      const panelX = 8;
+      // Push below existing relics row (y≈68 + 22)
+      const panelY = (itemManager && itemManager.equipped && itemManager.equipped.length) ? 100 : 96;
+      ctx.fillStyle = 'rgba(0,0,0,0.62)';
+      ctx.beginPath(); ctx.roundRect(panelX, panelY, panelW, panelH, 6); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+      ctx.lineWidth = 1; ctx.stroke();
+
+      let yCursor = panelY + 14;
       ctx.textAlign = 'left';
-      ctx.fillText('BIOME: ' + currentBiome.name.toUpperCase(), 14, 24);
-      if (players.count > 1) {
+      if (currentBiome) {
+        ctx.fillStyle = currentBiome.palette ? currentBiome.palette.accent : '#88ccdd';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText('BIOME: ' + currentBiome.name.toUpperCase(), 14, yCursor);
+        yCursor += 18;
+      }
+
+      // Helper: draw label + mini HP bar
+      const drawHpRow = (label, p, color) => {
+        ctx.fillStyle = color;
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText(label, 14, yCursor + 10);
+        const bx2 = 60, by2 = yCursor + 2, bw = 100, bh = 12;
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        ctx.fillRect(bx2, by2, bw, bh);
+        const frac = Math.max(0, Math.min(1, p.hp / Math.max(1, p.maxHp)));
+        ctx.fillStyle = color;
+        ctx.fillRect(bx2, by2, bw * frac, bh);
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 1; ctx.strokeRect(bx2, by2, bw, bh);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '10px monospace';
+        const txt = Math.max(0, Math.round(p.hp)) + '/' + p.maxHp + (p.downed ? '  ▼DOWN' : (!p.alive ? '  ✖DEAD' : ''));
+        ctx.fillText(txt, bx2 + bw + 6, yCursor + 11);
+        yCursor += 22;
+      };
+
+      if (hasP2) {
         const p2 = players.list[1];
-        ctx.fillStyle = p2.haloColor || '#ff7744';
-        ctx.fillText('P2 HP: ' + Math.max(0, p2.hp) + ' / ' + p2.maxHp + (p2.downed ? ' [DOWN]' : ''), 14, 40);
+        drawHpRow('P2', p2, p2.haloColor || '#ff7744');
+        // P2 AP pip row
+        ctx.fillStyle = '#4488ff';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText('AP', 14, yCursor + 11);
+        const apX = 60, apY = yCursor + 3, segW = 12, segH = 12, segGap = 2;
+        const mb = p2.maxBudget || 3;
+        for (let i = 0; i < mb; i++) {
+          const sx = apX + i * (segW + segGap);
+          const filled = i < Math.floor(p2.budget);
+          ctx.fillStyle = filled ? '#44aaff' : '#1a2a44';
+          ctx.fillRect(sx, apY, segW, segH);
+          ctx.strokeStyle = '#223355';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(sx, apY, segW, segH);
+        }
+        ctx.fillStyle = '#888';
+        ctx.font = '10px monospace';
+        ctx.fillText(p2.budget.toFixed(1) + '/' + mb, apX + mb * (segW + segGap) + 4, yCursor + 12);
+        yCursor += 18;
+        // Show P2's currently-selected card so they know what Q will fire
+        const p2CardId = deckManager.hand[selectedCardSlotP2];
+        const p2Def = p2CardId ? deckManager.getCardDef(p2CardId) : null;
+        ctx.fillStyle = '#aaff88';
+        ctx.font = 'bold 10px monospace';
+        ctx.fillText('P2 ▸ ' + (selectedCardSlotP2 + 1) + ' ' + (p2Def ? p2Def.name : '—'), 14, yCursor + 10);
+        yCursor += 16;
       }
-      // Group Tempo Resonance indicator
-      if (tempo._groupResonanceMult && tempo._groupResonanceMult > 1.001) {
+
+      if (hasReso) {
         ctx.fillStyle = '#ffdd44';
+        ctx.font = 'bold 11px monospace';
         const pct = Math.round((tempo._groupResonanceMult - 1) * 100);
-        ctx.fillText('RESONANCE +' + pct + '%', 14, 56);
+        ctx.fillText('★ RESONANCE +' + pct + '% DMG', 14, yCursor + 10);
       }
+      ctx.restore();
+    }
+    // RH2: full-screen edge-glow when Group Resonance just activated
+    if (_resonanceFlashTimer > 0) {
+      const k = _resonanceFlashTimer / 0.6;
+      ctx.save();
+      ctx.globalAlpha = k * 0.55;
+      const eg = ctx.createRadialGradient(
+        canvas.width / 2, canvas.height / 2, Math.min(canvas.width, canvas.height) * 0.35,
+        canvas.width / 2, canvas.height / 2, Math.max(canvas.width, canvas.height) * 0.7
+      );
+      eg.addColorStop(0, 'rgba(255,221,68,0)');
+      eg.addColorStop(1, 'rgba(255,221,68,0.9)');
+      ctx.fillStyle = eg;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.globalAlpha = k;
+      ctx.fillStyle = '#ffdd44';
+      ctx.font = 'bold 22px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('★ GROUP RESONANCE ★', canvas.width / 2, 78);
       ctx.restore();
     }
     // Floor / difficulty badge — top right (below minimap)
@@ -3601,7 +4314,7 @@ function drawDraftScreen() {
     ctx.fillText(def.type.toUpperCase(), x + CARD_W / 2, startY + 116);
     ctx.fillStyle = '#667';
     ctx.font = '13px monospace';
-    ctx.fillText(`${def.range}px range`, x + CARD_W / 2, startY + 134);
+    ctx.fillText(`${rangeLabel(def.range)} range`, x + CARD_W / 2, startY + 134);
 
     // DMG
     let dmgLineY = startY + 164;

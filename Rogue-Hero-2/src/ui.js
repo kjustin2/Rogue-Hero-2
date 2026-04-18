@@ -1,6 +1,17 @@
 import { CardDefinitions } from './DeckManager.js';
 import { CosmeticById, CosmeticDefinitions, BOX_TIERS, RARITY_COLORS, RARITY_LABELS, CATEGORY_LABELS, drawPlayerShape, drawPlayerAura, getPrismaticColor } from './Cosmetics.js';
 
+// RH2: humanise raw pixel ranges into game-y descriptors so cards don't expose engine units.
+export function rangeLabel(r) {
+  if (r == null) return '';
+  if (r <= 100)  return 'Touch';
+  if (r <= 160)  return 'Short';
+  if (r <= 260)  return 'Mid';
+  if (r <= 450)  return 'Long';
+  if (r <= 700)  return 'Very Long';
+  return 'Sniper';
+}
+
 // ── Color Palette ────────────────────────────────────────────────
 export const PAL = {
   COLD:       '#4a9eff',
@@ -635,10 +646,31 @@ export class UI {
 
       const isActive = this.selectedCardSlot === i;
 
-      // Active card: solid coloured top bar instead of glow overlay
+      // Active card: solid coloured top bar + "P1" badge
       if (isActive) {
         ctx.fillStyle = '#44ff88';
-        ctx.fillRect(x, y, cardDrawW, 4);
+        ctx.fillRect(x, y, cardDrawW, 6);
+        if (this.selectedCardSlotP2 != null) {
+          // Only show P1 label when 2P is on (otherwise it's just "you")
+          ctx.fillStyle = '#0a1410';
+          ctx.fillRect(x + 6, y + 2, 22, 12);
+          ctx.fillStyle = '#88ffaa';
+          ctx.font = 'bold 9px monospace';
+          ctx.textAlign = 'left';
+          ctx.fillText('P1', x + 9, y + 12);
+        }
+      }
+
+      // P2 selected-slot marker — orange bottom bar + "P2" badge
+      if (this.selectedCardSlotP2 != null && this.selectedCardSlotP2 === i) {
+        ctx.fillStyle = '#ff9944';
+        ctx.fillRect(x, y + CARD_H - 6, cardDrawW, 6);
+        ctx.fillStyle = '#1a0e07';
+        ctx.fillRect(x + 6, y + CARD_H - 14, 22, 12);
+        ctx.fillStyle = '#ffbb77';
+        ctx.font = 'bold 9px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('P2', x + 9, y + CARD_H - 5);
       }
 
       // Left color stripe + rarity indicator
@@ -739,15 +771,21 @@ export class UI {
         ctx.font = 'bold 11px monospace';
         ctx.fillText(def.type.toUpperCase(), x + CARD_W / 2, y + 70);
 
-        // Range
+        // Damage (prominent so the player knows what each card hits for)
+        if (def.damage > 0) {
+          ctx.fillStyle = canAfford ? '#ff8855' : '#553322';
+          ctx.font = 'bold 13px monospace';
+          ctx.fillText(`${def.damage} DMG`, x + CARD_W / 2, y + 84);
+        }
+        // Range — abstract label, not raw pixels
         ctx.fillStyle = canAfford ? '#888' : '#444';
         ctx.font = '11px monospace';
-        ctx.fillText(`${def.range}px range`, x + CARD_W / 2, y + 84);
+        ctx.fillText(`${rangeLabel(def.range)} range`, x + CARD_W / 2, y + 98);
 
         // Description — larger font, more line height
         ctx.fillStyle = canAfford ? '#cccccc' : '#555';
         ctx.font = '12px monospace';
-        this._wrapText(ctx, def.desc, x + 8, y + 108, CARD_W - 16, 15);
+        this._wrapText(ctx, def.desc, x + 8, y + 116, CARD_W - 16, 15);
       }
 
       // Active indicator — small pill above card, no glow
@@ -875,7 +913,9 @@ export class UI {
       ctx.fillText((def.rarity || 'common').toUpperCase(), x + CARD_W / 2, y + 56);
       ctx.fillStyle = '#44aaff';
       ctx.font = '15px monospace';
-      ctx.fillText(`${def.cost} AP | ${def.range}px`, x + CARD_W / 2, y + 78);
+      const _segs = [`${def.cost} AP`, `${rangeLabel(def.range)}`];
+      if (def.damage > 0) _segs.unshift(`${def.damage} DMG`);
+      ctx.fillText(_segs.join('  ·  '), x + CARD_W / 2, y + 78);
       ctx.fillStyle = def.tempoShift > 0 ? PAL.HOT : PAL.COLD;
       ctx.font = 'bold 15px monospace';
       ctx.fillText((def.tempoShift > 0 ? '+' : '') + def.tempoShift + ' Tempo', x + CARD_W / 2, y + 100);
@@ -939,7 +979,7 @@ export class UI {
     if (def.damage > 0) {
       ctx.fillStyle = '#ff9988';
       ctx.font = 'bold 13px monospace';
-      ctx.fillText(`${def.damage} DMG  |  ${def.range}px`, tx + TW / 2, ty + 82);
+      ctx.fillText(`${def.damage} DMG  ·  ${rangeLabel(def.range)}`, tx + TW / 2, ty + 82);
     }
 
     ctx.fillStyle = rarCol;
@@ -1457,7 +1497,7 @@ export class UI {
       ctx.fillText('Buy: 1 HP', x + CARD_W / 2, y + 62);
       ctx.fillStyle = '#44aaff';
       ctx.font = '15px monospace';
-      ctx.fillText(`${def.cost} AP | ${def.range}px range`, x + CARD_W / 2, y + 87);
+      ctx.fillText(`${def.cost} AP  ·  ${rangeLabel(def.range)} range`, x + CARD_W / 2, y + 87);
       ctx.fillStyle = def.tempoShift > 0 ? PAL.HOT : PAL.COLD;
       ctx.font = '14px monospace';
       ctx.fillText(`${def.tempoShift > 0 ? '+' : ''}${def.tempoShift} Tempo`, x + CARD_W / 2, y + 107);
@@ -1830,11 +1870,19 @@ export class UI {
       ctx.fillText(`New card: ${newDef.name} (${newDef.cost}AP, ${newDef.type}) — click an existing card to replace it`, this.width / 2, 116);
     }
 
-    const CARD_W = 165, CARD_H = 205, GAP = 14;
+    // Larger cards so they're readable; auto-shrink only if deck overflows the screen
     const all = this.deckManager.collection;
+    const GAP = 16;
+    let CARD_W = 215, CARD_H = 290;
+    const maxRowW = this.width - 40;
+    const naturalW = all.length * CARD_W + (all.length - 1) * GAP;
+    if (naturalW > maxRowW) {
+      CARD_W = Math.max(150, Math.floor((maxRowW - (all.length - 1) * GAP) / all.length));
+      CARD_H = Math.round(CARD_W * (290 / 215));
+    }
     const totalW = all.length * CARD_W + (all.length - 1) * GAP;
     const startX = (this.width - totalW) / 2;
-    const startY = 140;
+    const startY = 150;
     this.discardBoxes = [];
 
     for (let i = 0; i < all.length; i++) {
@@ -1855,26 +1903,29 @@ export class UI {
       ctx.strokeRect(x, y, CARD_W, CARD_H);
 
       ctx.fillStyle = PAL.TEXT;
-      ctx.font = 'bold 17px monospace';
+      ctx.font = 'bold 22px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(def.name, x + CARD_W / 2, y + 28);
+      ctx.fillText(def.name, x + CARD_W / 2, y + 36);
+      ctx.fillStyle = '#ff8855';
+      ctx.font = 'bold 18px monospace';
+      ctx.fillText(`${def.damage} DMG`, x + CARD_W / 2, y + 62);
       ctx.fillStyle = '#44aaff';
-      ctx.font = '14px monospace';
-      ctx.fillText(`${def.cost}AP | ${def.range}px`, x + CARD_W / 2, y + 49);
+      ctx.font = '15px monospace';
+      ctx.fillText(`${def.cost} AP  ·  ${rangeLabel(def.range)}`, x + CARD_W / 2, y + 84);
       ctx.fillStyle = def.tempoShift > 0 ? PAL.HOT : PAL.COLD;
-      ctx.font = '13px monospace';
-      ctx.fillText((def.tempoShift > 0 ? '+' : '') + def.tempoShift + ' Tempo', x + CARD_W / 2, y + 68);
+      ctx.font = '14px monospace';
+      ctx.fillText((def.tempoShift > 0 ? '+' : '') + def.tempoShift + ' Tempo', x + CARD_W / 2, y + 106);
       ctx.fillStyle = def.color || '#888';
-      ctx.font = 'bold 12px monospace';
-      ctx.fillText(def.type.toUpperCase(), x + CARD_W / 2, y + 86);
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText(def.type.toUpperCase(), x + CARD_W / 2, y + 126);
       ctx.fillStyle = PAL.MUTED;
-      ctx.font = '12px monospace';
-      this._wrapText(ctx, def.desc, x + 8, y + 105, CARD_W - 16, 15);
+      ctx.font = '13px monospace';
+      this._wrapText(ctx, def.desc, x + 10, y + 150, CARD_W - 20, 17);
 
       if (isHovered) {
         ctx.fillStyle = PAL.CRITICAL;
-        ctx.font = 'bold 14px monospace';
-        ctx.fillText('DISCARD THIS', x + CARD_W / 2, y + CARD_H - 12);
+        ctx.font = 'bold 16px monospace';
+        ctx.fillText('DISCARD THIS', x + CARD_W / 2, y + CARD_H - 16);
       }
 
       this.discardBoxes.push({ x, y, w: CARD_W, h: CARD_H, cardId });
@@ -1960,13 +2011,13 @@ UI.prototype.drawCosmeticShop = function(ctx, meta, t) {
 
   this.cosmeticShopBoxes = [];
 
-  // Box buttons — 2-per-row grid, large cards
+  // Box buttons — 4-per-row grid so all 8 tiers fit on a single screen
   const tiers = ['bronze','silver','gold','prismatic','shadowed','elemental','infernal','shapebox'];
-  const perRow = 2;
-  const gap = 24;
-  const BW = Math.min(420, (this.width - 80 - gap) / perRow);
-  const BH = 200;
-  const gridW = BW * perRow + gap;
+  const perRow = 4;
+  const gap = 16;
+  const BW = Math.min(280, (this.width - 60 - gap * (perRow - 1)) / perRow);
+  const BH = 230;
+  const gridW = BW * perRow + gap * (perRow - 1);
   const startX = (this.width - gridW) / 2;
   const startY = 124;
 
@@ -1990,8 +2041,9 @@ UI.prototype.drawCosmeticShop = function(ctx, meta, t) {
     ctx.beginPath(); ctx.roundRect(bx, by, BW, BH, 14); ctx.stroke();
     if (canAfford) ctx.restore();
 
-    // Box icon (left side)
-    const iconX = bx + 22, iconY = by + 24, iconS = 64;
+    // Box icon (top-centered now that the card is narrower)
+    const iconS = 56;
+    const iconX = bx + (BW - iconS) / 2, iconY = by + 14;
     if (tier === 'prismatic') {
       ctx.strokeStyle = getPrismaticColor(t, 100, 65); ctx.lineWidth = 2.5;
       ctx.fillStyle = getPrismaticColor(t, 70, 30) + '55';
@@ -2004,35 +2056,36 @@ UI.prototype.drawCosmeticShop = function(ctx, meta, t) {
     ctx.fillStyle = '#fff'; ctx.font = 'bold 16px monospace'; ctx.textAlign = 'center';
     ctx.fillText('BOX', iconX + iconS/2, iconY + iconS/2 + 6);
 
-    // Tier name
-    const tx = bx + iconS + 36;
+    // Tier name (centered below icon)
+    ctx.textAlign = 'center';
     ctx.fillStyle = tier === 'prismatic' ? getPrismaticColor(t, 90, 80) : info.glowColor;
-    ctx.font = 'bold 22px monospace'; ctx.textAlign = 'left';
-    ctx.fillText(info.label, tx, by + 48);
+    ctx.font = 'bold 16px monospace';
+    ctx.fillText(info.label, bx + BW / 2, by + iconS + 32);
 
     // Cost
-    ctx.fillStyle = canAfford ? PAL.GOLD : '#555566'; ctx.font = 'bold 18px monospace';
-    ctx.fillText(`${info.cost} Gold`, tx, by + 74);
+    ctx.fillStyle = canAfford ? PAL.GOLD : '#555566'; ctx.font = 'bold 14px monospace';
+    ctx.fillText(`${info.cost} Gold`, bx + BW / 2, by + iconS + 50);
 
     // Odds line
-    ctx.fillStyle = PAL.MUTED; ctx.font = '13px monospace';
+    ctx.fillStyle = PAL.MUTED; ctx.font = '10px monospace';
     const w = _getTierWeightLine(tier);
-    if (w) ctx.fillText(w, bx + 22, by + 118);
+    if (w) ctx.fillText(w, bx + BW / 2, by + iconS + 70);
 
     // Category filter line
     if (info.categoryFilter) {
-      ctx.fillStyle = '#6688aa'; ctx.font = '12px monospace';
-      ctx.fillText('Only: ' + info.categoryFilter.join(', '), bx + 22, by + 138);
+      ctx.fillStyle = '#6688aa'; ctx.font = '10px monospace';
+      const fl = 'Only: ' + info.categoryFilter.join(', ');
+      ctx.fillText(fl.length > 28 ? fl.slice(0, 26) + '…' : fl, bx + BW / 2, by + iconS + 86);
     }
 
     // Buy button
-    const btnX = bx + 16, btnY = by + BH - 52, btnW = BW - 32, btnH = 40;
+    const btnX = bx + 10, btnY = by + BH - 44, btnW = BW - 20, btnH = 34;
     ctx.fillStyle = canAfford ? '#1a3a1a' : '#111111';
     ctx.beginPath(); ctx.roundRect(btnX, btnY, btnW, btnH, 8); ctx.fill();
     ctx.strokeStyle = canAfford ? '#44ff88' : '#333'; ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.roundRect(btnX, btnY, btnW, btnH, 8); ctx.stroke();
-    ctx.fillStyle = canAfford ? '#44ff88' : '#444455'; ctx.font = 'bold 17px monospace'; ctx.textAlign = 'center';
-    ctx.fillText(canAfford ? 'OPEN BOX' : 'Need more gold', bx + BW/2, btnY + 27);
+    ctx.fillStyle = canAfford ? '#44ff88' : '#444455'; ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(canAfford ? 'OPEN BOX' : 'Need more gold', bx + BW/2, btnY + 22);
     if (canAfford) this.cosmeticShopBoxes.push({ x:btnX, y:btnY, w:btnW, h:btnH, action:'buy_box', tier });
   }
 
@@ -2049,7 +2102,16 @@ UI.prototype.drawCosmeticShop = function(ctx, meta, t) {
 };
 
 function _getTierWeightLine(tier) {
-  const w = { bronze:'C:60% U:28% R:10% L:2% SL:0.5%', silver:'C:30% U:40% R:24% L:5% SL:1%', gold:'U:20% R:55% L:23% SL:2%', prismatic:'R:30% L:60% SL:10%' };
+  const w = {
+    bronze:    'C:60 U:28 R:10 L:2 SL:0.5',
+    silver:    'C:30 U:40 R:24 L:5 SL:1',
+    gold:      'U:20 R:55 L:23 SL:2',
+    prismatic: 'R:30 L:60 SL:10',
+    shadowed:  'U:30 R:52 L:16 SL:2',
+    elemental: 'C:20 U:40 R:32 L:7 SL:1',
+    infernal:  'C:10 U:35 R:42 L:11 SL:2',
+    shapebox:  'C:40 U:38 R:18 L:3 SL:1',
+  };
   return w[tier] || '';
 }
 

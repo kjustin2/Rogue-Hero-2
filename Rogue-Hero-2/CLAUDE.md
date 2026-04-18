@@ -71,9 +71,13 @@ Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest
 
 ## RH2 Multiplayer & Co-op
 
-**Local 2-player co-op:** Press **F2** on the character select screen to toggle. Host plays P1 (WASD + mouse + Space dodge + 1–4 cards). P2 uses arrow keys to move, numpad 4/8/6/2 to aim a reticle (orange), numpad 0 to fire, numpad 5 / RShift to dodge, numpad 1–4 to play from the shared hand. P2 input is exposed via `input.player2View()`, and `input.updateP2Reticle(p2, dt)` must be called once per frame *before* P2's `updateLogic`.
+**Local 2-player co-op:** Toggle with the **2P CO-OP button** in the top-right of the character select screen (also bound to **F2**). Host plays P1 (WASD + mouse + Space dodge + 1–4 cards). P2 uses **arrow keys** to move, **I/J/K/L** to aim the reticle, **U** to fire, **O** to dodge, **7/8/9/0** to play from the shared hand (mapped onto slots 1–4). Numpad is intentionally unused — keep all P2 keys on the right-hand side of a standard keyboard. P2 input is exposed via `input.player2View()`, and `input.updateP2Reticle(p2, dt)` must be called once per frame *before* P2's `updateLogic`.
 
-**Remote co-op (up to 4):** wired through `src/net/`. `Net` is a stub — production transport (WebRTC DataChannel, ordered+unordered) plugs in there without changing call sites. `HostSim.tick(dt, players, enemies)` is called from the main loop *only when role==='host'* and broadcasts position snapshots at 15 Hz; reliable world events (KILL, PLAYER_DOWNED, BOSS_PHASE, ZONE_TRANSITION, CONTROLS_INVERT, etc.) are forwarded automatically via `events.on()` subscriptions. Clients apply own-player snapshots via `Reconcile.applyOwn` (gentle pull at >8 px drift) and remote entities via `Reconcile.interpolateRemote`.
+**Remote co-op (up to 4):** wired through `src/net/`. `Net` is a stub — production transport (WebRTC DataChannel, ordered+unordered) plugs in there without changing call sites. The wiring is already live in `main.js`:
+- `hostSim.tick(logicDt, players.list, enemies)` runs every frame after the sim step. In solo mode it returns immediately; in `host` mode it broadcasts 15 Hz position snapshots and forwards reliable world events (KILL, PLAYER_DOWNED, BOSS_PHASE, ZONE_TRANSITION, CONTROLS_INVERT, etc.).
+- `net.on('snap', ...)` is registered at startup and feeds `SnapshotDecoder.apply()`, then calls `reconcile.applyOwn(player, ...)` for the local player and `reconcile.interpolateRemote(p, ...)` for each remote ally.
+
+Clients apply own-player snapshots via `Reconcile.applyOwn` (gentle pull at >8 px drift) and remote entities via `Reconcile.interpolateRemote`. Swapping the stub for real WebRTC means populating `net.peers` and forwarding messages to `_dispatch(channel, msg, peerId)` — no main-loop changes required.
 
 **Downed/revive:** when `player._coopMode === true`, `player.takeDamage()` enters the **downed** state instead of dying. Downed players move at 0.35× speed, cannot dodge, and may only play cards approved by `player.canPlayCardWhileDowned()`. Allies revive by standing within range — `players.updateRevives(dt)` advances the revive timer.
 

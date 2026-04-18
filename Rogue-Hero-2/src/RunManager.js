@@ -145,41 +145,132 @@ export class RunManager {
     const theme = floorThemes[Math.min(this.floor - 1, 4)];
 
     // PERF-02: cache map background grid to offscreen canvas
-    if (!this._mapGridCache || this._mapGridW !== width || this._mapGridH !== height) {
+    // RH2: richer background — radial vignette, biome-tinted accent grid,
+    // diagonal pinstripe sheen, faint dotted nebula speckle.
+    if (!this._mapGridCache || this._mapGridW !== width || this._mapGridH !== height || this._mapGridFloor !== this.floor) {
       const off = document.createElement('canvas');
       off.width = width; off.height = height;
       const octx = off.getContext('2d');
+
+      // Base + radial vignette
       octx.fillStyle = theme.bg;
       octx.fillRect(0, 0, width, height);
-      octx.strokeStyle = 'rgba(255,255,255,0.02)';
+      const rg = octx.createRadialGradient(width / 2, height / 2, Math.min(width, height) * 0.15,
+                                           width / 2, height / 2, Math.max(width, height) * 0.85);
+      rg.addColorStop(0, 'rgba(0,0,0,0)');
+      rg.addColorStop(1, 'rgba(0,0,0,0.65)');
+      octx.fillStyle = rg;
+      octx.fillRect(0, 0, width, height);
+
+      // Pinstripe diagonal sheen (subtle)
+      octx.save();
+      octx.globalAlpha = 0.04;
+      octx.strokeStyle = theme.col;
       octx.lineWidth = 1;
-      for (let gx = 0; gx < width; gx += 60) {
+      for (let s = -height; s < width; s += 14) {
+        octx.beginPath();
+        octx.moveTo(s, 0);
+        octx.lineTo(s + height, height);
+        octx.stroke();
+      }
+      octx.restore();
+
+      // Major grid lines (thicker, biome-tinted)
+      octx.strokeStyle = `${theme.col}1f`;
+      octx.lineWidth = 1;
+      for (let gx = 0; gx < width; gx += 120) {
         octx.beginPath(); octx.moveTo(gx, 0); octx.lineTo(gx, height); octx.stroke();
       }
-      for (let gy = 0; gy < height; gy += 60) {
+      for (let gy = 0; gy < height; gy += 120) {
         octx.beginPath(); octx.moveTo(0, gy); octx.lineTo(width, gy); octx.stroke();
       }
+      // Minor grid
+      octx.strokeStyle = 'rgba(255,255,255,0.025)';
+      for (let gx = 60; gx < width; gx += 120) {
+        octx.beginPath(); octx.moveTo(gx, 0); octx.lineTo(gx, height); octx.stroke();
+      }
+      for (let gy = 60; gy < height; gy += 120) {
+        octx.beginPath(); octx.moveTo(0, gy); octx.lineTo(width, gy); octx.stroke();
+      }
+
+      // Star/nebula speckle (deterministic per floor)
+      let s1 = (this.floor * 1664525 + 1013904223) >>> 0;
+      const _rand = () => { s1 = (s1 * 1664525 + 1013904223) >>> 0; return s1 / 0x100000000; };
+      for (let n = 0; n < 80; n++) {
+        const sx = _rand() * width, sy = _rand() * height;
+        const sr = 0.4 + _rand() * 1.2;
+        octx.globalAlpha = 0.10 + _rand() * 0.25;
+        octx.fillStyle = _rand() > 0.7 ? theme.col : '#aabbcc';
+        octx.beginPath(); octx.arc(sx, sy, sr, 0, Math.PI * 2); octx.fill();
+      }
+      octx.globalAlpha = 1;
+
       this._mapGridCache = off;
       this._mapGridW = width;
       this._mapGridH = height;
+      this._mapGridFloor = this.floor;
     }
     ctx.drawImage(this._mapGridCache, 0, 0);
 
-    // Header bar
-    ctx.fillStyle = 'rgba(0,0,0,0.7)';
-    ctx.fillRect(0, 0, width, 80);
+    // Header bar — gradient + accent stripe
+    {
+      const hg = ctx.createLinearGradient(0, 0, 0, 90);
+      hg.addColorStop(0, 'rgba(8,8,16,0.95)');
+      hg.addColorStop(1, 'rgba(8,8,16,0.55)');
+      ctx.fillStyle = hg;
+      ctx.fillRect(0, 0, width, 90);
+      // Accent stripe under header
+      const sg = ctx.createLinearGradient(0, 0, width, 0);
+      sg.addColorStop(0, 'rgba(0,0,0,0)');
+      sg.addColorStop(0.5, theme.col);
+      sg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = sg;
+      ctx.globalAlpha = 0.65;
+      ctx.fillRect(0, 88, width, 2);
+      ctx.globalAlpha = 1;
+    }
 
+    ctx.save();
+    ctx.shadowColor = theme.col;
+    ctx.shadowBlur = 20;
     ctx.fillStyle = theme.col;
-    ctx.font = 'bold 34px monospace';
+    ctx.font = 'bold 36px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(`ACT ${this.floor}${theme.name}`, width / 2, 46);
+    ctx.fillText(`ACT ${this.floor}${theme.name}`, width / 2, 48);
+    ctx.restore();
 
-    ctx.fillStyle = '#555';
+    // Floor pip strip — shows progress through total acts
+    {
+      const _tHdr = Date.now() / 1000;
+      const totalActs = 5;
+      const pipR = 4, pipGap = 14;
+      const pipsW = totalActs * pipGap - (pipGap - pipR * 2);
+      const pipsX = width / 2 - pipsW / 2 + pipR;
+      for (let pi = 0; pi < totalActs; pi++) {
+        const px = pipsX + pi * pipGap;
+        const done = pi < this.floor - 1;
+        const cur  = pi === this.floor - 1;
+        ctx.fillStyle = cur ? theme.col : (done ? '#44ff88' : '#222a3a');
+        ctx.beginPath();
+        ctx.arc(px, 70, cur ? pipR + 1 : pipR, 0, Math.PI * 2);
+        ctx.fill();
+        if (cur) {
+          ctx.strokeStyle = theme.col;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(px, 70, pipR + 4 + Math.sin(_tHdr * 3) * 1.5, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+    }
+
+    ctx.fillStyle = '#88aabb';
     ctx.font = '12px monospace';
-    ctx.fillText('Choose your path — click a glowing room', width / 2, 68);
+    ctx.fillText('Choose your path — click a glowing room', width / 2, 86);
 
     const START_Y = height - 90;
-    const END_Y = 110;
+    // Boss node sits at END_Y; bumped down to clear the 90px header banner + caption
+    const END_Y = 150;
     const gapY = (START_Y - END_Y) / (this.maxLayers - 1);
 
     this.clickSpheres = [];
@@ -412,12 +503,28 @@ export class RunManager {
       ctx.fillText(layersLeft === 1 ? '⚠ BOSS NEXT ⚠' : '⚠ BOSS NEAR', width / 2, height - 60);
     }
 
-    // Footer
-    ctx.fillStyle = 'rgba(0,0,0,0.7)';
-    ctx.fillRect(0, height - 48, width, 48);
-    ctx.fillStyle = '#44ff88';
-    ctx.font = 'bold 14px monospace';
+    // Footer — gradient + accent stripe matching header
+    {
+      const fg = ctx.createLinearGradient(0, height - 52, 0, height);
+      fg.addColorStop(0, 'rgba(8,8,16,0.5)');
+      fg.addColorStop(1, 'rgba(8,8,16,0.95)');
+      ctx.fillStyle = fg;
+      ctx.fillRect(0, height - 52, width, 52);
+      const sg = ctx.createLinearGradient(0, 0, width, 0);
+      sg.addColorStop(0, 'rgba(0,0,0,0)');
+      sg.addColorStop(0.5, theme.col);
+      sg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = sg;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(0, height - 52, width, 2);
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = '#88ffbb';
+    ctx.font = 'bold 13px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('Click a glowing room to advance', width / 2, height - 18);
+    ctx.fillText('◆  Click a glowing room to advance  ◆', width / 2, height - 22);
+    ctx.fillStyle = '#445566';
+    ctx.font = '10px monospace';
+    ctx.fillText('Press I for inventory  ◆  ESC for pause menu', width / 2, height - 8);
   }
 }

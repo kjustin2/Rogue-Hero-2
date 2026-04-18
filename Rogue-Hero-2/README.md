@@ -57,17 +57,17 @@ Since the game is purely HTML5 and Canvas-based, you can also host it on the web
 | Space | Dodge (Free at Cold, -5 at Hot, Locked at Critical) |
 | F | Manual Tempo Crash (85+ Tempo only) |
 | R | Restart (Dead / Win only) |
-| **F2** (char select) | **Toggle local 2-player co-op** |
+| **2P CO-OP button** (top-right of char select) | **Toggle local 2-player co-op** |
 
 ### Player 2 (local co-op)
 
 | Input | Action |
 |---|---|
 | Arrow keys | Move |
-| Numpad 4 / 8 / 6 / 2 | Aim reticle (left / up / right / down) |
-| Numpad 0 | Fire / attack |
-| Numpad 5 or RShift | Dodge |
-| Numpad 1–4 | Play card from shared hand |
+| I / J / K / L | Aim reticle (up / left / down / right) |
+| U | Fire / attack |
+| O | Dodge |
+| 7 / 8 / 9 / 0 | Play card from shared hand (slots 1–4) |
 
 When a co-op ally is reduced to 0 HP they go **downed** instead of dying — stand near them to revive. The run ends only when *all* players are downed or dead.
 
