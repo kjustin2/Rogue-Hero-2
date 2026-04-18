@@ -3677,9 +3677,27 @@ function render() {
         ctx.textAlign = 'center';
       }
 
-      // Status
-      ctx.fillStyle = '#ff8866'; ctx.font = '12px monospace';
-      ctx.fillText(lobbyStatusMsg || '', cx, slotY + 14 + 4 * 34 + 24);
+      // Status + relay health line
+      {
+        const statusY = slotY + 14 + 4 * 34 + 24;
+        const msg = lobbyStatusMsg || '';
+        ctx.fillStyle = msg.startsWith('⚠') ? '#ff8866' : msg.startsWith('🟢') ? '#44ff88' : '#aaccdd';
+        ctx.font = '12px monospace';
+        ctx.fillText(msg, cx, statusY);
+        // Show live tracker count so the user can confirm WebRTC is ready
+        try {
+          if (typeof net._trysteroMod === 'undefined') net._trysteroMod = null; // guard
+          const tryst = window._trysteroModRef;
+          if (tryst && typeof tryst.getRelaySockets === 'function') {
+            const sockets = tryst.getRelaySockets();
+            const open = Object.values(sockets).filter(ws => ws && ws.readyState === 1).length;
+            const total = Object.keys(sockets).length;
+            ctx.fillStyle = open > 0 ? '#55cc88' : '#ff7755';
+            ctx.font = '11px monospace';
+            ctx.fillText(`trackers: ${open}/${total} open`, cx, statusY + 18);
+          }
+        } catch (_e) { /* non-fatal */ }
+      }
 
       // Back
       const xbW = 160, xbH = 38, xbX = cx - xbW / 2, xbY = canvas.height - 70;

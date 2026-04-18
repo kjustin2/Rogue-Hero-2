@@ -192,6 +192,7 @@ export class Net {
     }
 
     this.connected = true;
+    window._trysteroModRef = tryst; // expose for lobby relay-count display
     this._dispatch('status', { kind: 'connected', room: roomCode });
     console.log(`[Net] connected to room "${roomCode}" (waiting for peers)`);
 
