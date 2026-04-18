@@ -782,11 +782,12 @@ export class UI {
         ctx.textAlign = 'center';
         ctx.fillText(def.cost, x + 16, y + 21);
 
-        // Type glyph — top-right corner, distinct symbol per card type
+        // Type glyph — small badge tucked against the AP cost badge.
+        // (Was top-right corner where it overlapped the [1]/[2]/[3]/[4] slot label.)
         ctx.fillStyle = canAfford ? (def.color || '#ddd') : '#444';
-        ctx.font = 'bold 20px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(cardGlyph(def.type), x + CARD_W - 16, y + 22);
+        ctx.font = 'bold 14px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(cardGlyph(def.type), x + 32, y + 21);
 
         // Tempo shift — prominent
         const tsCol = def.tempoShift > 0 ? (canAfford ? PAL.HOT : '#553322') : (canAfford ? PAL.COLD : '#223344');

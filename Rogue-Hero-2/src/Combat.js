@@ -86,6 +86,10 @@ export class CombatManager {
       this.particles.spawnDamageNumber(enemy.x, enemy.y, amount);
     }
 
+    // Forward damage to peers so the host's authoritative copy of the enemy
+    // takes the same hit when a client lands an attack. HostSim filters by role.
+    events.emit('DAMAGE_DEALT', { id: enemy.id, amount });
+
     if (!enemy.alive) {
       this.particles.spawnBurst(enemy.x, enemy.y, '#dd3333');
       events.emit('KILL', { id: enemy.id });

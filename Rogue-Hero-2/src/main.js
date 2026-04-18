@@ -153,23 +153,29 @@ const reconcile = new Reconcile();
 // Apply incoming position snapshots to the player & remote-entity placeholders.
 // Solo: never fires (Net.connect is no-op).
 net.on('snap', (snap) => {
-  // Hosts are authoritative — they should never reconcile against
-  // an incoming snapshot of themselves.
-  if (net.role === 'host') return;
+  // Co-op model: each side is authoritative for its OWN player position
+  // (no applyOwn). Each side updates its `_isRemote` placeholders from
+  // incoming snaps. Only the host broadcasts enemy positions; client
+  // interpolates them so the world stays visually in sync.
   if (!snap || !snap.e) return;
   snapDecoder.apply(snap);
-  // Reconcile own player against the host's authoritative position
-  if (player && player.id) {
-    const own = snapDecoder.positions.get(player.id);
-    if (own) reconcile.applyOwn(player, own.x, own.y, snap.n || 0);
+  // Update remote player placeholders (any role)
+  for (const p of players.list) {
+    if (!p || !p.id || !p._isRemote) continue;
+    const remote = snapDecoder.positions.get(p.id);
+    if (!remote) continue;
+    reconcile.interpolateRemote(p, remote);
+    if (typeof remote.flags === 'number') {
+      p.downed = (remote.flags & 2) !== 0;
+      p.dodging = (remote.flags & 1) !== 0;
+    }
   }
-  // Smoothly interpolate any remote allies present in the snapshot
-  if (players.count > 1) {
-    for (let i = 1; i < players.list.length; i++) {
-      const p = players.list[i];
-      if (!p || !p.id) continue;
-      const remote = snapDecoder.positions.get(p.id);
-      if (remote) reconcile.interpolateRemote(p, remote);
+  // Client interpolates host-authoritative enemy positions
+  if (net.role === 'client') {
+    for (const e of enemies) {
+      if (!e || !e.id) continue;
+      const remote = snapDecoder.positions.get(e.id);
+      if (remote) reconcile.interpolateRemote(e, remote);
     }
   }
 });
@@ -183,6 +189,47 @@ net.on('status', (s) => {
   else if (s.kind === 'connected')  lobbyStatusMsg = `Connected — Share code ${s.room}`;
   else if (s.kind === 'error')      lobbyStatusMsg = `⚠ ${s.msg}`;
   else if (s.kind === 'peer-error') lobbyStatusMsg = `⚠ ${s.msg}`;
+});
+// Handle peer connect / disconnect
+net.on('peer', (msg) => {
+  if (!msg) return;
+  if (msg.kind === 'join') {
+    if (net.role === 'host') {
+      _lobbyPeers.push({ peerId: msg.peerId, name: 'Player ' + (net.peers.size + 1) });
+      if (gameState === 'lobby') lobbyStatusMsg = `Player connected! ${net.peers.size} peer(s) in room`;
+    } else if (net.role === 'client' && gameState === 'lobby') {
+      lobbyMode = 'connected';
+      lobbyStatusMsg = 'Connected to host — waiting for them to start…';
+    }
+  } else if (msg.kind === 'leave') {
+    _lobbyPeers = _lobbyPeers.filter(p => p.peerId !== msg.peerId);
+    const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard'].includes(gameState);
+    if (inRun) {
+      _remoteDisconnected = true;
+      _remoteDisconnectTimer = 6;
+      players.list = players.list.filter(p => !p._isRemote);
+      // Switch local player out of co-op mode so they can die normally now (no reviver)
+      if (player) player._coopMode = false;
+      // If client just lost host, they become authoritative for room-clear etc.
+      if (net.role === 'client') net.role = 'solo';
+      // Drop any wait-for-peer gates so the remaining player can advance the map
+      _remotePhaseDone = true;
+      _localPhaseDone = true;
+    } else if (gameState === 'charSelect') {
+      _remoteReady = false;
+      _clientReady = false;
+      lobbyStatusMsg = 'Remote player disconnected';
+    } else if (gameState === 'lobby') {
+      if (net.role === 'client') {
+        lobbyMode = 'joining';
+        lobbyStatusMsg = 'Host disconnected — enter a new code';
+        net.role = 'solo';
+      } else {
+        lobbyStatusMsg = 'A player disconnected';
+        _remoteReady = false;
+      }
+    }
+  }
 });
 // Handle reliable events from host. Two formats coexist:
 //   Direct game events:  { type: 'FOO', ...data }
@@ -200,15 +247,23 @@ net.on('evt', (msg) => {
       players.list[1].charId = _remoteCharId;
     }
 
+  } else if (type === 'PLAYER_READY') {
+    if (net.role === 'host') {
+      _remoteReady = true;
+      _remoteCharId = p.charId || msg.charId || _remoteCharId;
+    }
+
   } else if (type === 'START_LOBBY') {
     lobby.seed = msg.seed;
+    _clientReady = false;
+    _remoteReady = false;
     gameState = 'charSelect';
     audio.playBGM('menu');
 
   } else if (type === 'GAME_STARTED') {
     lobby.seed = msg.seed;
     _remoteCharId = msg.charId; // host's charId — used for the remote placeholder
-    // Client keeps their own selectedCharId; we do NOT override it here
+    if (!selectedCharId) selectedCharId = 'blade'; // fallback if client never picked
     startNewRun(msg.seed);
     // Tell host which character we chose
     net.sendReliable('evt', { type: 'CHAR_SELECTED', charId: selectedCharId });
@@ -240,6 +295,14 @@ net.on('evt', (msg) => {
     enemies = [];
     roomsCleared++;
     audio.silenceMusic();
+    // Sync floor advance from boss kills so client's map matches host's
+    if (typeof msg.floor === 'number' && msg.floor !== runManager.floor) {
+      runManager.floor = msg.floor;
+      runManager.generateMap();
+      currentBiome = pickBiomeForFloor(runManager.floor, runManager.getRng());
+      window._biome = currentBiome;
+      if (room) room.biome = currentBiome;
+    }
     if (msg.isVictory) {
       gameState = 'victory';
       _victoryAnimStart = null;
@@ -267,16 +330,59 @@ net.on('evt', (msg) => {
       if (e && e.alive) { e.alive = false; events.emit('PLAY_SOUND', 'kill'); }
     }
 
+  } else if (type === 'DAMAGE_DEALT') {
+    // Host receives damage events from clients and applies them authoritatively
+    if (net.role !== 'host') return;
+    const dmgId = p?.id || msg.id;
+    const dmgAmount = p?.amount || msg.amount;
+    if (!dmgId || !dmgAmount) return;
+    const target = enemies.find(en => en.id === dmgId);
+    if (target && target.alive) {
+      target.takeDamage(dmgAmount);
+      if (!target.alive) {
+        events.emit('KILL', { id: target.id });
+        events.emit('PLAY_SOUND', 'kill');
+      }
+    }
+
   } else if (type === 'PLAYER_DOWNED') {
-    // Visually mark the remote player as downed
+    // Mark the remote placeholder as downed so local revive logic + UI work
     if (players.list.length > 1 && players.list[1]._isRemote) {
       players.list[1].downed = true;
+      players.list[1].hp = 0;
+      players.list[1].reviveProgress = 0;
     }
 
   } else if (type === 'PLAYER_REVIVED') {
     if (players.list.length > 1 && players.list[1]._isRemote) {
       players.list[1].downed = false;
-      players.list[1].hp = players.list[1].maxHp;
+      players.list[1].reviveProgress = 0;
+      players.list[1].hp = Math.max(1, Math.round(players.list[1].maxHp * 0.3));
+    }
+
+  } else if (type === 'PHASE_DONE') {
+    // Peer finished their post-combat decision phase — host can now advance the map
+    _remotePhaseDone = true;
+
+  } else if (type === 'BATTLE_START') {
+    // Host pressed Enter in prep — client transitions to playing in lockstep
+    if (net.role === 'client' && gameState === 'prep') {
+      particles.spawnRoomEntryFlash();
+      gameState = 'playing';
+      _combatStartFlash = 0.5;
+      _fadeAlpha = 0;
+      _ambientInit = false;
+    }
+
+  } else if (type === 'GAME_OVER') {
+    // Either side can declare run over (e.g., all players downed, or boss escape)
+    if (gameState === 'playing' || gameState === 'prep' || gameState === 'map' || gameState === 'draft') {
+      runStats.floor = runManager.floor;
+      runStats.finalDeck = [...deckManager.collection];
+      runStats.won = false;
+      checkRunUnlocks(false);
+      playerDeathTimer = 0.8;
+      input.clearFrame();
     }
 
   } else if (type === 'BOSS_PHASE') {
@@ -357,6 +463,16 @@ let lobbyJoinCode = '';          // text being typed for join
 let lobbyStatusMsg = '';         // bottom-line status text
 let lobbyBoxes = [];
 let _remoteCharId = null;        // remote peer's selected character (for placeholder rendering)
+let _remoteReady = false;        // host: remote client has clicked READY in charSelect
+let _clientReady = false;        // client: local player has clicked READY in charSelect
+let _remoteDisconnected = false; // in-game: remote peer disconnected mid-run
+let _remoteDisconnectTimer = 0;  // seconds until banner auto-hides
+let _lobbyPeers = [];            // host: [{ peerId, name }] peers currently in lobby
+// PHASE_DONE handshake — gate map advance until both players have finished
+// the post-combat decision phase (draft / itemReward / shop / rest / event).
+let _localPhaseDone = true;      // we've signaled "done" to the peer
+let _remotePhaseDone = true;     // peer has signaled "done" to us
+let _prevSyncState = null;       // tracks gameState transitions for the handshake
 
 // Cosmetics state
 let lootBoxOpen = null;         // { boxTier, result, elapsed, isSL, waitingDismiss }
@@ -781,7 +897,8 @@ function startNewRun(explicitSeed) {
   player.setClassPassives(charDef.passives);
   player.charId = selectedCharId;
   player.haloColor = PLAYER_HALO_COLORS[0];
-  player._coopMode = !!localCoop;
+  // Co-op mode (downed-instead-of-die): true for local 2P AND remote multiplayer
+  player._coopMode = !!localCoop || (net.role !== 'solo' && net.peers.size > 0);
   // Stable ID for snapshot reconciliation: host is always p0, client is p1
   player.playerIndex = net.role === 'client' ? 1 : 0;
   player.id = 'p' + player.playerIndex;
@@ -1465,8 +1582,13 @@ function buildEquippedCosmetics(eq) {
 
 function update(logicDt, realDt) {
   runStats.elapsedTime += realDt;
-  // Poll Xbox / standard gamepads each frame so they feed key & mouse state
-  input.pollGamepads();
+  // Poll Xbox / standard gamepads each frame so they feed key & mouse state.
+  // Per-slot enable comes from MetaProgress (toggled in char select).
+  input.pollGamepads({
+    enabledP1: meta.isGamepadEnabled(0),
+    enabledP2: meta.isGamepadEnabled(1),
+    localCoop,
+  });
 
   // Set cosmetic context for this frame (used by player.js trail + draw)
   if (selectedCharId && meta.cosmeticsUnlocked()) {
@@ -1620,6 +1742,10 @@ function update(logicDt, realDt) {
         }
         startNewRun();
       }
+      if (result === 'ready' && selectedCharId && net.role === 'client' && !_clientReady) {
+        _clientReady = true;
+        net.sendReliable('evt', { type: 'PLAYER_READY', charId: selectedCharId });
+      }
       // Broadcast character selection so the remote peer can render the right placeholder
       if ((result === 'start' || result === 'selected') && selectedCharId && net.role !== 'solo') {
         net.sendReliable('evt', { type: 'CHAR_SELECTED', charId: selectedCharId });
@@ -1717,7 +1843,7 @@ function update(logicDt, realDt) {
             audio.playBGM('menu');
             break;
           }
-          if (b.action === 'lobby_back') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; net.disconnect(); net.role = 'solo'; break; }
+          if (b.action === 'lobby_back') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; _lobbyPeers = []; _remoteReady = false; _clientReady = false; net.disconnect(); net.role = 'solo'; break; }
           if (b.action === 'join_confirm' && lobbyJoinCode.length === 6) {
             net.role = 'client';
             lobbyStatusMsg = `Connecting…`;
@@ -1754,6 +1880,12 @@ function update(logicDt, realDt) {
     }
     if (input.consumeClick()) {
       if (ui.showInventory) { /* clicks fall through to overlay dismiss */ }
+      // Remote client can't navigate the map — only host picks the next room
+      if (net.role === 'client') { input.clearFrame(); return; }
+      // Host: wait for client to finish their post-combat decision phase
+      if (net.role === 'host' && net.peers.size > 0 && !_remotePhaseDone) {
+        input.clearFrame(); return;
+      }
       const node = runManager.handleMapClick(input.mouse.x, input.mouse.y, canvas.width, canvas.height);
       if (node) {
         console.log(`[Map] Node "${node.id}" type="${node.type}"`);
@@ -2036,11 +2168,12 @@ function update(logicDt, realDt) {
 
   // ── PREP ──
   if (gameState === 'prep') {
-    let startCombat = input.consumeKey('enter');
+    // Only host (or solo) can trigger combat start. Clients wait for BATTLE_START event.
+    const canStartCombat = net.role !== 'client';
+    let startCombat = canStartCombat && input.consumeKey('enter');
     if (input.consumeClick()) {
       const mx = input.mouse.x, my = input.mouse.y;
-      // Check fight button first
-      if (ui.prepFightBox) {
+      if (canStartCombat && ui.prepFightBox) {
         const fb = ui.prepFightBox;
         if (mx >= fb.x && mx <= fb.x + fb.w && my >= fb.y && my <= fb.y + fb.h) {
           startCombat = true;
@@ -2050,6 +2183,10 @@ function update(logicDt, realDt) {
     }
     if (startCombat) {
       console.log(`[Prep] Hand: [${deckManager.hand.join(', ')}]`);
+      // Notify clients first so both sides flip into combat together
+      if (net.role === 'host' && net.peers.size > 0) {
+        net.sendReliable('evt', { type: 'BATTLE_START' });
+      }
       particles.spawnRoomEntryFlash();
       gameState = 'playing';
       _combatStartFlash = 0.5;
@@ -2178,6 +2315,21 @@ function update(logicDt, realDt) {
       _resonanceFlashTimer = 0.6;
     }
     tempo._groupResonanceMult = newMult;
+  }
+
+  // Co-op wipe check: if every player is downed (no one to revive), end the run.
+  // Applies to both local 2P coop and remote multiplayer, since downed players
+  // never auto-die — they need an active ally in range to revive them.
+  if (player._coopMode && playerDeathTimer === 0 && gameState === 'playing' && players.allDownedOrDead()) {
+    console.log('[Run] Co-op wipe: all players downed');
+    runStats.floor = runManager.floor;
+    runStats.finalDeck = [...deckManager.collection];
+    runStats.won = false;
+    checkRunUnlocks(false);
+    playerDeathTimer = 1.2;
+    if (net.role !== 'solo' && net.peers.size > 0) {
+      net.sendReliable('evt', { type: 'GAME_OVER', reason: 'wipe' });
+    }
   }
 
   // IDEA-12: Brutal floor curse effects
@@ -2340,8 +2492,9 @@ function update(logicDt, realDt) {
     }
   }
 
-  // Room clear check — skip if player died this frame
-  if (enemies.length === 0 && gameState === 'playing' && player.alive) {
+  // Room clear check — skip if player died this frame.
+  // Clients wait for host's authoritative ROOM_CLEARED event to avoid desync.
+  if (enemies.length === 0 && gameState === 'playing' && player.alive && net.role !== 'client') {
     handleCombatClear();
   }
 
@@ -2595,7 +2748,25 @@ function update(logicDt, realDt) {
   particles.update(logicDt);
   // RH2: host broadcasts position snapshots after sim step (no-op in solo)
   hostSim.tick(logicDt, players.list, enemies);
+  // PHASE_DONE handshake: detect transitions in/out of decision phases
+  if (_prevSyncState !== gameState) {
+    const decisionPhases = ['draft', 'itemReward', 'shop', 'rest', 'event', 'discard', 'upgrade'];
+    // Just left a decision phase for the map → we're done with that phase
+    if (gameState === 'map' && decisionPhases.includes(_prevSyncState)) {
+      if (net.role !== 'solo' && net.peers.size > 0) {
+        net.sendReliable('evt', { type: 'PHASE_DONE' });
+      }
+      _localPhaseDone = true;
+    }
+    // Entering combat resets both flags — there's a fresh decision phase coming after
+    if (gameState === 'prep' || gameState === 'playing') {
+      _localPhaseDone = false;
+      _remotePhaseDone = false;
+    }
+    _prevSyncState = gameState;
+  }
   if (_resonanceFlashTimer > 0) _resonanceFlashTimer = Math.max(0, _resonanceFlashTimer - realDt);
+  if (_remoteDisconnectTimer > 0) { _remoteDisconnectTimer = Math.max(0, _remoteDisconnectTimer - realDt); if (_remoteDisconnectTimer <= 0) _remoteDisconnected = false; }
   renderer.updateShake(realDt);
   renderer.updateCA(realDt);
   // Tick zone tooltip
@@ -2622,6 +2793,7 @@ function handleCharSelectClick(mx, my) {
         return 'selected';
       }
       if (b.action === 'start') return 'start';
+      if (b.action === 'ready') return 'ready';
       if (b.action === 'difficulty' && selectedCharId) {
         const maxD = meta.getMaxDifficulty(selectedCharId);
         selectedDifficulty = (selectedDifficulty + 1) % (maxD + 1);
@@ -2629,7 +2801,9 @@ function handleCharSelectClick(mx, my) {
       }
       if (b.action === 'mainMenu') return 'mainMenu';
       if (b.action === 'toggleCoop') { localCoop = !localCoop; return 'toggleCoop'; }
-      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; gameState = 'lobby';
+      if (b.action === 'toggleGamepadP1') { meta.setGamepadEnabled(0, !meta.isGamepadEnabled(0)); return 'toggleGamepadP1'; }
+      if (b.action === 'toggleGamepadP2') { meta.setGamepadEnabled(1, !meta.isGamepadEnabled(1)); return 'toggleGamepadP2'; }
+      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; _lobbyPeers = []; _remoteReady = false; _clientReady = false; _remoteDisconnected = false; gameState = 'lobby';
             // RH2: warm Trystero CDN + WebRTC permissions immediately so the
             // banner shows real status rather than waiting until host-click.
             net.preflight().then(ok => {
@@ -3404,6 +3578,33 @@ function render() {
       ctx2.fillText(on ? '👥  2P CO-OP — ON' : '👤  SOLO — CLICK FOR 2P', cbX + cbW / 2, cbY + 24);
       charSelectBoxes.push({ x: cbX, y: cbY, w: cbW, h: cbH, action: 'toggleCoop' });
 
+      // ── Gamepad toggles — sit just below the coop button ──
+      const gp1On = meta.isGamepadEnabled(0);
+      const gp1Connected = input.isGamepadConnected(0);
+      const gp1bX = cbX, gp1bY = cbY + cbH + 8, gp1bW = on ? Math.floor((cbW - 8) / 2) : cbW, gp1bH = 32;
+      ctx2.fillStyle = gp1On ? '#142a30' : '#1a1520';
+      ctx2.beginPath(); ctx2.roundRect(gp1bX, gp1bY, gp1bW, gp1bH, 6); ctx2.fill();
+      ctx2.strokeStyle = gp1On ? '#44ddcc' : '#6655aa'; ctx2.lineWidth = 1.5; ctx2.stroke();
+      ctx2.fillStyle = gp1On ? '#88ffee' : '#bbaadd';
+      ctx2.font = 'bold 11px monospace';
+      const gp1Dot = gp1Connected ? '🟢' : '⚪';
+      ctx2.fillText(gp1Dot + (on ? ' P1 PAD' : ' GAMEPAD') + (gp1On ? ' ON' : ' OFF'), gp1bX + gp1bW / 2, gp1bY + 21);
+      charSelectBoxes.push({ x: gp1bX, y: gp1bY, w: gp1bW, h: gp1bH, action: 'toggleGamepadP1' });
+
+      if (on) {
+        const gp2On = meta.isGamepadEnabled(1);
+        const gp2Connected = input.isGamepadConnected(1);
+        const gp2bX = gp1bX + gp1bW + 8, gp2bY = gp1bY, gp2bW = gp1bW, gp2bH = gp1bH;
+        ctx2.fillStyle = gp2On ? '#2a1820' : '#1a1520';
+        ctx2.beginPath(); ctx2.roundRect(gp2bX, gp2bY, gp2bW, gp2bH, 6); ctx2.fill();
+        ctx2.strokeStyle = gp2On ? '#ff88aa' : '#6655aa'; ctx2.lineWidth = 1.5; ctx2.stroke();
+        ctx2.fillStyle = gp2On ? '#ffbbcc' : '#bbaadd';
+        ctx2.font = 'bold 11px monospace';
+        const gp2Dot = gp2Connected ? '🟢' : '⚪';
+        ctx2.fillText(gp2Dot + ' P2 PAD' + (gp2On ? ' ON' : ' OFF'), gp2bX + gp2bW / 2, gp2bY + 21);
+        charSelectBoxes.push({ x: gp2bX, y: gp2bY, w: gp2bW, h: gp2bH, action: 'toggleGamepadP2' });
+      }
+
       // P2 controls help panel — visible when 2P is on
       if (on) {
         // Horizontal strip across the bottom — two rows so P1 and P2 don't overlap
@@ -3648,18 +3849,40 @@ function render() {
       charSelectBoxes.push({ x: diffBtnX, y: btnY, w: diffBtnW, h: diffBtnH, action: 'difficulty' });
 
       const startBtnX = canvas.width / 2 + 10, startBtnW = 180, startBtnH = 44;
-      const isRemoteClient = net.role === 'client';
-      ctx2.fillStyle = isRemoteClient ? '#181820' : '#225533';
-      ctx2.beginPath();
-      ctx2.roundRect(startBtnX, btnY, startBtnW, startBtnH, 8);
-      ctx2.fill();
-      ctx2.strokeStyle = isRemoteClient ? '#445566' : '#44ff88';
-      ctx2.lineWidth = 2;
-      ctx2.stroke();
-      ctx2.fillStyle = isRemoteClient ? '#556677' : '#44ff88';
-      ctx2.font = 'bold 18px monospace';
-      ctx2.fillText(isRemoteClient ? 'WAITING…' : 'START RUN', startBtnX + startBtnW / 2, btnY + 29);
-      if (!isRemoteClient) charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'start' });
+      if (net.role === 'client') {
+        // 3-state button: no char → grey hint | char picked, not ready → green READY UP | ready → grey waiting
+        const canReady = !!selectedCharId && !_clientReady;
+        const btnFill   = _clientReady ? '#181820' : canReady ? '#1a3322' : '#181820';
+        const btnStroke = _clientReady ? '#445566' : canReady ? '#44ff88' : '#334455';
+        const btnLabel  = _clientReady ? 'WAITING FOR HOST…' : canReady ? 'READY UP ✓' : 'SELECT HERO FIRST';
+        const btnColor  = _clientReady ? '#556677' : canReady ? '#44ff88' : '#445566';
+        ctx2.fillStyle = btnFill;
+        ctx2.beginPath(); ctx2.roundRect(startBtnX, btnY, startBtnW, startBtnH, 8); ctx2.fill();
+        ctx2.strokeStyle = btnStroke; ctx2.lineWidth = 2; ctx2.stroke();
+        ctx2.fillStyle = btnColor; ctx2.font = 'bold 16px monospace';
+        ctx2.fillText(btnLabel, startBtnX + startBtnW / 2, btnY + 29);
+        if (canReady) charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'ready' });
+        // Show P2 ready status below button for host view (skip for client)
+      } else {
+        // Host button — START RUN (only clickable when multiplayer peer is ready or solo)
+        const waitingForP2 = net.role === 'host' && net.peers.size > 0 && !_remoteReady;
+        ctx2.fillStyle = waitingForP2 ? '#1a1a22' : '#225533';
+        ctx2.beginPath(); ctx2.roundRect(startBtnX, btnY, startBtnW, startBtnH, 8); ctx2.fill();
+        ctx2.strokeStyle = waitingForP2 ? '#554466' : '#44ff88'; ctx2.lineWidth = 2; ctx2.stroke();
+        ctx2.fillStyle = waitingForP2 ? '#886699' : '#44ff88';
+        ctx2.font = waitingForP2 ? 'bold 14px monospace' : 'bold 18px monospace';
+        ctx2.fillText(waitingForP2 ? 'WAITING FOR P2…' : 'START RUN', startBtnX + startBtnW / 2, btnY + 29);
+        // Only register the click box when actually startable
+        if (!waitingForP2) {
+          charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'start' });
+        }
+        // P2 status indicator below button
+        if (net.role === 'host' && net.peers.size > 0) {
+          ctx2.fillStyle = _remoteReady ? '#44ff88' : '#887799';
+          ctx2.font = '12px monospace';
+          ctx2.fillText(_remoteReady ? 'P2: READY ✓' : 'P2: PICKING…', startBtnX + startBtnW / 2, btnY + startBtnH + 16);
+        }
+      }
     } else {
       const ctx2 = renderer.ctx;
       ctx2.fillStyle = '#555';
@@ -3820,20 +4043,20 @@ function render() {
       ctx.fillText(code, cx, 250);
       ctx.restore();
 
-      // Slot list
+      // Slot list — host is always slot 0; _lobbyPeers fills subsequent slots
       const slotY = 290;
       ctx.fillStyle = '#aabbcc'; ctx.font = 'bold 13px monospace';
       ctx.fillText('CONNECTED PLAYERS', cx, slotY);
-      const slots = lobby.slots.length ? lobby.slots : [{ name: 'P1 (you)', peerId: 'host', ready: false }];
+      const allSlots = [{ name: 'P1 (you — host)', peerId: 'host' }, ..._lobbyPeers];
       for (let i = 0; i < 4; i++) {
         const sX = cx - 200, sW = 400, sH = 28, sY = slotY + 14 + i * 34;
-        const filled = i < slots.length;
+        const filled = i < allSlots.length;
         ctx.fillStyle = filled ? '#162028' : '#0a0e14';
         ctx.beginPath(); ctx.roundRect(sX, sY, sW, sH, 5); ctx.fill();
         ctx.strokeStyle = filled ? '#44ddcc' : '#33445566'; ctx.lineWidth = 1; ctx.stroke();
         ctx.fillStyle = filled ? '#cce0d8' : '#445566';
         ctx.font = '13px monospace'; ctx.textAlign = 'left';
-        ctx.fillText(filled ? `▶  ${slots[i].name || 'Player'}` : '   (waiting…)', sX + 12, sY + 19);
+        ctx.fillText(filled ? `▶  ${allSlots[i].name || 'Player'}` : '   (waiting…)', sX + 12, sY + 19);
         ctx.textAlign = 'center';
       }
 
@@ -3956,12 +4179,83 @@ function render() {
         lobbyBoxes.push({ x: confirmX, y: btY, w: confirmW, h: confirmH, action: 'join_confirm' });
       }
     }
+
+    if (lobbyMode === 'connected') {
+      // Client has connected to a room — waiting for host to start
+      ctx.save();
+      ctx.shadowColor = '#44ff88'; ctx.shadowBlur = 20;
+      ctx.fillStyle = '#ccffdd';
+      ctx.font = 'bold 28px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('CONNECTED TO ROOM', cx, 160);
+      ctx.restore();
+
+      // Room code display
+      ctx.fillStyle = '#aabbcc';
+      ctx.font = '14px monospace';
+      ctx.fillText('Room code:', cx, 200);
+      ctx.save();
+      ctx.shadowColor = '#44ddcc'; ctx.shadowBlur = 16;
+      ctx.fillStyle = '#e8fffa';
+      ctx.font = 'bold 64px monospace';
+      ctx.fillText(lobbyJoinCode || '------', cx, 280);
+      ctx.restore();
+
+      // Waiting indicator
+      const _t3 = performance.now() / 1000;
+      const dots = '.'.repeat((Math.floor(_t3 * 2) % 4));
+      ctx.fillStyle = '#88bbcc';
+      ctx.font = '16px monospace';
+      ctx.fillText('Waiting for host to start' + dots, cx, 340);
+
+      // Status message
+      if (lobbyStatusMsg) {
+        ctx.fillStyle = lobbyStatusMsg.startsWith('⚠') ? '#ff8866' : '#aaffcc';
+        ctx.font = '13px monospace';
+        ctx.fillText(lobbyStatusMsg, cx, 375);
+      }
+
+      // Leave button
+      const lvW = 200, lvH = 42, lvX = cx - lvW / 2, lvY = canvas.height - 90;
+      ctx.fillStyle = '#1a1520';
+      ctx.beginPath(); ctx.roundRect(lvX, lvY, lvW, lvH, 8); ctx.fill();
+      ctx.strokeStyle = '#6655aa'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = '#bbaadd'; ctx.font = 'bold 14px monospace';
+      ctx.fillText('LEAVE ROOM', lvX + lvW / 2, lvY + 28);
+      lobbyBoxes.push({ x: lvX, y: lvY, w: lvW, h: lvH, action: 'lobby_back' });
+    }
+
     return;
   }
 
   // ── MAP ──
   if (gameState === 'map') {
     runManager.drawMap(renderer.ctx, canvas.width, canvas.height, input.mouse.x, input.mouse.y);
+    // Remote multiplayer banners — distinct messaging for host vs. client
+    if (net.role !== 'solo' && net.peers.size > 0) {
+      const ctx = renderer.ctx;
+      const t = performance.now() / 1000;
+      const dots = '.'.repeat((Math.floor(t * 2) % 4));
+      let label = null, color = '#aa88ff';
+      if (net.role === 'client') {
+        label = '⌛  HOST IS PICKING THE NEXT ROOM' + dots;
+      } else if (net.role === 'host' && !_remotePhaseDone) {
+        label = '⌛  WAITING FOR OTHER PLAYER TO FINISH' + dots;
+        color = '#ffaa44';
+      }
+      if (label) {
+        const bW = 520, bH = 44, bX = canvas.width / 2 - bW / 2, bY = canvas.height - 70;
+        ctx.save();
+        ctx.fillStyle = 'rgba(20,18,40,0.92)';
+        ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 10); ctx.fill();
+        ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = '#ddccff';
+        ctx.font = 'bold 15px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, canvas.width / 2, bY + 28);
+        ctx.restore();
+      }
+    }
     const ctx = renderer.ctx;
     const ch = Characters[selectedCharId];
     // Hero info bar — drawn inside the map header area
@@ -4514,6 +4808,22 @@ function render() {
       ctx.fillText('★ GROUP RESONANCE ★', canvas.width / 2, 78);
       ctx.restore();
     }
+    // Remote player disconnected banner
+    if (_remoteDisconnected && _remoteDisconnectTimer > 0) {
+      const k = Math.min(1, _remoteDisconnectTimer / 1.5);
+      ctx.save();
+      ctx.globalAlpha = k * 0.92;
+      const bW = 460, bH = 44, bX = canvas.width / 2 - bW / 2, bY = 110;
+      ctx.fillStyle = 'rgba(40,10,10,0.9)';
+      ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 8); ctx.fill();
+      ctx.strokeStyle = '#ff6644'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.globalAlpha = k;
+      ctx.fillStyle = '#ff9977';
+      ctx.font = 'bold 15px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Remote player disconnected — continuing solo', canvas.width / 2, bY + 28);
+      ctx.restore();
+    }
     // Floor / difficulty badge — top right (below minimap)
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(canvas.width - 115, 105, 103, 38);
@@ -4633,6 +4943,26 @@ function render() {
     drawDraftScreen();
   } else if (gameState === 'prep') {
     ui.drawPrepScreen(renderer.ctx);
+    // Remote co-op: client can't start combat; show a waiting banner over the
+    // prep screen so they know they're not the one pressing Enter.
+    if (net.role === 'client' && net.peers.size > 0) {
+      const ctx = renderer.ctx;
+      const t = performance.now() / 1000;
+      const dots = '.'.repeat((Math.floor(t * 2) % 4));
+      const bW = 460, bH = 56, bX = canvas.width / 2 - bW / 2, bY = canvas.height - 140;
+      ctx.save();
+      ctx.fillStyle = 'rgba(20,18,40,0.92)';
+      ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 10); ctx.fill();
+      ctx.strokeStyle = '#aa88ff'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#ddccff';
+      ctx.font = 'bold 18px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('⌛  WAITING FOR HOST TO START' + dots, canvas.width / 2, bY + 24);
+      ctx.fillStyle = '#aa99cc';
+      ctx.font = '12px monospace';
+      ctx.fillText('Arrange your hand — combat begins when host hits ENTER', canvas.width / 2, bY + 44);
+      ctx.restore();
+    }
   } else if (gameState === 'discard') {
     ui.width = canvas.width; ui.height = canvas.height;
     ui.setMouse(input.mouse.x, input.mouse.y);

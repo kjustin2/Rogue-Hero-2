@@ -67,6 +67,9 @@ export class Players {
   updateRevives(dt) {
     for (const p of this.list) {
       if (!p.alive || !p.downed) continue;
+      // In remote MP, the `_isRemote` placeholder is owned by the OTHER side —
+      // their machine handles its revive and broadcasts PLAYER_REVIVED back.
+      if (p._isRemote) continue;
       let inContact = false;
       for (const a of this.list) {
         if (a === p || !a.alive || a.downed) continue;

@@ -145,18 +145,21 @@ export class InputManager {
       if (key === 'w' || key === 'arrowup')    return this.touchJoystick.dy < -deadzone;
       if (key === 's' || key === 'arrowdown')  return this.touchJoystick.dy > deadzone;
     }
-    // Map gamepad #0 left stick → P1's arrows
+    // Map gamepad #0 left stick → P1 movement.
+    // In solo P1 reads either WASD or arrows; in coop P1 reads arrows (P2 takes WASD).
+    // Only forward to WASD in solo so pad 0 doesn't double-control P2 when both share.
     const gp0 = this._gpState[0];
-    if (gp0 && gp0.connected) {
+    if (gp0 && gp0.connected && gp0.enabled !== false) {
       const dz = 0.30;
-      if (key === 'arrowleft'  && gp0.lx < -dz) return true;
-      if (key === 'arrowright' && gp0.lx >  dz) return true;
-      if (key === 'arrowup'    && gp0.ly < -dz) return true;
-      if (key === 'arrowdown'  && gp0.ly >  dz) return true;
+      const allowWasd = !gp0.localCoop;
+      if ((key === 'arrowleft'  || (allowWasd && key === 'a')) && gp0.lx < -dz) return true;
+      if ((key === 'arrowright' || (allowWasd && key === 'd')) && gp0.lx >  dz) return true;
+      if ((key === 'arrowup'    || (allowWasd && key === 'w')) && gp0.ly < -dz) return true;
+      if ((key === 'arrowdown'  || (allowWasd && key === 's')) && gp0.ly >  dz) return true;
     }
-    // Gamepad #1 left stick → P2's WASD
+    // Gamepad #1 left stick → P2's WASD (in coop the keyboard P2 uses arrows; pad takes over)
     const gp1 = this._gpState[1];
-    if (gp1 && gp1.connected) {
+    if (gp1 && gp1.connected && gp1.enabled !== false) {
       const dz = 0.30;
       if (key === 'a' && gp1.lx < -dz) return true;
       if (key === 'd' && gp1.lx >  dz) return true;
@@ -167,9 +170,15 @@ export class InputManager {
   }
 
   // RH2: poll connected gamepads each frame. P1 = pad 0, P2 = pad 1.
-  // Buttons: A(0)=attack, B(1)=dodge, X(2)=card prev, Y(3)=card next.
+  // Buttons: A(0)=attack, B(1)=dodge, X/Y/LB/RB → card slots 1-4.
   // Right stick on pad 0 moves the mouse cursor for aim.
-  pollGamepads() {
+  // `opts.enabledP1` / `opts.enabledP2` gate per-slot input so a plugged-in
+  // controller never silently overrides the keyboard. `opts.localCoop` swaps
+  // the P1 card-slot keys to match coop's 7890 cluster instead of 1234.
+  pollGamepads(opts) {
+    const enabledP1 = !opts || opts.enabledP1 !== false; // default on for backward compat
+    const enabledP2 = !!(opts && opts.enabledP2);
+    const localCoop = !!(opts && opts.localCoop);
     if (!this._gpState) this._gpState = [null, null, null, null];
     const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
     for (let i = 0; i < 4; i++) {
@@ -185,15 +194,20 @@ export class InputManager {
       const ry = pad.axes[3] || 0;
       const btns = pad.buttons.map(b => !!b.pressed);
       const prevBtns = (prev && prev.btns) || [];
-      const newState = { connected: true, lx, ly, rx, ry, btns };
+      const enabled = (i === 0) ? enabledP1 : (i === 1 ? enabledP2 : false);
+      const newState = { connected: true, lx, ly, rx, ry, btns, enabled, localCoop };
       this._gpState[i] = newState;
 
-      // Edge-trigger buttons → justPressed map
-      // P1 (pad 0) uses ' ' for dodge and 1-4/cards; P2 (pad 1) uses 'e'/'q'/1-4
+      // Per-slot enable: still track connected/state for UI, but skip input dispatch
       const isP1 = i === 0;
+      if (!enabled) continue;
+      if (i > 1) continue; // we only support pads 0 and 1 for now
+
+      // Edge-trigger buttons → justPressed map
       const dodgeKey = isP1 ? ' ' : 'e';
-      const fireKey  = isP1 ? null : 'q';   // P1 fires via mouse click below
-      const cardKeys = isP1 ? ['7','8','9','0'] : ['1','2','3','4'];
+      const fireKey  = isP1 ? null : 'q';   // P1 fires via mouse click
+      // P1 in solo uses 1-4; in coop uses 7-0 (right cluster). P2 always 1-4 (left cluster).
+      const cardKeys = isP1 ? (localCoop ? ['7','8','9','0'] : ['1','2','3','4']) : ['1','2','3','4'];
 
       // A button (idx 0)
       if (btns[0] && !prevBtns[0]) {
@@ -215,6 +229,9 @@ export class InputManager {
       if (btns[4] && !prevBtns[4]) this.justPressed.add(cardKeys[2]);
       if (btns[5] && !prevBtns[5]) this.justPressed.add(cardKeys[3]);
 
+      // Start (9) → enter (menus / start combat)
+      if (btns[9] && !prevBtns[9]) this.justPressed.add('enter');
+
       // Right stick on P1's pad → move the mouse cursor for aim
       if (isP1 && this.canvas) {
         const mag2 = rx * rx + ry * ry;
@@ -225,6 +242,12 @@ export class InputManager {
         }
       }
     }
+  }
+
+  // True if the slot's pad is physically connected (regardless of enable flag).
+  isGamepadConnected(slot) {
+    const g = this._gpState && this._gpState[slot];
+    return !!(g && g.connected);
   }
 
   // True if any gamepad is currently connected (UI hint)

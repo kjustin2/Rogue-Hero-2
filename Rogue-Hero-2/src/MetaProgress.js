@@ -32,6 +32,10 @@ const DEFAULT_STATE = {
   },
   masteryUnlockedCards: [], // globally unlocked via mastery
   masterVolume: 1.0,
+  // Gamepad input toggles — saved across sessions. Players opt in per slot
+  // so a connected controller never silently steals input from the keyboard.
+  gamepadP1Enabled: false,
+  gamepadP2Enabled: false,
   // ── Cosmetics ──
   cosmetics: {
     gold: 0,
@@ -212,6 +216,16 @@ export class MetaProgress {
 
   getMasterVolume() { return this.state.masterVolume !== undefined ? this.state.masterVolume : 1.0; }
   setMasterVolume(v) { this.state.masterVolume = Math.max(0, Math.min(1, v)); this.save(); }
+
+  isGamepadEnabled(slot) {
+    if (slot === 1) return !!this.state.gamepadP2Enabled;
+    return !!this.state.gamepadP1Enabled;
+  }
+  setGamepadEnabled(slot, on) {
+    if (slot === 1) this.state.gamepadP2Enabled = !!on;
+    else this.state.gamepadP1Enabled = !!on;
+    this.save();
+  }
 
   // ── COSMETICS ──
 
