@@ -1,240 +1,264 @@
-# Rogue Hero 2 — Multiplayer Backend Setup
+# Rogue Hero 2 — Multiplayer Setup (Cloudflare Workers)
 
-This document is for **you, the project owner** — it lists the manual steps and dollar costs for turning the in-game lobby (which already collects room codes and shows the host/join UI) into a working remote co-op experience.
+## Current Status
 
-The game itself is **already wired** to do the right thing once a backend exists:
+Trystero (BitTorrent tracker strategy) works for peer discovery but the WebRTC
+ICE/NAT handshake fails between two real home networks — the trackers connect,
+but the actual game data channel never opens.
 
-- `src/net/Net.js` is the single integration point. Everything else in the game (`HostSim`, `Reconcile`, `SnapshotEncoder/Decoder`, `Lobby`) is transport-agnostic.
-- The lobby UI (char select → 🌐 REMOTE LOBBY) generates room codes via `Lobby.makeRoomCode()` and currently just shows them; once the backend is configured, the same buttons start a real session.
-
-## Why a backend is needed at all
-
-Rogue Hero 2 multiplayer uses **WebRTC DataChannels** for actual gameplay traffic — that's peer-to-peer, no server in the loop, very low latency. But two browsers cannot find each other on the open internet without help. They need:
-
-1. **Signaling** — a tiny relay that lets P1 and P2 swap WebRTC SDP offers + ICE candidates. After this exchange (1–3 KB total per pair), the relay is no longer in the data path.
-2. **STUN** — public Google STUN servers (`stun:stun.l.google.com:19302`) work for ~85% of NAT setups, free.
-3. **TURN** *(optional)* — relay for the ~15% of users behind symmetric NAT or strict firewalls. Required for full reliability. Costs bandwidth.
-
-The signaling backend is **the only thing you must host**. STUN is free; TURN is recommended but optional.
+**Solution:** Replace the tracker-based signaling with a Cloudflare Workers
+Durable Object that relays WebRTC SDP/ICE messages directly, and keep the same
+native WebRTC DataChannels for game traffic. The Worker is ~100 lines, always
+free for our traffic volume, and eliminates the third-party dependency entirely.
 
 ---
 
-## Backend Options Compared
+## Architecture
 
-| Option | Setup time | Monthly cost (≤100 active rooms) | Monthly cost (~1000 rooms) | Reliability | Notes |
-|---|---|---|---|---|---|
-| **A. Cloudflare Workers + Durable Objects** | 1–2 hrs | **$0** (free tier) | **$5–10** | ★★★★★ | Best fit. Free tier handles thousands of signaling sessions. WebSocket Hibernation = pay only while active. |
-| **B. Self-host on a small VPS (Hetzner / Fly.io)** | 2–3 hrs | **€4 / $5** | **€4 / $5** (flat) | ★★★★☆ | Predictable cost, full control. Tiny Node.js + `ws` server handles thousands of concurrent sockets. |
-| **C. Trystero (free public BitTorrent trackers)** | 30 min | **$0** | **$0** | ★★★☆☆ | Drop-in WebRTC mesh, no infra. Public trackers occasionally rate-limit or go offline. |
-| **D. PeerJS Cloud** | 30 min | **$0** | **$0** | ★★★☆☆ | Public broker, fine for hobby projects. No SLA, occasional downtime. |
-| **E. Hosted realtime (Ably / Pusher / Pubnub)** | 1 hr | **$25** | **$50–200** | ★★★★★ | Easy SDKs, generous free tier *for messages* but RTC signaling burns through it fast. |
-| **F. Daily.co / LiveKit / Agora** | 2 hrs | **$0** (small free tier) | **$50–500** | ★★★★★ | Way overkill — these are full SFU video stacks. Skip unless you also want voice chat. |
+```
+Player A                   Cloudflare Worker                Player B
+  |                        (rh2-signal)                       |
+  |--- WebSocket join -------->  Room DO  <------- join -------|
+  |<-- welcome: [peers] ------  (per room)                    |
+  |                               |  <--- peer_joined --------|
+  |--- offer SDP ------------->   |                           |
+  |                               |------ offer SDP --------->|
+  |                        <--- answer SDP -------------------|
+  |<-- answer SDP ----------      |                           |
+  |--- ICE candidates -------> relay  <--- ICE candidates ----|
+  |                                                           |
+  |<===================== WebRTC DataChannel ================>|
+  |              (direct P2P — Worker no longer involved)     |
+```
 
-**My recommendation:** Start with **C (Trystero)** to ship multiplayer in 30 minutes with $0 infra. If you outgrow it, migrate to **A (Cloudflare)** for production. Skip B unless you specifically want a VPS.
-
----
-
-## Cost Detail (per option)
-
-### A. Cloudflare Workers + Durable Objects
-
-Cloudflare's pricing as of 2026:
-
-- **Workers Free**: 100k requests/day, 10ms CPU time per request. A signaling exchange is ~4 messages × 2 peers = 8 requests per join, so the free tier handles ~12,500 joins/day = ~400 active 30-minute rooms. Plenty for early-stage.
-- **Workers Paid ($5/mo)**: 10M requests/mo + 1M Durable Object requests included. Past that, **$0.20 per million Workers requests** and **$0.20 per million DO requests**.
-- **Durable Objects WebSocket Hibernation**: you pay for active WebSocket *time* only when messages flow. A typical lobby session bills ~30 seconds of duration. At $12.50/M GB-sec memory and 128MB DO instance, an idle hibernated room is effectively free.
-- **TURN via Cloudflare Calls** (optional): 1000 free minutes/mo, then $0.05/GB egress. A 4-player run with full TURN relay uses ~3 MB/min — so $0.05/GB ≈ free for hundreds of runs/month.
-
-**Realistic budget:** $0/mo for hundreds of nightly sessions; $5/mo gives you ~10× headroom; $25/mo would cover a successful indie launch.
-
-### B. Self-host (Hetzner CX11 / CAX11 — ARM is cheaper)
-
-- **Hetzner CAX11** (ARM): **€3.79/mo** — 2 vCPU, 4 GB RAM, 40 GB SSD, 20 TB egress. Lots of headroom for signaling.
-- **Fly.io shared-CPU-1x**: **~$1.94/mo** at 256 MB, but you pay for bandwidth and they removed the always-free tier in 2024.
-- **AWS Lightsail $3.50/mo**: 512 MB RAM — just barely enough for a Node + `ws` signaling server.
-
-A single 256-MB instance running `ws` (Node.js WebSocket library) holds **5,000+ concurrent connections**. You will not outgrow this.
-
-### C. Trystero (free, P2P discovery via BitTorrent trackers)
-
-- **$0/mo, forever.** Uses public WebTorrent/Nostr trackers as the rendezvous point.
-- Trade-off: trackers occasionally throttle, and there's no central authority you control. Fine for a free indie game; not great if uptime is contractual.
-- Library: [`trystero`](https://github.com/dmotz/trystero) — actively maintained, ~15 KB gzipped.
-
-### D. PeerJS Cloud broker
-
-- **$0/mo.** Public broker hosted by the PeerJS project.
-- Same caveats as C: no SLA, occasional downtime. Slightly easier API than raw WebRTC.
-
-### E. Hosted realtime (Ably, Pusher, Pubnub)
-
-- **Ably free tier:** 6M monthly messages, 200 peak concurrent. Each WebRTC handshake is ~6 signaling messages, so 6M = ~1M handshakes/mo. The 200-concurrent limit is the real cap — that's ~50 rooms at any moment.
-- **Ably paid:** starts at $29/mo for 25M messages and unlimited peak concurrency.
-- Easy SDKs, but you're paying for features (presence, history, push) you don't need for signaling.
-
-### F. Daily.co / LiveKit / Agora
-
-- These hand you a full SFU/MCU media server and bill per participant-minute.
-- **LiveKit Cloud free tier:** 1500 participant-minutes/mo. After: $0.005/min = $0.30/hr per peer.
-- **Agora:** $0.99 per 1000 minutes after the free 10k.
-- Only worth it if you also want **voice chat** in-game. Otherwise massive overkill.
+**Signaling** (tiny, through Worker): ~2 KB of SDP + a few ICE candidates per pair.  
+**Game traffic** (DataChannels, fully P2P): snapshots at 15 Hz, events on demand.
 
 ---
 
-## Recommended Path (Step-by-Step)
+## Part 1 — Manual Setup (you do this)
 
-### Path 1 — Ship in 30 minutes with Trystero (option C)
+### Prerequisites
 
-Cost: **$0**. No infrastructure to set up.
+- Node.js 18+ installed (you have this — it runs Electron)
+- A free Cloudflare account
 
-1. From the `Rogue-Hero-2/` folder:
-   ```bash
-   npm install trystero
-   ```
-   Note: this game has no bundler, so you'll need to either (a) drop in a pre-bundled IIFE build of trystero into `src/net/`, or (b) introduce a tiny build step. For an Electron-only build you can also use Node `require` directly.
+### Step 1 — Create a Cloudflare account
 
-2. Replace the body of `src/net/Net.js` with a thin wrapper around Trystero. Keep the same public API (`connect`, `sendUnreliable`, `sendReliable`, `on`, `disconnect`):
+Go to https://dash.cloudflare.com/sign-up and create a free account.
+You do not need to add a domain or a credit card for this step.
+
+### Step 2 — Install Wrangler (the CF deploy CLI)
+
+In any terminal (not necessarily the game directory):
+
+```bash
+npm install -g wrangler
+```
+
+Verify:
+```bash
+wrangler --version
+```
+
+### Step 3 — Authenticate Wrangler with your account
+
+```bash
+wrangler login
+```
+
+This opens a browser window. Click **Allow**. You'll see
+`Successfully logged in` in the terminal.
+
+### Step 4 — Deploy the signaling Worker
+
+The Worker code is already written at `workers/signaling.js` and the config
+is at `wrangler.toml` in the project root. From the project directory:
+
+```bash
+cd E:/Storage/SAAS/Rogue-Hero-2/Rogue-Hero-2
+wrangler deploy
+```
+
+Expected output:
+```
+Total Upload: X.XX KiB / gzip: X.XX KiB
+Uploaded rh2-signal (X sec)
+Published rh2-signal (X sec)
+  https://rh2-signal.YOUR_SUBDOMAIN.workers.dev
+```
+
+**Copy that URL.** You'll need it in Step 6.
+
+> First deploy may show a migration prompt for the Durable Object:
+> `Are you sure you want to apply these migrations? (y/n)` → type **y**.
+
+### Step 5 — Set the Worker URL in Net.js
+
+Open `src/net/Net.js` and find line 10:
+
+```js
+const CF_SIGNAL_URL = ''; // SET THIS after deploying workers/signaling.js
+```
+
+Replace the empty string with your Worker URL using `wss://` (not `https://`):
+
+```js
+const CF_SIGNAL_URL = 'wss://rh2-signal.YOUR_SUBDOMAIN.workers.dev';
+```
+
+Save the file.
+
+### Step 6 — Test the Worker directly
+
+Before running the game, verify the Worker is live:
+
+```bash
+curl https://rh2-signal.YOUR_SUBDOMAIN.workers.dev/
+```
+
+You should see: `RH2 Signal OK`
+
+Also open `multiplayer-test.html` in two Electron windows and verify the
+existing torrent path still works as a fallback (in case CF is ever unreachable).
+
+---
+
+## Part 2 — Code Changes (already done)
+
+The following files have been updated. No further code changes needed once
+you set `CF_SIGNAL_URL` in Step 6.
+
+### `workers/signaling.js`
+
+A Cloudflare Worker with a `Room` Durable Object that:
+- Accepts WebSocket connections, one per player
+- Routes `join` → `welcome` (list of existing peers) + `peer_joined` broadcasts
+- Relays `signal` messages (SDP offers/answers, ICE candidates) between named peers
+- Sends `peer_left` when a connection drops
+- Uses Hibernatable WebSockets (zero cost when no messages flowing)
+
+### `wrangler.toml`
+
+Worker config binding `ROOMS` to the `Room` Durable Object class.
+
+### `src/net/Net.js`
+
+Updated transport layer:
+
+1. **CF path (primary):** when `CF_SIGNAL_URL` is set, `connect()` opens a
+   WebSocket to `CF_SIGNAL_URL/ROOMCODE`, exchanges SDP/ICE via the Worker,
+   and builds native `RTCPeerConnection` + two DataChannels per peer:
+   - `snap` — unordered, no retransmits (position snapshots)
+   - `evt` — ordered, reliable (game events: kills, room transitions, etc.)
+
+2. **Trystero torrent (fallback):** if `CF_SIGNAL_URL` is empty or the Worker
+   is unreachable, falls back to the previous Trystero BitTorrent tracker path.
+   This keeps the game playable while the CF Worker is being set up.
+
+Public API is unchanged — `main.js`, `HostSim`, `Reconcile`, and `Lobby` need
+no changes.
+
+---
+
+## Part 3 — Testing After Setup
+
+### Quick verify (same machine, two windows)
+
+1. `npm start` on your machine (two Electron windows, or one Electron + one browser).
+2. Window A: Remote Co-op → **HOST GAME**. You should see:
+   - The 6-char code displayed large
+   - Status: `Connected (Cloudflare) — Share code XXXXXX`
+   - `trackers: —` (no Trystero, CF path is active)
+3. Window B: Remote Co-op → **JOIN GAME** → type the code → ENTER.
+4. Both windows should show `🟢 Peer connected (1 total)` within ~5 seconds.
+
+### Cross-machine verify
+
+Same steps on two separate machines. Expect ~3–8 seconds for the WebRTC
+ICE handshake (STUN) or ~8–15 seconds if TURN is required (symmetric NAT).
+
+If one machine is behind very strict NAT and STUN doesn't work, see the
+**TURN** section below.
+
+### Check the Worker logs
+
+```bash
+wrangler tail
+```
+
+This streams live log output from the deployed Worker. You should see
+messages like:
+
+```
+[Room ABC123] peer mLEzX4lj joined, 0 existing
+[Room ABC123] relaying signal offer → Vm9UXIaFSY
+[Room ABC123] peer Vm9UXIaFSY joined, 1 existing
+[Room ABC123] relaying signal answer → mLEzX4lj
+```
+
+---
+
+## Part 4 — TURN (if some players still can't connect)
+
+Without a TURN server, ~10–15% of connections fail (corporate networks,
+some ISPs, strict routers). The current config already includes the
+**openrelay.metered.ca** free TURN as a fallback, which covers most cases.
+
+If you want guaranteed reliability, add Cloudflare Calls TURN credentials:
+
+1. In the Cloudflare dashboard → **Calls** → **Create application**.
+2. Copy the `App ID` and generate a `Token`.
+3. In `src/net/Net.js`, find `RTC_CONFIG.iceServers` and add:
    ```js
-   import { joinRoom } from 'trystero';
-   const config = { appId: 'rogue-hero-2' };
-
-   export class Net {
-     constructor(opts = {}) {
-       this.role = opts.role || 'solo';
-       this.handlers = new Map();
-       this.peers = new Map();
-       this.localPeerId = Math.random().toString(36).slice(2, 10);
-     }
-     async connect(roomCode) {
-       if (this.role === 'solo') return;
-       this.room = joinRoom(config, roomCode);
-       const [sendSnap, getSnap] = this.room.makeAction('snap');
-       const [sendEvt,  getEvt]  = this.room.makeAction('evt');
-       this._sendSnap = sendSnap; this._sendEvt = sendEvt;
-       getSnap((p, peerId) => this._dispatch('snap', p, peerId));
-       getEvt((p,  peerId) => this._dispatch('evt',  p, peerId));
-       this.room.onPeerJoin(id => this.peers.set(id, {}));
-       this.room.onPeerLeave(id => this.peers.delete(id));
-       this.connected = true;
-     }
-     sendUnreliable(ch, p) { if (ch === 'snap') this._sendSnap?.(p); }
-     sendReliable(ch, p)   { if (ch === 'evt')  this._sendEvt?.(p); }
-     on(channel, fn) { /* unchanged */ }
-     _dispatch(channel, msg, peerId) { /* unchanged */ }
-     disconnect() { this.room?.leave(); this.connected = false; }
-   }
+   {
+     urls: 'turn:turn.cloudflare.com:3478',
+     username: 'YOUR_APP_ID',
+     credential: 'YOUR_TOKEN',
+   },
    ```
-
-3. That's it. The lobby UI, `HostSim.tick`, `Reconcile`, etc. all work unchanged.
-
-### Path 2 — Production-grade with Cloudflare Workers (option A)
-
-Cost: **$0 to start, $5/mo at scale**. Setup time: 1–2 hours.
-
-1. Sign up for Cloudflare (free), install Wrangler:
-   ```bash
-   npm install -g wrangler
-   wrangler login
-   ```
-
-2. Create a new Worker:
-   ```bash
-   wrangler init rogue-hero-signal --type=javascript
-   cd rogue-hero-signal
-   ```
-
-3. Edit `wrangler.toml`:
-   ```toml
-   name = "rogue-hero-signal"
-   main = "src/index.js"
-   compatibility_date = "2026-01-01"
-
-   [[durable_objects.bindings]]
-   name = "ROOMS"
-   class_name = "Room"
-
-   [[migrations]]
-   tag = "v1"
-   new_sqlite_classes = ["Room"]
-   ```
-
-4. Implement `src/index.js` — a Durable Object per room that relays SDP/ICE between peers. ~150 lines. Reference: [Cloudflare WebSocket Hibernation docs](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
-
-5. Deploy:
-   ```bash
-   wrangler deploy
-   ```
-   You get a URL like `https://rogue-hero-signal.YOUR-NAME.workers.dev`.
-
-6. In `Rogue-Hero-2/src/main.js`, change:
-   ```js
-   const net = new Net({ role: 'solo' });
-   ```
-   to:
-   ```js
-   const net = new Net({ role: 'solo', signalUrl: 'wss://rogue-hero-signal.YOUR-NAME.workers.dev/ws' });
-   ```
-
-7. In `Rogue-Hero-2/src/net/Net.js`, fill in `connect(roomCode)` to (a) open a WebSocket to `signalUrl?room=ROOMCODE`, (b) exchange WebRTC SDP/ICE through it, (c) populate `this.peers` once the DataChannels open. ~200 lines.
-
-8. Optional: enable Cloudflare Calls for free TURN — toggle in dashboard, no code change.
-
-### Path 3 — VPS self-host (option B)
-
-Cost: **€4/mo flat**. Setup time: 2–3 hours.
-
-1. Provision a Hetzner CAX11 (Frankfurt or Ashburn).
-2. Install Node 22, clone a tiny WebSocket relay (~80 lines using `ws`).
-3. `pm2 start signal.js` to keep it running.
-4. Point a subdomain (`signal.yourdomain.com`) at the box and put Caddy in front for free TLS.
-5. Wire `Net.connect()` against `wss://signal.yourdomain.com/ws?room=...`.
+4. Cloudflare Calls TURN: **1,000 free minutes/month**, then $0.05/GB.
+   A 4-player hour through full TURN relay uses ~18 MB = essentially free.
 
 ---
 
-## TURN (optional but recommended)
+## Part 5 — Maintenance
 
-Without TURN, ~10–15% of players (corporate networks, restrictive carriers, dorm Wi-Fi) cannot connect to a host. Options:
+### Re-deploying after changes
 
-| TURN provider | Cost | Notes |
+```bash
+wrangler deploy
+```
+
+### Viewing usage
+
+Cloudflare dashboard → Workers & Pages → `rh2-signal` → **Analytics**.
+
+### Teardown (stop billing)
+
+```bash
+wrangler delete rh2-signal
+```
+
+Then downgrade the Workers plan in the dashboard if you no longer need it.
+
+### Wrangler version issues
+
+If `wrangler deploy` fails with a schema error, update Wrangler:
+```bash
+npm install -g wrangler@latest
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
 |---|---|---|
-| **Cloudflare Calls** | 1000 free min/mo, then $0.05/GB egress | If you're already on Cloudflare, this is the obvious pick. |
-| **Twilio Network Traversal Service** | $0.40/GB | Reliable, well-documented. |
-| **Self-host coturn** | Bandwidth on your VPS only | Coturn is the canonical open-source TURN server. Hetzner gives 20 TB egress free with the €4 box. |
-| **Metered.ca free tier** | 50 GB/mo free | Easy if you just want a credentials endpoint. |
-
-A single 4-player run uses ~3 MB/min of TURN traffic *only when used*. At 50 GB free, that's ~17,000 player-minutes — easily covers thousands of casual sessions.
-
----
-
-## Where the in-game UI lives now
-
-For reference, here's what already works inside the game:
-
-- **🌐 REMOTE LOBBY button** — char-select screen, top-left next to MAIN MENU.
-- **Lobby state (`gameState === 'lobby'`)** — three sub-modes:
-  - `menu` — HOST GAME / JOIN GAME choice.
-  - `hosting` — shows the 6-character room code huge, lists up to 4 player slots.
-  - `joining` — 6-slot text input field, accepts `A–Z` + `2–9` (Crockford-style alphabet, no confusing chars), BACKSPACE/ENTER.
-- **Status line** — currently displays "⚠ Signaling backend not configured. See MULTIPLAYER_SETUP.md" until `Net.connect()` actually completes a handshake.
-
-You only have to deliver a working `Net.connect()` and `Net.peers`. Everything else (snapshot encoding, host-authoritative sim, client prediction, reliable event forwarding) is already wired.
-
----
-
-## TL;DR
-
-| If you want to… | Do this |
-|---|---|
-| Ship multiplayer this afternoon for $0 | Trystero (Path 1) |
-| Build something you can launch a paid game on | Cloudflare Workers (Path 2) |
-| Keep everything on one bill / want a learning project | VPS (Path 3) |
-| Add voice chat too | LiveKit Cloud |
-
-Cost summary at "successful indie game" scale (≈500 nightly co-op rooms):
-
-- Trystero: **$0/mo** (with caveat: relies on public trackers)
-- Cloudflare Workers: **$5–10/mo**
-- Hetzner VPS: **€4/mo**
-- Ably: **$29–49/mo**
-
-All of these are well below the price of one cup of coffee per week.
+| `curl` to Worker returns 404 | Worker not deployed yet | Run `wrangler deploy` |
+| Status shows "⚠ CF Worker unreachable" | Wrong URL or http:// instead of wss:// | Check CF_SIGNAL_URL is `wss://...`, not `https://...` |
+| Peer joins but game data never arrives | DataChannel open race | Wait 2s after `peer joined` before sending — already handled in HostSim |
+| Works same-machine, fails cross-machine | Symmetric NAT, no TURN | Add Cloudflare Calls TURN credentials (see Part 4) |
+| `wrangler deploy` asks for account ID | Not logged in | Run `wrangler login` |
+| DO migration prompt | First deploy only | Type `y` to apply |
+| Game falls back to torrent after CF set | CF_SIGNAL_URL typo or Worker crashed | Check URL, run `wrangler tail` for errors |

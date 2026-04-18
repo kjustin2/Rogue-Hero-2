@@ -133,8 +133,7 @@ console.log('[Init] All systems created. Cards:', Object.keys(CardDefinitions).l
 audio.setMasterVolume(meta.getMasterVolume());
 
 let player = new Player(400, 360);
-player.id = 'p1';            // RH2: stable id for net snapshots / Reconcile
-player.playerIndex = 0;
+// player.id and playerIndex are set in startNewRun() based on net.role
 let enemies = [];
 combat.setLists(enemies, player);
 
@@ -184,6 +183,106 @@ net.on('status', (s) => {
   else if (s.kind === 'connected')  lobbyStatusMsg = `Connected — Share code ${s.room}`;
   else if (s.kind === 'error')      lobbyStatusMsg = `⚠ ${s.msg}`;
   else if (s.kind === 'peer-error') lobbyStatusMsg = `⚠ ${s.msg}`;
+});
+// Handle reliable events from host. Two formats coexist:
+//   Direct game events:  { type: 'FOO', ...data }
+//   HostSim-relayed:     { name: 'FOO', p: payload }
+net.on('evt', (msg) => {
+  if (!msg) return;
+  const type = msg.type || msg.name;
+  if (!type) return;
+  const p = msg.p ?? msg; // HostSim wraps extra data in .p; direct events are flat
+
+  if (type === 'CHAR_SELECTED') {
+    _remoteCharId = p.charId || msg.charId;
+    // Update placeholder charId if it already exists
+    if (players.list.length > 1 && players.list[1]._isRemote) {
+      players.list[1].charId = _remoteCharId;
+    }
+
+  } else if (type === 'START_LOBBY') {
+    lobby.seed = msg.seed;
+    gameState = 'charSelect';
+    audio.playBGM('menu');
+
+  } else if (type === 'GAME_STARTED') {
+    lobby.seed = msg.seed;
+    _remoteCharId = msg.charId; // host's charId — used for the remote placeholder
+    // Client keeps their own selectedCharId; we do NOT override it here
+    startNewRun(msg.seed);
+    // Tell host which character we chose
+    net.sendReliable('evt', { type: 'CHAR_SELECTED', charId: selectedCharId });
+
+  } else if (type === 'MAP_NODE_CHOSEN') {
+    if (net.role !== 'client') return;
+    const { nodeType, nodeId, shopCards: sc, eventType: et } = msg;
+    if (nodeType === 'rest') {
+      restChoiceBoxes = [];
+      gameState = 'rest';
+    } else if (nodeType === 'event') {
+      currentEventType = et;
+      gameState = 'event';
+    } else if (nodeType === 'shop') {
+      shopCards = sc || [];
+      gameState = 'shop';
+    } else {
+      // fight / elite / boss
+      currentCombatNode = { type: nodeType, id: nodeId };
+      spawnEnemies(currentCombatNode);
+      player.x = room.FLOOR_X1 + 100;
+      player.y = (room.FLOOR_Y1 + room.FLOOR_Y2) / 2;
+      gameState = 'prep';
+    }
+
+  } else if (type === 'ROOM_CLEARED') {
+    if (net.role !== 'client') return;
+    // Force-clear any remaining local enemies and mirror host's state transition
+    enemies = [];
+    roomsCleared++;
+    audio.silenceMusic();
+    if (msg.isVictory) {
+      gameState = 'victory';
+      _victoryAnimStart = null;
+      _victoryReady = false;
+      events.emit('PLAY_SOUND', 'victoryFanfare');
+      audio.silenceMusic();
+    } else if (msg.nextState === 'draft') {
+      generateDraft();
+      gameState = 'draft';
+      _draftRevealTimer = 0;
+      _draftRevealMax = draftChoices.length;
+      _fadeAlpha = 0.6; _fadeDir = -1;
+      audio.playBGM('map');
+    } else {
+      gameState = 'map';
+      _fadeAlpha = 0.6; _fadeDir = -1;
+      audio.playBGM('map');
+    }
+
+  } else if (type === 'KILL') {
+    // Mark matching enemy dead on client (best-effort; IDs may drift if RNG diverged)
+    const id = p?.id || msg.id;
+    if (id && gameState === 'playing') {
+      const e = enemies.find(en => en.id === id);
+      if (e && e.alive) { e.alive = false; events.emit('PLAY_SOUND', 'kill'); }
+    }
+
+  } else if (type === 'PLAYER_DOWNED') {
+    // Visually mark the remote player as downed
+    if (players.list.length > 1 && players.list[1]._isRemote) {
+      players.list[1].downed = true;
+    }
+
+  } else if (type === 'PLAYER_REVIVED') {
+    if (players.list.length > 1 && players.list[1]._isRemote) {
+      players.list[1].downed = false;
+      players.list[1].hp = players.list[1].maxHp;
+    }
+
+  } else if (type === 'BOSS_PHASE') {
+    // Already handled visually via position snapshots; just play a sound cue
+    events.emit('PLAY_SOUND', 'bossRoar');
+  }
 });
 let localCoop = false;             // toggled by F2 in char select
 let currentBiome = Biomes.verdant; // updated per floor in startNewRun
@@ -257,6 +356,7 @@ let lobbyMode = 'menu';          // 'menu' | 'hosting' | 'joining'
 let lobbyJoinCode = '';          // text being typed for join
 let lobbyStatusMsg = '';         // bottom-line status text
 let lobbyBoxes = [];
+let _remoteCharId = null;        // remote peer's selected character (for placeholder rendering)
 
 // Cosmetics state
 let lootBoxOpen = null;         // { boxTier, result, elapsed, isSL, waitingDismiss }
@@ -671,7 +771,7 @@ events.on('COMBO_DISPLAY', ({ count, x, y }) => {
 });
 
 // ── Helpers ─────────────────────────────────────────────────────
-function startNewRun() {
+function startNewRun(explicitSeed) {
   const charDef = Characters[selectedCharId];
   player = new Player(400, 360);
   player.hp = charDef.hp;
@@ -682,6 +782,9 @@ function startNewRun() {
   player.charId = selectedCharId;
   player.haloColor = PLAYER_HALO_COLORS[0];
   player._coopMode = !!localCoop;
+  // Stable ID for snapshot reconciliation: host is always p0, client is p1
+  player.playerIndex = net.role === 'client' ? 1 : 0;
+  player.id = 'p' + player.playerIndex;
   // Coop input scheme: P1 → arrows + mouse + '/' dodge. Solo → both schemes + space dodge.
   player._inputScheme = localCoop ? 'arrows' : 'both';
   player._dodgeKey    = localCoop ? '/' : ' ';
@@ -696,12 +799,24 @@ function startNewRun() {
     p2._inputScheme = 'wasd';
     p2._dodgeKey    = ' '; // player2View maps consumeKey(' ') → 'e'
     players.add(p2);
+  } else if (net.role !== 'solo' && net.peers.size > 0) {
+    // Remote co-op: create a placeholder entity for the remote peer.
+    // Its position will be driven by incoming snapshots; we never run updateLogic on it.
+    const remoteCharDef = Characters[_remoteCharId] || Characters['blade'];
+    const rp = makePlayer(remoteCharDef, 500, 360);
+    rp.charId       = _remoteCharId || 'blade';
+    rp.playerIndex  = net.role === 'host' ? 1 : 0;
+    rp.id           = 'p' + rp.playerIndex;
+    rp.haloColor    = PLAYER_HALO_COLORS[1];
+    rp._isRemote    = true;
+    rp._coopMode    = true;
+    players.add(rp);
   }
   window._players = players;
 
   // Seed must be set before any RNG calls
   runManager.floor = 1;
-  runManager.setSeed(Date.now());
+  runManager.setSeed(explicitSeed ?? lobby.seed ?? Date.now());
 
   // Pick 3 random starting cards from the pool using the run seed
   const pool = [...(charDef.startingPool || charDef.startingDeck || [])];
@@ -753,6 +868,8 @@ function startNewRun() {
 function spawnEnemies(node) {
   enemies = [];
   const f = runManager.floor;
+  // IDs are assigned at the END of this function (after all enemies are pushed)
+  // using the same scheme as HostSim so KILL event IDs match on both sides.
   const diff = DIFFICULTY_MODS[selectedDifficulty] || DIFFICULTY_MODS[0];
   const rng = runManager.getRng();
   function rndX() { return room.FLOOR_X1 + 100 + rng() * (room.FLOOR_X2 - room.FLOOR_X1 - 200); }
@@ -879,11 +996,15 @@ function spawnEnemies(node) {
   const actHpRamp  = f >= 5 ? 1.5 : (f >= 4 ? 1.2 : 1.0);
   const actSpdRamp = f >= 5 ? 1.2 : (f >= 4 ? 1.1 : 1.0);
   const telegraphMult = f >= 5 ? 0.7 : (f >= 4 ? 0.82 : 1.0);
+  let _eid = 1;
   for (const e of enemies) {
     e.hp = Math.round(e.hp * (1 + (f - 1) * 0.18) * diff.hpMult * actHpRamp);
     e.maxHp = e.hp;
     e.difficultySpdMult = (diff.spdMult || 1.0) * actSpdRamp;
     if (f >= 4) e.telegraphDuration = Math.max(0.25, e.telegraphDuration * telegraphMult);
+    // Stable ID for KILL event sync — must match HostSim's scheme (e1, e2, …)
+    if (!e.id) e.id = 'e' + _eid;
+    _eid++;
   }
 
   // Set starting tempo from items
@@ -1096,6 +1217,10 @@ function handleCombatClear() {
       _victoryReady = false;
       events.emit('PLAY_SOUND', 'victoryFanfare');
       audio.silenceMusic();
+      // Tell clients the run is won
+      if (net.role === 'host' && net.peers.size > 0) {
+        net.sendReliable('evt', { type: 'ROOM_CLEARED', isVictory: true, nextState: 'victory', floor: runManager.floor });
+      }
       input.clearFrame();
       currentCombatNode = null;
       return;
@@ -1119,6 +1244,10 @@ function handleCombatClear() {
     } else {
       gameState = 'map';
       _fadeAlpha = 0.6; _fadeDir = -1;
+    }
+    // Sync state transition to all clients
+    if (net.role === 'host' && net.peers.size > 0) {
+      net.sendReliable('evt', { type: 'ROOM_CLEARED', isVictory: false, nextState: gameState, floor: runManager.floor });
     }
   }
 }
@@ -1485,7 +1614,16 @@ function update(logicDt, realDt) {
     }
     if (input.consumeClick()) {
       const result = handleCharSelectClick(input.mouse.x, input.mouse.y);
-      if (result === 'start' && selectedCharId) startNewRun();
+      if (result === 'start' && selectedCharId) {
+        if (net.role === 'host' && net.peers.size > 0) {
+          net.sendReliable('evt', { type: 'GAME_STARTED', seed: lobby.seed, charId: selectedCharId });
+        }
+        startNewRun();
+      }
+      // Broadcast character selection so the remote peer can render the right placeholder
+      if ((result === 'start' || result === 'selected') && selectedCharId && net.role !== 'solo') {
+        net.sendReliable('evt', { type: 'CHAR_SELECTED', charId: selectedCharId });
+      }
       if (result === 'mainMenu') { gameState = 'intro'; selectedCharId = null; audio.playBGM('menu'); }
     }
     if (input.consumeKey('d') && selectedCharId) {
@@ -1572,6 +1710,13 @@ function update(logicDt, realDt) {
             break;
           }
           if (b.action === 'join') { lobbyMode = 'joining'; lobbyJoinCode = ''; lobbyStatusMsg = 'Type the 6-character room code, press ENTER'; break; }
+          if (b.action === 'lobby_start') {
+            // Host sends all connected clients to char select with the shared seed.
+            net.sendReliable('evt', { type: 'START_LOBBY', seed: lobby.seed });
+            gameState = 'charSelect';
+            audio.playBGM('menu');
+            break;
+          }
           if (b.action === 'lobby_back') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; net.disconnect(); net.role = 'solo'; break; }
           if (b.action === 'join_confirm' && lobbyJoinCode.length === 6) {
             net.role = 'client';
@@ -1634,6 +1779,17 @@ function update(logicDt, realDt) {
           player.x = room.FLOOR_X1 + 100;
           player.y = (room.FLOOR_Y1 + room.FLOOR_Y2) / 2;
           gameState = 'prep';
+        }
+        // Tell clients which node was chosen so they mirror the state transition
+        if (net.role === 'host' && net.peers.size > 0) {
+          net.sendReliable('evt', {
+            type: 'MAP_NODE_CHOSEN',
+            nodeType: node.type,
+            nodeId: node.id,
+            floor: runManager.floor,
+            shopCards: node.type === 'shop' ? shopCards : undefined,
+            eventType: node.type === 'event' ? currentEventType : undefined,
+          });
         }
       }
     }
@@ -1978,26 +2134,29 @@ function update(logicDt, realDt) {
   // RH2: P2 update + revives + Group Tempo Resonance
   if (players.count > 1) {
     const p2 = players.list[1];
-    input.updateP2Reticle(p2, logicDt, enemies);
-    // Q-press: P2 fires its selected card with auto-aim target
-    const p2v = input._p2View;
-    if (p2v && p2v.mouse.justClicked && p2.alive && !p2.downed && !p2.silenced) {
-      p2v.mouse.justClicked = false;
-      const cardId2 = deckManager.hand[selectedCardSlotP2];
-      if (cardId2) {
-        const def2 = deckManager.getCardDef(cardId2);
-        if (p2.budget >= def2.cost) {
-          combat.executeCard(p2, def2, p2v.mouse);
-          runStats.cardsPlayed++;
-          if (def2.type !== 'echo') _lastCardPlayed = def2;
-        } else {
-          events.emit('PLAY_SOUND', 'miss');
+    // Remote placeholder: position driven by snapshots only — skip all local input/physics
+    if (!p2._isRemote) {
+      input.updateP2Reticle(p2, logicDt, enemies);
+      // Q-press: P2 fires its selected card with auto-aim target
+      const p2v = input._p2View;
+      if (p2v && p2v.mouse.justClicked && p2.alive && !p2.downed && !p2.silenced) {
+        p2v.mouse.justClicked = false;
+        const cardId2 = deckManager.hand[selectedCardSlotP2];
+        if (cardId2) {
+          const def2 = deckManager.getCardDef(cardId2);
+          if (p2.budget >= def2.cost) {
+            combat.executeCard(p2, def2, p2v.mouse);
+            runStats.cardsPlayed++;
+            if (def2.type !== 'echo') _lastCardPlayed = def2;
+          } else {
+            events.emit('PLAY_SOUND', 'miss');
+          }
         }
+      } else if (p2v) {
+        p2v.mouse.justClicked = false;
       }
-    } else if (p2v) {
-      p2v.mouse.justClicked = false;
+      if (p2.alive) p2.updateLogic(logicDt, input.player2View(), tempo, room);
     }
-    if (p2.alive) p2.updateLogic(logicDt, input.player2View(), tempo, room);
     players.updateRevives(logicDt);
     // Group resonance: shared tempo bar → all alive non-downed share the
     // same zone, so the count alone drives the multiplier. Avoid the
@@ -3489,17 +3648,18 @@ function render() {
       charSelectBoxes.push({ x: diffBtnX, y: btnY, w: diffBtnW, h: diffBtnH, action: 'difficulty' });
 
       const startBtnX = canvas.width / 2 + 10, startBtnW = 180, startBtnH = 44;
-      ctx2.fillStyle = '#225533';
+      const isRemoteClient = net.role === 'client';
+      ctx2.fillStyle = isRemoteClient ? '#181820' : '#225533';
       ctx2.beginPath();
       ctx2.roundRect(startBtnX, btnY, startBtnW, startBtnH, 8);
       ctx2.fill();
-      ctx2.strokeStyle = '#44ff88';
+      ctx2.strokeStyle = isRemoteClient ? '#445566' : '#44ff88';
       ctx2.lineWidth = 2;
       ctx2.stroke();
-      ctx2.fillStyle = '#44ff88';
+      ctx2.fillStyle = isRemoteClient ? '#556677' : '#44ff88';
       ctx2.font = 'bold 18px monospace';
-      ctx2.fillText('START RUN', startBtnX + startBtnW / 2, btnY + 29);
-      charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'start' });
+      ctx2.fillText(isRemoteClient ? 'WAITING…' : 'START RUN', startBtnX + startBtnW / 2, btnY + 29);
+      if (!isRemoteClient) charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'start' });
     } else {
       const ctx2 = renderer.ctx;
       ctx2.fillStyle = '#555';
@@ -3699,8 +3859,19 @@ function render() {
         } catch (_e) { /* non-fatal */ }
       }
 
-      // Back
-      const xbW = 160, xbH = 38, xbX = cx - xbW / 2, xbY = canvas.height - 70;
+      // START GAME button — only shown once at least one peer is connected
+      const hasPeers = net.peers.size > 0;
+      const sbW = 260, sbH = 48, sbX = cx - sbW / 2, sbY = canvas.height - 120;
+      ctx.fillStyle = hasPeers ? '#0d2a1a' : '#111118';
+      ctx.beginPath(); ctx.roundRect(sbX, sbY, sbW, sbH, 10); ctx.fill();
+      ctx.strokeStyle = hasPeers ? '#44ff88' : '#334455'; ctx.lineWidth = hasPeers ? 2 : 1; ctx.stroke();
+      ctx.fillStyle = hasPeers ? '#aaffcc' : '#445566';
+      ctx.font = `bold 18px monospace`;
+      ctx.fillText(hasPeers ? '▶  START GAME' : '▶  START GAME (waiting…)', cx, sbY + 31);
+      if (hasPeers) lobbyBoxes.push({ x: sbX, y: sbY, w: sbW, h: sbH, action: 'lobby_start' });
+
+      // Back / Cancel
+      const xbW = 160, xbH = 38, xbX = cx - xbW / 2, xbY = canvas.height - 60;
       ctx.fillStyle = '#1a1520';
       ctx.beginPath(); ctx.roundRect(xbX, xbY, xbW, xbH, 7); ctx.fill();
       ctx.strokeStyle = '#6655aa'; ctx.lineWidth = 1.5; ctx.stroke();

@@ -15,6 +15,9 @@ node_modules/
 
 dist/*
 
+# Wrangler local cache (created by `wrangler deploy`)
+.wrangler/
+
 syntax-report.txt
 Improvements.md
 *IDEAS.md

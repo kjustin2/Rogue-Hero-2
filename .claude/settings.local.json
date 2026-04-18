@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node check-syntax.js)"
+      "Bash(node check-syntax.js)",
+      "Bash(curl -sI \"https://esm.sh/trystero@0.21.6/nostr\")",
+      "Bash(curl -s \"https://esm.sh/trystero@0.21.6/nostr\")",
+      "Bash(curl -s \"https://esm.sh/trystero@0.21.6/es2022/nostr.mjs\")"
     ]
   }
 }

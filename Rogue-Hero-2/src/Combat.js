@@ -88,7 +88,7 @@ export class CombatManager {
 
     if (!enemy.alive) {
       this.particles.spawnBurst(enemy.x, enemy.y, '#dd3333');
-      events.emit('KILL');
+      events.emit('KILL', { id: enemy.id });
       events.emit('PLAY_SOUND', 'kill');
 
       // Wraith Death's Edge kill-heal

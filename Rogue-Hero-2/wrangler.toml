@@ -1,0 +1,14 @@
+name = "rh2-signal"
+main = "workers/signaling.js"
+compatibility_date = "2025-01-01"
+
+# Durable Object binding — one Room instance per room code
+[durable_objects]
+bindings = [
+  { name = "ROOMS", class_name = "Room" }
+]
+
+# Migration required on first deploy to register the Room class
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]

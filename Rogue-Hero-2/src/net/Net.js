@@ -1,57 +1,36 @@
-// Net.js — Transport layer (WebRTC DataChannel via Trystero).
+// Net.js — Transport layer (WebRTC DataChannels).
 //
-// Public API (unchanged — solo mode is a no-op so the rest of the game
-// stays agnostic about whether networking is wired in):
+// Primary path: Cloudflare Worker signaling (set CF_SIGNAL_URL after deploying
+// workers/signaling.js). Worker relays SDP/ICE only; all game data flows
+// directly peer-to-peer via WebRTC DataChannels.
+//
+// Fallback path: Trystero BitTorrent trackers — zero infra, but ICE success
+// rate is lower on restrictive networks.
+//
+// Public API (unchanged):
 //   const net = new Net({ role: 'host'|'client'|'solo' });
 //   await net.connect(roomCode);
-//   net.sendUnreliable('snap', payload);
-//   net.sendReliable('evt', payload);
-//   net.on(channel, (msg, peerId) => { ... });
+//   net.sendUnreliable('snap', payload);   // positions — unordered, lossy
+//   net.sendReliable('evt', payload);      // events  — ordered, reliable
+//   net.on(channel, (msg, peerId) => {});
 //   net.disconnect();
-//
-// Trystero gives us free WebRTC mesh discovery via public BitTorrent /
-// Nostr trackers — no signaling backend to host. The library is pulled
-// from esm.sh on first connect so the project keeps its zero-build
-// constraint. If the CDN is blocked the module silently falls back to
-// solo (game still runs, just no remote peers).
 
-// RH2 multiplayer fix audit:
-//
-//  - The BitTorrent `torrent` strategy depends on public WebTorrent trackers
-//    (wss://tracker.webtorrent.dev et al.) which are frequently down or
-//    blocked by firewalls; two computers calling joinRoom will silently never
-//    discover each other. Switching to the `nostr` strategy routes signaling
-//    over a pool of public Nostr relays which are much more reliable.
-//
-//  - Trystero's default iceServers points at global.stun.twilio.com (DNS
-//    often refuses to resolve it → the `errorcode: -105` spam). We pass a
-//    full iceServers list (Google + Cloudflare STUN plus a free openrelay
-//    TURN) so both candidate gathering and symmetric-NAT traversal succeed.
-//
-//  - On connect we now surface peer/relay errors via `status` events, so the
-//    lobby UI can actually tell the user what failed rather than silently
-//    staying on "Connecting…" forever.
+// ─── SET THIS after running `wrangler deploy` (see MULTIPLAYER_SETUP.md) ────
+const CF_SIGNAL_URL = 'wss://rh2-signal.jpk91.workers.dev'; // e.g. 'wss://rh2-signal.yourname.workers.dev'
+// ────────────────────────────────────────────────────────────────────────────
 
-// NOTE: empirical test (multiplayer-test.html, 2026-04-17) — public Nostr
-// relays accept the WebSocket but silently drop Trystero's signaling events,
-// so two peers on the same relay set never discovered each other. The torrent
-// strategy (WebTorrent trackers) connected reliably in ~11s in the same test.
-// Keep nostr as a fallback in case trackers are blocked on a given network.
-const TRYSTERO_PRIMARY_CDN   = 'https://esm.sh/trystero@0.21.6/torrent';
-const TRYSTERO_FALLBACK_CDN  = 'https://esm.sh/trystero@0.21.6/nostr';
+const TRYSTERO_TORRENT = 'https://esm.sh/trystero@0.21.6/torrent';
+const TRYSTERO_NOSTR   = 'https://esm.sh/trystero@0.21.6/nostr';
 const APP_ID = 'rogue-hero-2';
 
 const RTC_CONFIG = {
   iceServers: [
-    // Multiple STUN so candidate gathering succeeds even if one host is down
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    // Free TURN fallback — required when both peers are behind symmetric
-    // NAT (the common "two residential networks" case the user hit). These
-    // are openrelay's public credentials; fine for small games.
+    // Free TURN for symmetric-NAT traversal.
     {
       urls: [
         'turn:openrelay.metered.ca:80',
@@ -64,45 +43,51 @@ const RTC_CONFIG = {
   ],
 };
 
-let _trysteroModule = null;
-let _trysteroStrategy = null; // 'nostr' | 'torrent'
+// ── Trystero module cache ─────────────────────────────────────────────────────
+let _trysteroModule   = null;
+let _trysteroStrategy = null;
+
 async function _loadTrystero() {
   if (_trysteroModule) return _trysteroModule;
-  // Try nostr first, then fall back to torrent if the nostr module/relays
-  // are unreachable. Either way we end up with a working `joinRoom`.
   try {
-    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_PRIMARY_CDN);
+    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_TORRENT);
     _trysteroStrategy = 'torrent';
-    console.log('[Net] Trystero loaded (torrent strategy)');
+    console.log('[Net] Trystero loaded (torrent)');
     return _trysteroModule;
   } catch (e) {
-    console.warn('[Net] torrent module unreachable — trying nostr:', e?.message || e);
+    console.warn('[Net] torrent CDN unreachable, trying nostr:', e?.message);
   }
   try {
-    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_FALLBACK_CDN);
+    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_NOSTR);
     _trysteroStrategy = 'nostr';
     console.log('[Net] Trystero loaded (nostr fallback)');
     return _trysteroModule;
   } catch (e) {
-    console.warn('[Net] Trystero CDN unreachable — running solo:', e?.message || e);
+    console.warn('[Net] all CDN paths unreachable — solo only:', e?.message);
     return null;
   }
 }
 
+// ── Net class ─────────────────────────────────────────────────────────────────
 export class Net {
   constructor(opts = {}) {
-    this.role = opts.role || 'solo';
-    this.signalUrl = opts.signalUrl || null; // unused with Trystero, kept for compatibility
-    this.peers = new Map();          // peerId → {}
-    this.handlers = new Map();       // channel → Set<fn>
-    this.connected = false;
+    this.role        = opts.role || 'solo';
+    this.peers       = new Map();   // peerId → { pc?, snapDc?, evtDc? }
+    this.handlers    = new Map();   // channel → Set<fn>
+    this.connected   = false;
     this.localPeerId = Math.random().toString(36).slice(2, 10);
-    this._sendStats = { bytesOut: 0, bytesIn: 0, msgsOut: 0, msgsIn: 0 };
-    this.room = null;
+    this._sendStats  = { bytesOut: 0, bytesIn: 0, msgsOut: 0, msgsIn: 0 };
+    // Trystero references (null when using CF path)
+    this.room      = null;
     this._sendSnap = null;
-    this._sendEvt = null;
+    this._sendEvt  = null;
+    // CF signaling WebSocket
+    this._ws       = null;
+    // 'cloudflare' | 'torrent' | 'nostr' | null
+    this._strategy = null;
   }
 
+  // ── Event subscription ──────────────────────────────────────────────────────
   on(channel, fn) {
     if (!this.handlers.has(channel)) this.handlers.set(channel, new Set());
     this.handlers.get(channel).add(fn);
@@ -116,41 +101,206 @@ export class Net {
     if (set) for (const fn of set) fn(msg, peerId);
   }
 
-  // RH2: warm the CDN module and exercise WebRTC permissions before the user
-  // tries to host. Resolves to true if Trystero is reachable. Idempotent.
+  // ── Preflight ───────────────────────────────────────────────────────────────
   async preflight() {
     if (this._preflightPromise) return this._preflightPromise;
     this._preflightPromise = (async () => {
+      if (CF_SIGNAL_URL) {
+        try {
+          const httpUrl = CF_SIGNAL_URL.replace(/^wss?:\/\//, 'https://');
+          const r = await fetch(httpUrl, { signal: AbortSignal.timeout(5000) });
+          if (r.ok) {
+            this._preflightOk = true;
+            this._dispatch('status', { kind: 'ready', msg: 'Signal server ready (Cloudflare)' });
+            return true;
+          }
+        } catch { /* fall through to Trystero check */ }
+      }
       const tryst = await _loadTrystero();
-      if (!tryst || !tryst.joinRoom) {
+      if (!tryst?.joinRoom) {
         this._preflightOk = false;
-        this._dispatch('status', { kind: 'error', msg: 'Trystero unavailable' });
+        this._dispatch('status', { kind: 'error', msg: 'No transport available — check internet' });
         return false;
       }
       this._preflightOk = true;
-      this._dispatch('status', { kind: 'ready', msg: 'Trystero loaded' });
+      this._dispatch('status', { kind: 'ready', msg: 'Ready (Trystero)' });
       return true;
     })();
     return this._preflightPromise;
   }
 
+  // ── Connect ─────────────────────────────────────────────────────────────────
   async connect(roomCode) {
     if (this.role === 'solo') { this.connected = true; return; }
-    if (!roomCode) { console.warn('[Net] connect() needs a room code'); return; }
+    if (!roomCode) { console.warn('[Net] connect() requires a room code'); return; }
 
+    if (CF_SIGNAL_URL) {
+      try {
+        await this._connectDirect(roomCode);
+        return;
+      } catch (e) {
+        console.warn('[Net] CF signaling failed — falling back to Trystero:', e?.message || e);
+      }
+    }
+    await this._connectTrystero(roomCode);
+  }
+
+  // ── Cloudflare Worker path ───────────────────────────────────────────────────
+
+  async _connectDirect(roomCode) {
+    const wsUrl = `${CF_SIGNAL_URL}/${roomCode}`;
+    console.log('[Net] CF signaling →', wsUrl);
+
+    await new Promise((resolve, reject) => {
+      const ws = new WebSocket(wsUrl);
+      this._ws = ws;
+      const timer = setTimeout(() => reject(new Error('CF WS timeout')), 12000);
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'join', peerId: this.localPeerId }));
+      };
+
+      ws.onmessage = async (evt) => {
+        let msg;
+        try { msg = JSON.parse(evt.data); } catch { return; }
+
+        if (msg.type === 'welcome') {
+          clearTimeout(timer);
+          this._strategy = 'cloudflare';
+          this.connected = true;
+          window._trysteroModRef = null;
+          this._dispatch('status', { kind: 'connected', room: roomCode });
+          console.log(`[Net] CF connected room="${roomCode}" existing peers: [${msg.peers.join(', ')}]`);
+          for (const pid of msg.peers) {
+            await this._cfInitiatePeer(pid);
+          }
+          resolve();
+        } else if (msg.type === 'peer_joined') {
+          console.log('[Net] CF peer announced:', msg.peerId);
+          this._cfPreparePeer(msg.peerId);
+        } else if (msg.type === 'signal') {
+          await this._cfHandleSignal(msg.from, msg.data);
+        } else if (msg.type === 'peer_left') {
+          this._cfRemovePeer(msg.peerId);
+        }
+      };
+
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('CF WebSocket error')); };
+      ws.onclose = () => {
+        if (!this.connected) { clearTimeout(timer); reject(new Error('CF WebSocket closed early')); }
+      };
+    });
+  }
+
+  _cfMakePeer(peerId) {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const peer = { pc, snapDc: null, evtDc: null, iceBuf: [] };
+    this.peers.set(peerId, peer);
+
+    pc.onicecandidate = (evt) => {
+      if (evt.candidate) {
+        this._cfSignalSend(peerId, { type: 'candidate', candidate: evt.candidate });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      console.log(`[Net] peer ${peerId} → ${s}`);
+      if (s === 'connected') {
+        this._dispatch('peer', { kind: 'join', peerId }, peerId);
+        this._dispatch('status', { kind: 'peer', msg: `Peer connected (${this.peers.size} total)` });
+      } else if (s === 'failed' || s === 'disconnected') {
+        this._cfRemovePeer(peerId);
+      }
+    };
+
+    return peer;
+  }
+
+  // We are the initiator: create offer + data channels.
+  async _cfInitiatePeer(peerId) {
+    const peer = this._cfMakePeer(peerId);
+    // snap: unordered/lossy for positions; evt: ordered/reliable for game events
+    peer.snapDc = peer.pc.createDataChannel('snap', { ordered: false, maxRetransmits: 0 });
+    peer.evtDc  = peer.pc.createDataChannel('evt',  { ordered: true });
+    peer.snapDc.onmessage = (e) => this._dispatch('snap', JSON.parse(e.data), peerId);
+    peer.evtDc.onmessage  = (e) => this._dispatch('evt',  JSON.parse(e.data), peerId);
+    const offer = await peer.pc.createOffer();
+    await peer.pc.setLocalDescription(offer);
+    this._cfSignalSend(peerId, { type: 'offer', sdp: peer.pc.localDescription });
+  }
+
+  // We are the responder: wait for ondatachannel.
+  _cfPreparePeer(peerId) {
+    const peer = this._cfMakePeer(peerId);
+    peer.pc.ondatachannel = (evt) => {
+      const dc = evt.channel;
+      if (dc.label === 'snap') {
+        peer.snapDc = dc;
+        dc.onmessage = (e) => this._dispatch('snap', JSON.parse(e.data), peerId);
+      } else if (dc.label === 'evt') {
+        peer.evtDc = dc;
+        dc.onmessage = (e) => this._dispatch('evt', JSON.parse(e.data), peerId);
+      }
+    };
+  }
+
+  async _cfHandleSignal(fromId, data) {
+    let peer = this.peers.get(fromId);
+    if (!peer) { this._cfPreparePeer(fromId); peer = this.peers.get(fromId); }
+    try {
+      if (data.type === 'offer') {
+        await peer.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        const answer = await peer.pc.createAnswer();
+        await peer.pc.setLocalDescription(answer);
+        this._cfSignalSend(fromId, { type: 'answer', sdp: peer.pc.localDescription });
+        for (const c of peer.iceBuf) await peer.pc.addIceCandidate(new RTCIceCandidate(c));
+        peer.iceBuf = [];
+      } else if (data.type === 'answer') {
+        await peer.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        for (const c of peer.iceBuf) await peer.pc.addIceCandidate(new RTCIceCandidate(c));
+        peer.iceBuf = [];
+      } else if (data.type === 'candidate') {
+        if (peer.pc.remoteDescription) {
+          await peer.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } else {
+          peer.iceBuf.push(data.candidate);
+        }
+      }
+    } catch (e) {
+      console.warn('[Net] signal handling error:', e?.message || e);
+    }
+  }
+
+  _cfRemovePeer(peerId) {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+    try { peer.pc.close(); } catch {}
+    this.peers.delete(peerId);
+    this._dispatch('peer', { kind: 'leave', peerId }, peerId);
+  }
+
+  _cfSignalSend(toPeerId, data) {
+    if (this._ws?.readyState === WebSocket.OPEN) {
+      this._ws.send(JSON.stringify({ type: 'signal', to: toPeerId, from: this.localPeerId, data }));
+    }
+  }
+
+  // ── Trystero fallback path ───────────────────────────────────────────────────
+
+  async _connectTrystero(roomCode) {
     const tryst = await _loadTrystero();
-    if (!tryst || !tryst.joinRoom) {
+    if (!tryst?.joinRoom) {
       this.connected = false;
-      this._dispatch('status', { kind: 'error', msg: 'Trystero unavailable — check internet / firewall' });
+      this._dispatch('status', { kind: 'error', msg: 'No transport available — check internet/firewall' });
       return;
     }
 
-    console.log(`[Net] joinRoom — strategy=${_trysteroStrategy}, room="${roomCode}", appId="${APP_ID}"`);
+    console.log(`[Net] Trystero joinRoom strategy=${_trysteroStrategy} room="${roomCode}"`);
     try {
       this.room = tryst.joinRoom(
         { appId: APP_ID, rtcConfig: RTC_CONFIG, password: APP_ID },
         roomCode,
-        // Trystero v0.21+ accepts an onError callback as 3rd arg
         (err) => {
           console.warn('[Net] room error:', err);
           this._dispatch('status', { kind: 'error', msg: `Room error: ${err?.message || err}` });
@@ -163,7 +313,6 @@ export class Net {
       return;
     }
 
-    // Two trystero "actions" — one for snapshots, one for events
     const [sendSnap, getSnap] = this.room.makeAction('snap');
     const [sendEvt,  getEvt]  = this.room.makeAction('evt');
     this._sendSnap = sendSnap;
@@ -172,18 +321,14 @@ export class Net {
     getEvt((p,  peerId) => this._dispatch('evt',  p, peerId));
 
     this.room.onPeerJoin(id => {
-      console.log('[Net] peer joined:', id);
       this.peers.set(id, {});
       this._dispatch('peer', { kind: 'join', peerId: id }, id);
       this._dispatch('status', { kind: 'peer', msg: `Peer connected (${this.peers.size} total)` });
     });
     this.room.onPeerLeave(id => {
-      console.log('[Net] peer left:', id);
       this.peers.delete(id);
       this._dispatch('peer', { kind: 'leave', peerId: id }, id);
     });
-
-    // Surface ICE failures per peer so the lobby can hint at NAT/firewall issues.
     if (typeof this.room.onPeerError === 'function') {
       this.room.onPeerError((id, err) => {
         console.warn(`[Net] peer ${id} error:`, err);
@@ -191,60 +336,81 @@ export class Net {
       });
     }
 
+    this._strategy = _trysteroStrategy;
     this.connected = true;
-    window._trysteroModRef = tryst; // expose for lobby relay-count display
+    window._trysteroModRef = tryst;
     this._dispatch('status', { kind: 'connected', room: roomCode });
-    console.log(`[Net] connected to room "${roomCode}" (waiting for peers)`);
+    console.log(`[Net] Trystero connected room="${roomCode}" (${_trysteroStrategy})`);
 
-    // Diagnostic: dump which trackers/relays actually connected. If both peers
-    // share zero open URLs they will never discover each other regardless of
-    // strategy. Logs at 3s and 12s after join.
+    // Log which trackers/relays are actually open (visible in DevTools).
     const dumpRelays = () => {
       try {
         if (typeof tryst.getRelaySockets !== 'function') return;
         const sockets = tryst.getRelaySockets();
         const entries = Object.entries(sockets);
-        const open = entries.filter(([_, ws]) => ws && ws.readyState === 1).map(([url]) => url);
-        const dead = entries.filter(([_, ws]) => !ws || ws.readyState !== 1).map(([url]) => url);
-        console.log(`[Net] ${_trysteroStrategy} relays OPEN (${open.length}):`, open);
-        if (dead.length) console.log(`[Net] ${_trysteroStrategy} relays NOT open (${dead.length}):`, dead);
-        this._dispatch('status', { kind: 'relays', msg: `${open.length} ${_trysteroStrategy} relays open` });
-      } catch (e) { console.warn('[Net] relay dump failed:', e); }
+        const open = entries.filter(([, ws]) => ws?.readyState === 1).map(([u]) => u);
+        const dead = entries.filter(([, ws]) => ws?.readyState !== 1).map(([u]) => u);
+        console.log(`[Net] ${_trysteroStrategy} OPEN (${open.length}):`, open);
+        if (dead.length) console.log(`[Net] ${_trysteroStrategy} DEAD (${dead.length}):`, dead);
+        this._dispatch('status', { kind: 'relays', open: open.length, total: entries.length });
+      } catch {}
     };
     setTimeout(dumpRelays, 3000);
     setTimeout(dumpRelays, 12000);
   }
 
-  // Best-effort, unordered — for positions / cursor movement
+  // ── Send ─────────────────────────────────────────────────────────────────────
+
+  // Best-effort, unordered — position snapshots.
   sendUnreliable(channel, payload) {
-    if (!this.connected || this.role === 'solo' || !this._sendSnap) return;
-    if (channel !== 'snap') return;
-    try {
-      this._sendSnap(payload);
-      this._sendStats.msgsOut++;
-    } catch (e) { /* ignore transient send errors */ }
+    if (!this.connected || this.role === 'solo' || channel !== 'snap') return;
+    if (this._strategy === 'cloudflare') {
+      const json = JSON.stringify(payload);
+      for (const peer of this.peers.values()) {
+        if (peer.snapDc?.readyState === 'open') {
+          try { peer.snapDc.send(json); this._sendStats.msgsOut++; } catch {}
+        }
+      }
+    } else if (this._sendSnap) {
+      try { this._sendSnap(payload); this._sendStats.msgsOut++; } catch {}
+    }
   }
 
-  // Ordered, reliable — for events (card play, kill, room transition)
+  // Ordered, reliable — game events (kill, room transition, card play, etc.).
   sendReliable(channel, payload) {
-    if (!this.connected || this.role === 'solo' || !this._sendEvt) return;
-    if (channel !== 'evt') return;
-    try {
-      this._sendEvt(payload);
-      this._sendStats.msgsOut++;
-    } catch (e) { /* ignore */ }
+    if (!this.connected || this.role === 'solo' || channel !== 'evt') return;
+    if (this._strategy === 'cloudflare') {
+      const json = JSON.stringify(payload);
+      for (const peer of this.peers.values()) {
+        if (peer.evtDc?.readyState === 'open') {
+          try { peer.evtDc.send(json); this._sendStats.msgsOut++; } catch {}
+        }
+      }
+    } else if (this._sendEvt) {
+      try { this._sendEvt(payload); this._sendStats.msgsOut++; } catch {}
+    }
   }
+
+  // ── Disconnect ───────────────────────────────────────────────────────────────
 
   disconnect() {
-    try { this.room?.leave(); } catch (e) { /* ignore */ }
+    if (this._strategy === 'cloudflare') {
+      for (const [pid] of [...this.peers]) this._cfRemovePeer(pid);
+      try { this._ws?.close(); } catch {}
+      this._ws = null;
+    } else {
+      try { this.room?.leave(); } catch {}
+      this.room      = null;
+      this._sendSnap = null;
+      this._sendEvt  = null;
+    }
     this.peers.clear();
-    this.room = null;
-    this._sendSnap = null;
-    this._sendEvt = null;
     this.connected = false;
+    this._strategy = null;
   }
 
-  // Stats accessor for the in-game multiplayer pane
-  stats() { return { ...this._sendStats, peerCount: this.peers.size, role: this.role, strategy: _trysteroStrategy }; }
-  strategy() { return _trysteroStrategy; }
+  // ── Stats / introspection ────────────────────────────────────────────────────
+
+  stats()    { return { ...this._sendStats, peerCount: this.peers.size, role: this.role, strategy: this._strategy }; }
+  strategy() { return this._strategy; }
 }
