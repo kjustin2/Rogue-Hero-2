@@ -194,6 +194,24 @@ export class Net {
     this.connected = true;
     this._dispatch('status', { kind: 'connected', room: roomCode });
     console.log(`[Net] connected to room "${roomCode}" (waiting for peers)`);
+
+    // Diagnostic: dump which trackers/relays actually connected. If both peers
+    // share zero open URLs they will never discover each other regardless of
+    // strategy. Logs at 3s and 12s after join.
+    const dumpRelays = () => {
+      try {
+        if (typeof tryst.getRelaySockets !== 'function') return;
+        const sockets = tryst.getRelaySockets();
+        const entries = Object.entries(sockets);
+        const open = entries.filter(([_, ws]) => ws && ws.readyState === 1).map(([url]) => url);
+        const dead = entries.filter(([_, ws]) => !ws || ws.readyState !== 1).map(([url]) => url);
+        console.log(`[Net] ${_trysteroStrategy} relays OPEN (${open.length}):`, open);
+        if (dead.length) console.log(`[Net] ${_trysteroStrategy} relays NOT open (${dead.length}):`, dead);
+        this._dispatch('status', { kind: 'relays', msg: `${open.length} ${_trysteroStrategy} relays open` });
+      } catch (e) { console.warn('[Net] relay dump failed:', e); }
+    };
+    setTimeout(dumpRelays, 3000);
+    setTimeout(dumpRelays, 12000);
   }
 
   // Best-effort, unordered — for positions / cursor movement
