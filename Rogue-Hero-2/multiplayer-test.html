@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RH2 Multiplayer Connection Test</title>
+<style>
+  body { background:#0a0a14; color:#ddd; font-family:monospace; padding:20px; }
+  h1 { color:#44ddff; }
+  button { padding:10px 20px; font-size:14px; margin:6px; background:#1a3a3a; color:#aaffee; border:1px solid #44ddcc; cursor:pointer; }
+  button:hover { background:#2a5a5a; }
+  #log { background:#06060d; padding:10px; height:400px; overflow-y:auto; border:1px solid #333; font-size:12px; white-space:pre-wrap; margin-top:12px; }
+  .ok { color:#44ff88; }
+  .err { color:#ff5566; }
+  .info { color:#88ccff; }
+  .peer { color:#ffaa44; font-weight:bold; }
+  input { padding:8px; background:#11111e; color:#fff; border:1px solid #444; font-family:monospace; font-size:14px; }
+</style>
+</head>
+<body>
+<h1>RH2 Multiplayer Connection Test</h1>
+
+<p>This page is independent of the game. Open it in <b>two windows</b> (one on each computer, or both on the same machine for a basic check) and click <b>Connect</b> on both. They share the room code <code>RH2TEST</code>. If the test succeeds you'll see "PEER JOINED" in the log on both sides.</p>
+
+<div>
+  Strategy:
+  <select id="strategy">
+    <option value="nostr" selected>nostr (recommended)</option>
+    <option value="torrent">torrent (BitTorrent trackers)</option>
+    <option value="mqtt">mqtt</option>
+  </select>
+  Room: <input id="room" value="RH2TEST" maxlength="20">
+  <button id="connect">Connect</button>
+  <button id="ping" disabled>Send Ping</button>
+  <button id="leave" disabled>Leave</button>
+</div>
+
+<div id="log"></div>
+
+<script type="module">
+const $log = document.getElementById('log');
+const $strategy = document.getElementById('strategy');
+const $room = document.getElementById('room');
+const $connect = document.getElementById('connect');
+const $ping = document.getElementById('ping');
+const $leave = document.getElementById('leave');
+
+let room = null;
+let sendPing = null;
+
+function log(msg, cls='info') {
+  const t = new Date().toTimeString().slice(0,8);
+  const line = document.createElement('div');
+  line.className = cls;
+  line.textContent = `[${t}] ${msg}`;
+  $log.appendChild(line);
+  $log.scrollTop = $log.scrollHeight;
+  console.log(`[Test] ${msg}`);
+}
+
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    {
+      urls: ['turn:openrelay.metered.ca:80','turn:openrelay.metered.ca:443'],
+      username: 'openrelayproject', credential: 'openrelayproject',
+    },
+  ],
+};
+
+$connect.addEventListener('click', async () => {
+  $connect.disabled = true;
+  const strat = $strategy.value;
+  const code = ($room.value || 'RH2TEST').trim();
+  log(`Loading trystero@0.21.6/${strat} from esm.sh…`);
+  let mod;
+  try {
+    mod = await import(`https://esm.sh/trystero@0.21.6/${strat}`);
+    log(`Module loaded — exports: ${Object.keys(mod).join(', ')}`, 'ok');
+  } catch (e) {
+    log(`Module load failed: ${e?.message || e}`, 'err');
+    $connect.disabled = false;
+    return;
+  }
+  try {
+    log(`Calling joinRoom({appId:"rh2-test"}, "${code}")…`);
+    room = mod.joinRoom(
+      { appId: 'rh2-test', rtcConfig: RTC_CONFIG, password: 'rh2-test' },
+      code,
+      (err) => log(`Room error: ${err?.message || err}`, 'err'),
+    );
+    log(`joinRoom returned a room object — methods: ${Object.keys(room).join(', ')}`, 'ok');
+  } catch (e) {
+    log(`joinRoom threw: ${e?.message || e}`, 'err');
+    $connect.disabled = false;
+    return;
+  }
+  const [_sendPing, _getPing] = room.makeAction('ping');
+  sendPing = _sendPing;
+  _getPing((data, peerId) => log(`📨 PING from ${peerId}: ${JSON.stringify(data)}`, 'peer'));
+  room.onPeerJoin((id) => log(`🟢 PEER JOINED: ${id}`, 'peer'));
+  room.onPeerLeave((id) => log(`🔴 PEER LEFT: ${id}`, 'peer'));
+  if (typeof room.onPeerError === 'function') {
+    room.onPeerError((id, err) => log(`Peer ${id} error: ${err?.message || err}`, 'err'));
+  }
+  log(`Connected. selfId = ${mod.selfId}. Waiting for peers in room "${code}"…`, 'ok');
+  $ping.disabled = false;
+  $leave.disabled = false;
+
+  // Diagnostic: list which relays/trackers this peer is actually connected to.
+  // If two peers share zero relays, they will never discover each other.
+  if (typeof mod.getRelaySockets === 'function') {
+    const dump = () => {
+      try {
+        const sockets = mod.getRelaySockets();
+        const entries = Object.entries(sockets);
+        const open = entries.filter(([_, ws]) => ws && ws.readyState === 1).map(([url]) => url);
+        const closed = entries.filter(([_, ws]) => !ws || ws.readyState !== 1).map(([url]) => url);
+        log(`Relays OPEN (${open.length}): ${open.join(', ') || '(none!)'}`, open.length ? 'ok' : 'err');
+        if (closed.length) log(`Relays not open (${closed.length}): ${closed.join(', ')}`, 'info');
+      } catch (e) { log(`Relay dump failed: ${e?.message || e}`, 'err'); }
+    };
+    setTimeout(dump, 3000);
+    setTimeout(dump, 10000);
+  }
+});
+
+$ping.addEventListener('click', () => {
+  if (!sendPing) return;
+  const payload = { ts: Date.now(), msg: 'hello from ' + (navigator.userAgent.includes('Electron') ? 'Electron' : 'Browser') };
+  sendPing(payload);
+  log(`Sent ping: ${JSON.stringify(payload)}`, 'info');
+});
+
+$leave.addEventListener('click', () => {
+  if (room) { try { room.leave(); } catch (e) {} }
+  room = null; sendPing = null;
+  $connect.disabled = false;
+  $ping.disabled = true;
+  $leave.disabled = true;
+  log('Left room.', 'info');
+});
+
+log('Ready. Pick a strategy and click Connect.', 'info');
+log('Run the same page in another window to test peer discovery.', 'info');
+</script>
+</body>
+</html>

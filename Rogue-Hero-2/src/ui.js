@@ -1,6 +1,29 @@
 import { CardDefinitions } from './DeckManager.js';
 import { CosmeticById, CosmeticDefinitions, BOX_TIERS, RARITY_COLORS, RARITY_LABELS, CATEGORY_LABELS, drawPlayerShape, drawPlayerAura, getPrismaticColor } from './Cosmetics.js';
 
+// RH2: per-type glyph so players can tell card categories apart at a glance.
+// Single-codepoint symbols (no emoji rendering issues across browsers).
+export function cardGlyph(type) {
+  switch (type) {
+    case 'melee':      return '\u2694';  // ⚔
+    case 'cleave':     return '\u2698';  // ⚘
+    case 'dash':       return '\u279C';  // ➜
+    case 'projectile': return '\u25CF';  // ●
+    case 'shot':       return '\u25C9';  // ◉
+    case 'beam':       return '\u2550';  // ═
+    case 'trap':       return '\u2726';  // ✦
+    case 'orbit':      return '\u29BE';  // ⦾
+    case 'channel':    return '\u2248';  // ≈
+    case 'sigil':      return '\u2736';  // ✶
+    case 'echo':       return '\u25CC';  // ◌
+    case 'ground':     return '\u25B2';  // ▲
+    case 'counter':    return '\u2756';  // ❖
+    case 'stance':     return '\u2691';  // ⚑
+    case 'utility':    return '\u2042';  // ⁂
+    default:           return '\u25C6';  // ◆
+  }
+}
+
 // RH2: humanise raw pixel ranges into game-y descriptors so cards don't expose engine units.
 export function rangeLabel(r) {
   if (r == null) return '';
@@ -759,6 +782,12 @@ export class UI {
         ctx.textAlign = 'center';
         ctx.fillText(def.cost, x + 16, y + 21);
 
+        // Type glyph — top-right corner, distinct symbol per card type
+        ctx.fillStyle = canAfford ? (def.color || '#ddd') : '#444';
+        ctx.font = 'bold 20px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(cardGlyph(def.type), x + CARD_W - 16, y + 22);
+
         // Tempo shift — prominent
         const tsCol = def.tempoShift > 0 ? (canAfford ? PAL.HOT : '#553322') : (canAfford ? PAL.COLD : '#223344');
         ctx.fillStyle = tsCol;
@@ -820,14 +849,65 @@ export class UI {
   }
 
   // ───────────── PREP SCREEN ─────────────
-  drawPrepScreen(ctx) {
-    ctx.fillStyle = 'rgba(0,0,0,0.92)';
-    ctx.fillRect(0, 0, this.width, this.height);
+  // RH2 #17: Shared polished chrome — gradient bg + glowing accent title +
+  // top/bottom corner brackets. Called from each refreshed screen.
+  _drawScreenChrome(ctx, title, accent, subtitle) {
+    const w = this.width, h = this.height;
+    const grd = ctx.createLinearGradient(0, 0, 0, h);
+    grd.addColorStop(0, '#06060d');
+    grd.addColorStop(0.45, '#0d0d1c');
+    grd.addColorStop(1, '#070712');
+    ctx.fillStyle = grd; ctx.fillRect(0, 0, w, h);
 
-    ctx.fillStyle = '#44aaff';
+    // Subtle vignette
+    const vg = ctx.createRadialGradient(w/2, h/2, Math.min(w,h)*0.35, w/2, h/2, Math.max(w,h)*0.7);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = vg; ctx.fillRect(0, 0, w, h);
+
+    // Top accent bar
+    const bar = ctx.createLinearGradient(0, 0, w, 0);
+    bar.addColorStop(0, accent + '00');
+    bar.addColorStop(0.5, accent + 'ff');
+    bar.addColorStop(1, accent + '00');
+    ctx.fillStyle = bar; ctx.fillRect(0, 0, w, 3);
+    ctx.fillRect(0, h - 3, w, 3);
+
+    // Corner brackets
+    ctx.strokeStyle = accent + 'cc'; ctx.lineWidth = 2;
+    const brk = 18, off = 14;
+    const corners = [[off,off,1,1],[w-off,off,-1,1],[off,h-off,1,-1],[w-off,h-off,-1,-1]];
+    for (const [cx, cy, sx, sy] of corners) {
+      ctx.beginPath();
+      ctx.moveTo(cx, cy + sy * brk); ctx.lineTo(cx, cy); ctx.lineTo(cx + sx * brk, cy);
+      ctx.stroke();
+    }
+
+    // Glowing title
+    ctx.save();
+    ctx.shadowColor = accent; ctx.shadowBlur = 22;
+    ctx.fillStyle = accent;
     ctx.font = 'bold 40px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('EQUIP LOADOUT', this.width / 2, 52);
+    ctx.fillText(title, w / 2, 54);
+    ctx.restore();
+
+    // Title underline accent
+    const tw = ctx.measureText(title).width;
+    const ux = w/2 - tw/2, uy = 64;
+    const ulgrd = ctx.createLinearGradient(ux, 0, ux + tw, 0);
+    ulgrd.addColorStop(0, accent + '00'); ulgrd.addColorStop(0.5, accent + 'cc'); ulgrd.addColorStop(1, accent + '00');
+    ctx.fillStyle = ulgrd; ctx.fillRect(ux, uy, tw, 2);
+
+    if (subtitle) {
+      ctx.fillStyle = '#aab';
+      ctx.font = '13px monospace';
+      ctx.fillText(subtitle, w / 2, 84);
+    }
+  }
+
+  drawPrepScreen(ctx) {
+    this._drawScreenChrome(ctx, 'EQUIP LOADOUT', '#44aaff', null);
 
     if (this.prepPendingCard) {
       const pDef = this.deckManager.getCardDef(this.prepPendingCard);
@@ -908,7 +988,11 @@ export class UI {
       ctx.fillStyle = PAL.TEXT;
       ctx.font = 'bold 20px monospace';
       ctx.fillText(def.name, x + CARD_W / 2, y + 36);
+      ctx.fillStyle = def.color || '#ddd';
+      ctx.font = 'bold 22px monospace';
+      ctx.fillText(cardGlyph(def.type), x + CARD_W - 18, y + 26);
       ctx.fillStyle = rarCol;
+      ctx.textAlign = 'center';
       ctx.font = '14px monospace';
       ctx.fillText((def.rarity || 'common').toUpperCase(), x + CARD_W / 2, y + 56);
       ctx.fillStyle = '#44aaff';
@@ -1057,9 +1141,19 @@ export class UI {
 
     const cx = this.width / 2;
 
-    // ── Background ──
-    ctx.fillStyle = 'rgba(0,0,0,0.90)';
-    ctx.fillRect(0, 0, this.width, this.height);
+    // ── Background — gradient + vignette (RH2 #17 visual refresh) ──
+    {
+      const grd = ctx.createLinearGradient(0, 0, 0, this.height);
+      grd.addColorStop(0, '#0a0608'); grd.addColorStop(0.5, '#100a16'); grd.addColorStop(1, '#06060d');
+      ctx.fillStyle = grd; ctx.fillRect(0, 0, this.width, this.height);
+      const vg = ctx.createRadialGradient(this.width/2, this.height/2, Math.min(this.width,this.height)*0.3, this.width/2, this.height/2, Math.max(this.width,this.height)*0.7);
+      vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+      ctx.fillStyle = vg; ctx.fillRect(0, 0, this.width, this.height);
+      // Top + bottom gold accent bars
+      const bar = ctx.createLinearGradient(0, 0, this.width, 0);
+      bar.addColorStop(0, 'rgba(255,215,0,0)'); bar.addColorStop(0.5, 'rgba(255,215,0,1)'); bar.addColorStop(1, 'rgba(255,215,0,0)');
+      ctx.fillStyle = bar; ctx.fillRect(0, 0, this.width, 3); ctx.fillRect(0, this.height - 3, this.width, 3);
+    }
 
     // ── Light rays (intro burst) ──
     const rayDur = 900;
@@ -1292,15 +1386,7 @@ export class UI {
 
   // ───────────── UPGRADE SCREEN ─────────────
   drawUpgradeScreen(ctx, choices) {
-    ctx.fillStyle = 'rgba(0,0,0,0.88)';
-    ctx.fillRect(0, 0, this.width, this.height);
-    ctx.fillStyle = '#44aaff';
-    ctx.font = 'bold 32px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('UPGRADE A CARD', this.width / 2, 75);
-    ctx.fillStyle = PAL.MUTED;
-    ctx.font = '14px monospace';
-    ctx.fillText('Upgrades: +50% dmg, +25% tempo, cost-1 at +2 (max 2)', this.width / 2, 105);
+    this._drawScreenChrome(ctx, '⬆ UPGRADE A CARD', '#44ddff', 'Upgrades: +50% dmg, +25% tempo, cost-1 at +2 (max 2)');
 
     const CARD_W = 265, CARD_H = 240, GAP = 18;
     const totalW = choices.length * CARD_W + (choices.length - 1) * GAP;
@@ -1492,6 +1578,9 @@ export class UI {
       ctx.font = 'bold 19px monospace';
       ctx.textAlign = 'center';
       ctx.fillText(def.name, x + CARD_W / 2, y + 35);
+      ctx.fillStyle = def.color || '#ddd';
+      ctx.font = 'bold 22px monospace';
+      ctx.fillText(cardGlyph(def.type), x + CARD_W - 18, y + 24);
       ctx.fillStyle = '#ff6666';
       ctx.font = 'bold 17px monospace';
       ctx.fillText('Buy: 1 HP', x + CARD_W / 2, y + 62);
@@ -1541,13 +1630,16 @@ export class UI {
 
   // ───────────── STATS SCREEN ─────────────
   drawStatsScreen(ctx, stats, score, leaderboard, waitingForInput = false) {
-    ctx.fillStyle = 'rgba(0,0,0,0.93)';
-    ctx.fillRect(0, 0, this.width, this.height);
-
-    ctx.fillStyle = stats.won ? PAL.FLOWING : PAL.CRITICAL;
-    ctx.font = 'bold 48px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(stats.won ? 'VICTORY!' : 'DEFEATED', this.width / 2, 68);
+    const accent = stats.won ? PAL.FLOWING : PAL.CRITICAL;
+    this._drawScreenChrome(ctx, stats.won ? '✦ VICTORY ✦' : '☠ DEFEATED ☠', accent, null);
+    // Pulsing accent glow behind the title
+    const pulse = (Math.sin(performance.now() / 380) + 1) * 0.5;
+    ctx.save();
+    ctx.globalAlpha = 0.18 + pulse * 0.22;
+    const grd = ctx.createRadialGradient(this.width/2, 54, 10, this.width/2, 54, 280);
+    grd.addColorStop(0, accent); grd.addColorStop(1, accent + '00');
+    ctx.fillStyle = grd; ctx.fillRect(0, 0, this.width, 140);
+    ctx.restore();
 
     if (!stats.won) {
       ctx.fillStyle = PAL.MUTED;
@@ -1850,18 +1942,14 @@ export class UI {
 
   // ───────────── DISCARD SCREEN ─────────────
   drawDiscardScreen(ctx, newCardId) {
-    ctx.fillStyle = 'rgba(0,0,0,0.92)';
-    ctx.fillRect(0, 0, this.width, this.height);
-
     const isBurnMode = newCardId === '__BURN__';
-    ctx.fillStyle = isBurnMode ? '#ffaa44' : PAL.CRITICAL;
-    ctx.font = 'bold 34px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(isBurnMode ? 'REMOVE A CARD' : 'DECK FULL', this.width / 2, 62);
-
-    ctx.fillStyle = PAL.TEXT;
-    ctx.font = '15px monospace';
-    ctx.fillText(isBurnMode ? 'Choose a card to permanently remove from your deck:' : 'You already have 6 cards. Choose one to DISCARD:', this.width / 2, 92);
+    const accent = isBurnMode ? '#ffaa44' : PAL.CRITICAL;
+    this._drawScreenChrome(
+      ctx,
+      isBurnMode ? 'REMOVE A CARD' : 'DECK FULL',
+      accent,
+      isBurnMode ? 'Choose a card to permanently remove from your deck' : 'You already have 6 cards — choose one to DISCARD',
+    );
 
     const newDef = isBurnMode ? null : (this.deckManager.getCardDef(newCardId) || CardDefinitions[newCardId]);
     if (newDef) {
@@ -1906,6 +1994,9 @@ export class UI {
       ctx.font = 'bold 22px monospace';
       ctx.textAlign = 'center';
       ctx.fillText(def.name, x + CARD_W / 2, y + 36);
+      ctx.fillStyle = def.color || '#ddd';
+      ctx.font = 'bold 22px monospace';
+      ctx.fillText(cardGlyph(def.type), x + CARD_W - 20, y + 26);
       ctx.fillStyle = '#ff8855';
       ctx.font = 'bold 18px monospace';
       ctx.fillText(`${def.damage} DMG`, x + CARD_W / 2, y + 62);
@@ -2200,6 +2291,93 @@ UI.prototype.drawCosmeticPanel = function(ctx, charId, activeTab, meta, t) {
   }
   ctx.beginPath(); ctx.arc(pCX-2, pCY-2, pR*0.3, 0, Math.PI*2);
   ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.fill();
+
+  // RH2 #4: render the rest of the equipped cosmetics so the preview actually
+  // shows what every category looks like — not just body/outline/shape/aura.
+  const trailDef     = CosmeticById[eq.trail];
+  const flashDef     = CosmeticById[eq.flash];
+  const burstDef     = CosmeticById[eq.deathBurst];
+  const killEffDef   = CosmeticById[eq.killEffect];
+  const titleDef     = CosmeticById[eq.title];
+
+  // Trail — animated ribbon orbiting the player
+  if (trailDef) {
+    const tCol = trailDef.id === 'trail_prism' ? getPrismaticColor(t) : (trailDef.value || '#88ddff');
+    for (let ti = 0; ti < 18; ti++) {
+      const ang = t * 1.5 - ti * 0.18;
+      const rad = pR + 12 + Math.sin(t * 2 + ti * 0.4) * 4;
+      const tx = pCX + Math.cos(ang) * rad;
+      const ty = pCY + Math.sin(ang) * rad;
+      ctx.fillStyle = tCol;
+      ctx.globalAlpha = (1 - ti / 18) * 0.85;
+      ctx.beginPath(); ctx.arc(tx, ty, 4 - ti * 0.15, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Flash — pulsing radial glow on a 1.4s cycle
+  if (flashDef) {
+    const fc = flashDef.animated ? getPrismaticColor(t) : (flashDef.value || '#ffffff');
+    const ph = (Math.sin(t * 4.4) + 1) * 0.5;
+    ctx.save();
+    ctx.globalAlpha = 0.18 + ph * 0.45;
+    const grd = ctx.createRadialGradient(pCX, pCY, pR * 0.6, pCX, pCY, pR * 2.4);
+    grd.addColorStop(0, fc);
+    grd.addColorStop(1, fc + '00');
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(pCX, pCY, pR * 2.4, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // Death burst — radial spokes on a slow loop
+  if (burstDef) {
+    const bc = burstDef.value || '#ffaa44';
+    const ph2 = (t * 0.6) % 1;
+    ctx.save();
+    ctx.globalAlpha = 1 - ph2;
+    ctx.strokeStyle = bc;
+    ctx.lineWidth = 2;
+    for (let bi = 0; bi < 8; bi++) {
+      const ba = (bi / 8) * Math.PI * 2;
+      const r0 = pR + 6 + ph2 * 26;
+      const r1 = r0 + 16;
+      ctx.beginPath();
+      ctx.moveTo(pCX + Math.cos(ba) * r0, pCY + Math.sin(ba) * r0);
+      ctx.lineTo(pCX + Math.cos(ba) * r1, pCY + Math.sin(ba) * r1);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Kill effect — orbiting starburst marker
+  if (killEffDef) {
+    const kc = RARITY_COLORS[killEffDef.rarity] || '#ffdd44';
+    const kAng = t * 1.6;
+    const kx = pCX + Math.cos(kAng) * (pR + 28);
+    const ky = pCY + Math.sin(kAng) * (pR + 28);
+    ctx.save();
+    ctx.strokeStyle = kc; ctx.lineWidth = 1.5;
+    for (let ki = 0; ki < 6; ki++) {
+      const ka = (ki / 6) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(kx, ky);
+      ctx.lineTo(kx + Math.cos(ka) * 8, ky + Math.sin(ka) * 8);
+      ctx.stroke();
+    }
+    ctx.fillStyle = kc;
+    ctx.beginPath(); ctx.arc(kx, ky, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // Title — banner under the player
+  if (titleDef && titleDef.value) {
+    ctx.save();
+    ctx.fillStyle = titleDef.animated ? getPrismaticColor(t, 100, 70) : (titleDef.color || '#ffdd88');
+    ctx.font = 'bold 13px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(titleDef.value, pCX, pCY + pR + 22);
+    ctx.restore();
+  }
 
   // Equipped slots list in preview
   let slotY = prevY+170;

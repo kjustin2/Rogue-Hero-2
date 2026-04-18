@@ -15,14 +15,73 @@
 // constraint. If the CDN is blocked the module silently falls back to
 // solo (game still runs, just no remote peers).
 
-const TRYSTERO_CDN = 'https://esm.sh/trystero@0.20.0/torrent';
+// RH2 multiplayer fix audit:
+//
+//  - The BitTorrent `torrent` strategy depends on public WebTorrent trackers
+//    (wss://tracker.webtorrent.dev et al.) which are frequently down or
+//    blocked by firewalls; two computers calling joinRoom will silently never
+//    discover each other. Switching to the `nostr` strategy routes signaling
+//    over a pool of public Nostr relays which are much more reliable.
+//
+//  - Trystero's default iceServers points at global.stun.twilio.com (DNS
+//    often refuses to resolve it → the `errorcode: -105` spam). We pass a
+//    full iceServers list (Google + Cloudflare STUN plus a free openrelay
+//    TURN) so both candidate gathering and symmetric-NAT traversal succeed.
+//
+//  - On connect we now surface peer/relay errors via `status` events, so the
+//    lobby UI can actually tell the user what failed rather than silently
+//    staying on "Connecting…" forever.
+
+// NOTE: empirical test (multiplayer-test.html, 2026-04-17) — public Nostr
+// relays accept the WebSocket but silently drop Trystero's signaling events,
+// so two peers on the same relay set never discovered each other. The torrent
+// strategy (WebTorrent trackers) connected reliably in ~11s in the same test.
+// Keep nostr as a fallback in case trackers are blocked on a given network.
+const TRYSTERO_PRIMARY_CDN   = 'https://esm.sh/trystero@0.21.6/torrent';
+const TRYSTERO_FALLBACK_CDN  = 'https://esm.sh/trystero@0.21.6/nostr';
 const APP_ID = 'rogue-hero-2';
 
+const RTC_CONFIG = {
+  iceServers: [
+    // Multiple STUN so candidate gathering succeeds even if one host is down
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    // Free TURN fallback — required when both peers are behind symmetric
+    // NAT (the common "two residential networks" case the user hit). These
+    // are openrelay's public credentials; fine for small games.
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+  ],
+};
+
 let _trysteroModule = null;
+let _trysteroStrategy = null; // 'nostr' | 'torrent'
 async function _loadTrystero() {
   if (_trysteroModule) return _trysteroModule;
+  // Try nostr first, then fall back to torrent if the nostr module/relays
+  // are unreachable. Either way we end up with a working `joinRoom`.
   try {
-    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_CDN);
+    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_PRIMARY_CDN);
+    _trysteroStrategy = 'torrent';
+    console.log('[Net] Trystero loaded (torrent strategy)');
+    return _trysteroModule;
+  } catch (e) {
+    console.warn('[Net] torrent module unreachable — trying nostr:', e?.message || e);
+  }
+  try {
+    _trysteroModule = await import(/* @vite-ignore */ TRYSTERO_FALLBACK_CDN);
+    _trysteroStrategy = 'nostr';
+    console.log('[Net] Trystero loaded (nostr fallback)');
     return _trysteroModule;
   } catch (e) {
     console.warn('[Net] Trystero CDN unreachable — running solo:', e?.message || e);
@@ -81,18 +140,26 @@ export class Net {
 
     const tryst = await _loadTrystero();
     if (!tryst || !tryst.joinRoom) {
-      // CDN failed — degrade gracefully so the lobby UI just shows "no peers"
       this.connected = false;
-      this._dispatch('status', { kind: 'error', msg: 'Trystero unavailable' });
+      this._dispatch('status', { kind: 'error', msg: 'Trystero unavailable — check internet / firewall' });
       return;
     }
 
+    console.log(`[Net] joinRoom — strategy=${_trysteroStrategy}, room="${roomCode}", appId="${APP_ID}"`);
     try {
-      this.room = tryst.joinRoom({ appId: APP_ID }, roomCode);
+      this.room = tryst.joinRoom(
+        { appId: APP_ID, rtcConfig: RTC_CONFIG, password: APP_ID },
+        roomCode,
+        // Trystero v0.21+ accepts an onError callback as 3rd arg
+        (err) => {
+          console.warn('[Net] room error:', err);
+          this._dispatch('status', { kind: 'error', msg: `Room error: ${err?.message || err}` });
+        },
+      );
     } catch (e) {
-      console.warn('[Net] joinRoom failed:', e);
+      console.warn('[Net] joinRoom threw:', e);
       this.connected = false;
-      this._dispatch('status', { kind: 'error', msg: 'joinRoom failed' });
+      this._dispatch('status', { kind: 'error', msg: 'joinRoom failed: ' + (e?.message || e) });
       return;
     }
 
@@ -105,16 +172,28 @@ export class Net {
     getEvt((p,  peerId) => this._dispatch('evt',  p, peerId));
 
     this.room.onPeerJoin(id => {
+      console.log('[Net] peer joined:', id);
       this.peers.set(id, {});
       this._dispatch('peer', { kind: 'join', peerId: id }, id);
+      this._dispatch('status', { kind: 'peer', msg: `Peer connected (${this.peers.size} total)` });
     });
     this.room.onPeerLeave(id => {
+      console.log('[Net] peer left:', id);
       this.peers.delete(id);
       this._dispatch('peer', { kind: 'leave', peerId: id }, id);
     });
 
+    // Surface ICE failures per peer so the lobby can hint at NAT/firewall issues.
+    if (typeof this.room.onPeerError === 'function') {
+      this.room.onPeerError((id, err) => {
+        console.warn(`[Net] peer ${id} error:`, err);
+        this._dispatch('status', { kind: 'peer-error', msg: `Peer ${id} error — likely firewall/NAT` });
+      });
+    }
+
     this.connected = true;
     this._dispatch('status', { kind: 'connected', room: roomCode });
+    console.log(`[Net] connected to room "${roomCode}" (waiting for peers)`);
   }
 
   // Best-effort, unordered — for positions / cursor movement
@@ -147,5 +226,6 @@ export class Net {
   }
 
   // Stats accessor for the in-game multiplayer pane
-  stats() { return { ...this._sendStats, peerCount: this.peers.size, role: this.role }; }
+  stats() { return { ...this._sendStats, peerCount: this.peers.size, role: this.role, strategy: _trysteroStrategy }; }
+  strategy() { return _trysteroStrategy; }
 }

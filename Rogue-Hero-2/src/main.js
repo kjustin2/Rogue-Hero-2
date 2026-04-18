@@ -174,6 +174,17 @@ net.on('snap', (snap) => {
     }
   }
 });
+// Forward Net status events into the lobby UI so users actually see what
+// happened (peer connected, ICE failed, room error, etc.) rather than the
+// banner staying on a stale "Connecting…".
+net.on('status', (s) => {
+  if (!s) return;
+  if (gameState !== 'lobby') return;
+  if (s.kind === 'peer')        lobbyStatusMsg = `🟢 ${s.msg}`;
+  else if (s.kind === 'connected')  lobbyStatusMsg = `Connected — Share code ${s.room}`;
+  else if (s.kind === 'error')      lobbyStatusMsg = `⚠ ${s.msg}`;
+  else if (s.kind === 'peer-error') lobbyStatusMsg = `⚠ ${s.msg}`;
+});
 let localCoop = false;             // toggled by F2 in char select
 let currentBiome = Biomes.verdant; // updated per floor in startNewRun
 window._biome = currentBiome;
@@ -241,6 +252,7 @@ let _victoryReady = false;    // player can advance after 2.5s
 let _resonanceFlashTimer = 0;
 
 // RH2 multiplayer lobby state
+let tutorialPage = 0;            // RH2 #15: index into tutorial pages
 let lobbyMode = 'menu';          // 'menu' | 'hosting' | 'joining'
 let lobbyJoinCode = '';          // text being typed for join
 let lobbyStatusMsg = '';         // bottom-line status text
@@ -752,29 +764,52 @@ function spawnEnemies(node) {
   room.generateVariant(f, rng);
 
   if (node.type === 'boss') {
+    // RH2 #11: mix the three new RH2 bosses (HollowKing/VaultEngine/Aurora)
+    // into the existing roster on a seeded roll, so each run can surface a
+    // fresh fight instead of always RH1's lineup.
+    const _bossRoll = rng();
     if (f === 1) {
-      enemies.push(new BossBrawler(cx, cy - 50));
+      if (_bossRoll < 0.4) {
+        enemies.push(new BossHollowKing(cx, cy - 50));
+      } else {
+        enemies.push(new BossBrawler(cx, cy - 50));
+      }
       enemies.push(new Chaser(rndX(), rndY()));
     } else if (f === 2) {
-      enemies.push(new BossConductor(cx, cy - 50));
-      enemies.push(new ShieldDrone(cx - 100, cy + 60));
-      enemies.push(new ShieldDrone(cx + 100, cy + 60));
+      if (_bossRoll < 0.4) {
+        enemies.push(new BossVaultEngine(cx, cy - 50));
+      } else {
+        enemies.push(new BossConductor(cx, cy - 50));
+        enemies.push(new ShieldDrone(cx - 100, cy + 60));
+        enemies.push(new ShieldDrone(cx + 100, cy + 60));
+      }
     } else if (f === 3) {
-      // 30% chance to face The Archivist instead of BossEcho (BUG-07: use seeded rng)
-      if (rng() < 0.3) {
+      if (_bossRoll < 0.3) {
+        enemies.push(new BossAurora(cx, cy));
+      } else if (_bossRoll < 0.5) {
         enemies.push(new BossArchivist(cx, cy));
       } else {
         enemies.push(new BossEcho(cx, cy));
       }
     } else if (f === 4) {
-      enemies.push(new BossNecromancer(cx, cy - 50));
-      enemies.push(new Phantom(cx - 120, cy + 60));
-      enemies.push(new Phantom(cx + 120, cy + 60));
-      enemies.push(new Chaser(rndX(), rndY()));
+      if (_bossRoll < 0.35) {
+        enemies.push(new BossHollowKing(cx, cy - 50));
+        enemies.push(new Phantom(cx - 120, cy + 60));
+      } else {
+        enemies.push(new BossNecromancer(cx, cy - 50));
+        enemies.push(new Phantom(cx - 120, cy + 60));
+        enemies.push(new Phantom(cx + 120, cy + 60));
+        enemies.push(new Chaser(rndX(), rndY()));
+      }
     } else {
-      enemies.push(new BossApex(cx, cy));
-      enemies.push(new Blocker(cx - 160, cy));
-      enemies.push(new Marksman(cx + 160, cy));
+      if (_bossRoll < 0.35) {
+        enemies.push(new BossVaultEngine(cx, cy));
+        enemies.push(new BossAurora(cx + 200, cy));
+      } else {
+        enemies.push(new BossApex(cx, cy));
+        enemies.push(new Blocker(cx - 160, cy));
+        enemies.push(new Marksman(cx + 160, cy));
+      }
     }
   } else if (node.type === 'elite') {
     const eliteRoll = rng();
@@ -1347,7 +1382,14 @@ function update(logicDt, realDt) {
         if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
           if (b.action === 'continue' || b.action === 'mode_solo') { localCoop = false; audio.init(); audio.playBGM('menu'); gameState = 'charSelect'; }
           else if (b.action === 'mode_local') { localCoop = true; audio.init(); audio.playBGM('menu'); gameState = 'charSelect'; }
-          else if (b.action === 'mode_remote') { localCoop = false; audio.init(); audio.playBGM('menu'); lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; gameState = 'lobby'; }
+          else if (b.action === 'mode_remote') { localCoop = false; audio.init(); audio.playBGM('menu'); lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; gameState = 'lobby';
+            // RH2: warm Trystero CDN + WebRTC permissions immediately so the
+            // banner shows real status rather than waiting until host-click.
+            net.preflight().then(ok => {
+              lobbyStatusMsg = ok
+                ? '✓ Ready to host or join'
+                : '⚠ Network unavailable — check internet';
+            }).catch(() => { lobbyStatusMsg = '⚠ Network unavailable — check internet'; }); }
           else if (b.action === 'vol_down') { const v = Math.max(0, audio.getMasterVolume() - 0.1); audio.setMasterVolume(v); meta.setMasterVolume(v); }
           else if (b.action === 'vol_up')   { const v = Math.min(1, audio.getMasterVolume() + 0.1); audio.setMasterVolume(v); meta.setMasterVolume(v); }
           else if (b.action === 'reset_confirm') { introResetConfirm = true; }
@@ -1454,6 +1496,25 @@ function update(logicDt, realDt) {
     if (input.consumeKey('f2')) {
       localCoop = !localCoop;
       console.log('[RH2] Local co-op:', localCoop ? 'ON' : 'OFF');
+    }
+    input.clearFrame();
+    return;
+  }
+
+  // ── TUTORIAL (RH2 #15) ──
+  if (gameState === 'tutorial') {
+    if (input.consumeKey('escape')) { gameState = 'charSelect'; input.clearFrame(); return; }
+    if (input.consumeKey('arrowleft') || input.consumeKey('a')) tutorialPage = Math.max(0, tutorialPage - 1);
+    if (input.consumeKey('arrowright') || input.consumeKey('d') || input.consumeKey(' ') || input.consumeKey('enter')) {
+      tutorialPage = Math.min(_tutorialPageCount() - 1, tutorialPage + 1);
+    }
+    if (input.consumeClick()) {
+      const mx = input.mouse.x, my = input.mouse.y;
+      const w = canvas.width;
+      if (mx < 180 && my < 60) { gameState = 'charSelect'; input.clearFrame(); return; }
+      const btnY = canvas.height - 70;
+      if (mx >= w/2 - 200 && mx <= w/2 - 40 && my >= btnY && my <= btnY + 50) tutorialPage = Math.max(0, tutorialPage - 1);
+      if (mx >= w/2 + 40 && mx <= w/2 + 200 && my >= btnY && my <= btnY + 50) tutorialPage = Math.min(_tutorialPageCount() - 1, tutorialPage + 1);
     }
     input.clearFrame();
     return;
@@ -1711,7 +1772,12 @@ function update(logicDt, realDt) {
     if (input.consumeClick()) {
       const cardId = ui.handleShopClick(input.mouse.x, input.mouse.y);
       if (cardId === '__leave') { gameState = 'map'; input.clearFrame(); return; }
-      else if (cardId && player.hp > 1) {
+      else if (cardId && player.hp <= 1) {
+        window._shopWarnUntil = performance.now() + 2200;
+        window._shopWarnMsg = 'BUYING THIS CARD WOULD KILL YOU — REST FIRST';
+        events.emit('PLAY_SOUND', 'miss');
+      }
+      else if (cardId) {
         player.hp--;
         const addResult = deckManager.addCard(cardId);
         if (addResult === 'full') {
@@ -2404,10 +2470,22 @@ function handleCharSelectClick(mx, my) {
       }
       if (b.action === 'mainMenu') return 'mainMenu';
       if (b.action === 'toggleCoop') { localCoop = !localCoop; return 'toggleCoop'; }
-      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; gameState = 'lobby'; return 'lobby'; }
+      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; gameState = 'lobby';
+            // RH2: warm Trystero CDN + WebRTC permissions immediately so the
+            // banner shows real status rather than waiting until host-click.
+            net.preflight().then(ok => {
+              lobbyStatusMsg = ok
+                ? '✓ Ready to host or join'
+                : '⚠ Network unavailable — check internet';
+            }).catch(() => { lobbyStatusMsg = '⚠ Network unavailable — check internet'; }); return 'lobby'; }
       if (b.action === 'cosmetics') {
         gameState = 'cosmeticShop';
         return 'cosmetics';
+      }
+      if (b.action === 'tutorial') {
+        gameState = 'tutorial';
+        tutorialPage = 0;
+        return 'tutorial';
       }
       if (b.action === 'customize' && meta.isCharacterUnlocked(b.charId)) {
         cosmeticPanelCharId = b.charId;
@@ -2418,6 +2496,170 @@ function handleCharSelectClick(mx, my) {
     }
   }
   return null;
+}
+
+// ── TUTORIAL pages (RH2 #15) ─────────────────────────────────────────────
+const _TUTORIAL_PAGES = [
+  { kind: 'intro', title: 'WELCOME TO ROGUE HERO 2',
+    body: ['Move with WASD or Arrow Keys.','Aim and attack with the mouse.','Press SPACE to dodge — perfect dodges crit.','Keys 1-4 select cards from your hand.','Build TEMPO with attacks; hot tempo hits harder.'] },
+  { kind: 'attack', label: 'MELEE — ⚔', desc: 'Short-range swing. Cleaves enemies right in front of you.', anim: 'melee' },
+  { kind: 'attack', label: 'PROJECTILE — ●', desc: 'Fires a single projectile toward the cursor. Mid range.', anim: 'projectile' },
+  { kind: 'attack', label: 'BEAM — ═', desc: 'Instant straight line — pierces every enemy on the path.', anim: 'beam' },
+  { kind: 'attack', label: 'DASH — ➜', desc: 'Lunge through a line of enemies, hitting all you cross.', anim: 'dash' },
+  { kind: 'attack', label: 'TRAP — ✦', desc: 'Place at cursor. Detonates when enemies enter.', anim: 'trap' },
+  { kind: 'attack', label: 'GROUND WAVE — ▲', desc: 'A traveling wave that damages everything it crosses.', anim: 'ground' },
+  { kind: 'enemy', label: 'CHASER', color: '#cc3333',
+    desc: 'Sprints straight at you. Telegraphs a short windup before slamming. Dodge or strafe.' },
+  { kind: 'enemy', label: 'SNIPER', color: '#88aa33',
+    desc: 'Stops at range and fires a long aimed shot. Move sideways during the red telegraph ring.' },
+  { kind: 'enemy', label: 'BRUISER', color: '#9922aa',
+    desc: 'Slow but high-damage. Charges a heavy slam — break line of sight or dodge through.' },
+  { kind: 'enemy', label: 'TURRET', color: '#ddaa22',
+    desc: 'Stationary. Fires a burst of three shots. Close the distance behind cover.' },
+  { kind: 'enemy', label: 'BLINK', color: '#bb44ff',
+    desc: 'Teleports next to you, then strikes. Watch for the purple flash, then dodge immediately.' },
+  { kind: 'enemy', label: 'SPLITTER', color: '#ff6622',
+    desc: 'On death, splits into two smaller, faster halves. Kill one at a time and reposition.' },
+  { kind: 'enemy', label: 'BOMBER', color: '#ff8800',
+    desc: 'Runs to detonate on you. Kill from range — exploding does AoE damage.' },
+  { kind: 'tip', title: 'TEMPO BAR',
+    body: ['0-29 COLD: 0.7× damage','30-69 FLOWING: normal','70-89 HOT: 1.3× damage','90-99 CRITICAL: 1.8× damage + pierce','100 → AUTO-CRASH: huge AoE then reset','0 → COLD CRASH: freeze AoE'] },
+];
+function _tutorialPageCount() { return _TUTORIAL_PAGES.length; }
+
+function _drawTutorialScreen(ctx, t) {
+  const w = canvas.width, h = canvas.height;
+  // Background
+  ctx.fillStyle = '#070712'; ctx.fillRect(0, 0, w, h);
+  // Back button
+  ctx.fillStyle = '#1a1520';
+  ctx.beginPath(); ctx.roundRect(16, 14, 150, 36, 7); ctx.fill();
+  ctx.strokeStyle = '#6655aa'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = '#bbaadd'; ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('◀  BACK [ESC]', 91, 38);
+
+  const page = _TUTORIAL_PAGES[Math.max(0, Math.min(_TUTORIAL_PAGES.length - 1, tutorialPage))];
+
+  // Title
+  ctx.fillStyle = '#88ddff'; ctx.font = 'bold 26px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(`TUTORIAL — Page ${tutorialPage + 1} of ${_TUTORIAL_PAGES.length}`, w/2, 50);
+
+  if (page.kind === 'intro' || page.kind === 'tip') {
+    ctx.fillStyle = '#ffdd44'; ctx.font = 'bold 32px monospace';
+    ctx.fillText(page.title, w/2, 130);
+    ctx.fillStyle = '#ddddee'; ctx.font = '18px monospace';
+    for (let i = 0; i < page.body.length; i++) {
+      ctx.fillText(page.body[i], w/2, 200 + i * 34);
+    }
+  } else if (page.kind === 'attack') {
+    ctx.fillStyle = '#ffaa44'; ctx.font = 'bold 30px monospace';
+    ctx.fillText(page.label, w/2, 110);
+    ctx.fillStyle = '#cccccc'; ctx.font = '16px monospace';
+    ctx.fillText(page.desc, w/2, 144);
+
+    // Mini animation: a player firing the attack at a dummy target
+    const pCX = w/2 - 160, pCY = h/2 + 20;
+    const eCX = w/2 + 160, eCY = h/2 + 20;
+    // Phase 0..1 over 1.6s
+    const phase = (t * 0.625) % 1;
+
+    // Dummy target enemy
+    ctx.fillStyle = '#cc3333'; ctx.beginPath(); ctx.arc(eCX, eCY, 18, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.fillText('TARGET', eCX, eCY - 28);
+
+    // Player
+    ctx.fillStyle = '#44aaff'; ctx.beginPath(); ctx.arc(pCX, pCY, 18, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillText('YOU', pCX, pCY - 28);
+
+    if (page.anim === 'melee') {
+      // Sweep arc near the player toward target
+      ctx.save();
+      ctx.translate(pCX, pCY);
+      const rot = -Math.PI/4 + phase * Math.PI * 0.8;
+      ctx.rotate(rot);
+      ctx.strokeStyle = '#ffdd44'; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.arc(0, 0, 36, -0.6, 0.6); ctx.stroke();
+      ctx.restore();
+    } else if (page.anim === 'projectile') {
+      const px = pCX + (eCX - pCX) * phase;
+      ctx.fillStyle = '#ffdd44'; ctx.beginPath(); ctx.arc(px, pCY, 6, 0, Math.PI * 2); ctx.fill();
+    } else if (page.anim === 'beam') {
+      const a = phase < 0.4 ? phase / 0.4 : 1 - (phase - 0.4) / 0.6;
+      ctx.strokeStyle = `rgba(255,220,80,${a})`;
+      ctx.lineWidth = 6;
+      ctx.beginPath(); ctx.moveTo(pCX, pCY); ctx.lineTo(eCX, eCY); ctx.stroke();
+    } else if (page.anim === 'dash') {
+      const dx = pCX + (eCX - pCX) * phase;
+      ctx.fillStyle = `rgba(80,180,255,${0.5})`;
+      ctx.beginPath(); ctx.arc(dx, pCY, 18, 0, Math.PI * 2); ctx.fill();
+      // motion lines
+      for (let i = 0; i < 4; i++) {
+        ctx.strokeStyle = `rgba(120,200,255,${0.4 - i*0.08})`;
+        ctx.beginPath(); ctx.moveTo(dx - 20 - i*12, pCY); ctx.lineTo(dx - 6 - i*12, pCY); ctx.stroke();
+      }
+    } else if (page.anim === 'trap') {
+      const tx = (pCX + eCX) / 2;
+      const trig = phase > 0.6;
+      ctx.strokeStyle = trig ? '#ff4444' : '#ffaa44';
+      ctx.setLineDash([5, 4]); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(tx, pCY, 24 + (trig ? phase * 30 : 0), 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    } else if (page.anim === 'ground') {
+      const wx = pCX + (eCX - pCX) * phase;
+      ctx.strokeStyle = '#cc8833'; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(wx, pCY - 30); ctx.lineTo(wx, pCY + 30); ctx.stroke();
+    }
+  } else if (page.kind === 'enemy') {
+    ctx.fillStyle = page.color; ctx.font = 'bold 32px monospace';
+    ctx.fillText(page.label, w/2, 120);
+
+    // Render enemy with attack-windup ring (matches in-game telegraph look)
+    const eCX = w/2, eCY = h/2 - 10;
+    const r = 26;
+    ctx.fillStyle = page.color;
+    ctx.beginPath(); ctx.arc(eCX, eCY, r, 0, Math.PI * 2); ctx.fill();
+    // Telegraph ring (phase 0..1)
+    const tp = (t * 0.7) % 1;
+    ctx.beginPath();
+    ctx.arc(eCX, eCY, r + 6 + tp * 14, 0, Math.PI * 2);
+    ctx.strokeStyle = tp > 0.7 ? 'rgba(255,40,40,0.95)' : 'rgba(255,140,40,0.75)';
+    ctx.lineWidth = 2.5; ctx.setLineDash([6, 4]); ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = '#ddddee'; ctx.font = '17px monospace'; ctx.textAlign = 'center';
+    _tutorialWrap(ctx, page.desc, w/2, h/2 + 80, w * 0.7, 24);
+  }
+
+  // Prev / Next buttons
+  const btnY = h - 70;
+  ctx.fillStyle = tutorialPage > 0 ? '#1a2a3a' : '#0d0d18';
+  ctx.beginPath(); ctx.roundRect(w/2 - 200, btnY, 160, 50, 8); ctx.fill();
+  ctx.strokeStyle = '#44ddff'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = tutorialPage > 0 ? '#aaddff' : '#445566'; ctx.font = 'bold 16px monospace';
+  ctx.fillText('◀ PREV', w/2 - 120, btnY + 32);
+
+  const isLast = tutorialPage >= _TUTORIAL_PAGES.length - 1;
+  ctx.fillStyle = !isLast ? '#1a2a3a' : '#0d0d18';
+  ctx.beginPath(); ctx.roundRect(w/2 + 40, btnY, 160, 50, 8); ctx.fill();
+  ctx.strokeStyle = '#44ddff'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = !isLast ? '#aaddff' : '#445566';
+  ctx.fillText('NEXT ▶', w/2 + 120, btnY + 32);
+
+  ctx.fillStyle = '#666688'; ctx.font = '12px monospace';
+  ctx.fillText('← / → arrows or A/D to flip pages  ·  ESC to return', w/2, btnY - 12);
+}
+
+function _tutorialWrap(ctx, text, x, y, maxW, lineH) {
+  const words = text.split(' ');
+  let line = '', yy = y;
+  for (const w0 of words) {
+    const test = line ? line + ' ' + w0 : w0;
+    if (ctx.measureText(test).width > maxW && line) {
+      ctx.fillText(line, x, yy);
+      line = w0; yy += lineH;
+    } else line = test;
+  }
+  if (line) ctx.fillText(line, x, yy);
 }
 
 let draftBoxes = [];
@@ -2967,6 +3209,21 @@ function render() {
       ctx2.textAlign = 'center';
       ctx2.fillText('🌐  REMOTE LOBBY', lbX + lbW / 2, lbY + 24);
       charSelectBoxes.push({ x: lbX, y: lbY, w: lbW, h: lbH, action: 'lobby' });
+
+      // ── TUTORIAL button — to the right of REMOTE LOBBY ──
+      const tbW = 160, tbH = 38, tbX = lbX + lbW + 10, tbY = lbY;
+      ctx2.fillStyle = '#1a2418';
+      ctx2.beginPath();
+      ctx2.roundRect(tbX, tbY, tbW, tbH, 7);
+      ctx2.fill();
+      ctx2.strokeStyle = '#88dd66';
+      ctx2.lineWidth = 1.5;
+      ctx2.stroke();
+      ctx2.fillStyle = '#bbffaa';
+      ctx2.font = 'bold 13px monospace';
+      ctx2.textAlign = 'center';
+      ctx2.fillText('📖  TUTORIAL', tbX + tbW / 2, tbY + 24);
+      charSelectBoxes.push({ x: tbX, y: tbY, w: tbW, h: tbH, action: 'tutorial' });
     }
 
     // ── PLAYERS toggle button (1P / 2P local co-op) — top-right ──
@@ -3293,6 +3550,12 @@ function render() {
     return;
   }
 
+  // ── TUTORIAL (RH2 #15) ──
+  if (gameState === 'tutorial') {
+    _drawTutorialScreen(renderer.ctx, performance.now() / 1000);
+    return;
+  }
+
   // ── LOBBY (remote co-op) ──
   if (gameState === 'lobby') {
     const ctx = renderer.ctx;
@@ -3329,16 +3592,29 @@ function render() {
       ctx.font = '14px monospace';
       ctx.fillText('Play with up to 4 players over the internet', cx, 110);
 
-      // Simple connection banner — just connected/not connected
+      // Connection banner — preflight (network OK) → ready, in-room → connected, else error
       {
-        const wbW = 420, wbH = 38, wbX = cx - wbW / 2, wbY = 138;
-        const ok = net.connected;
-        ctx.fillStyle = ok ? 'rgba(12,40,24,0.85)' : 'rgba(40,16,12,0.85)';
+        const wbW = 460, wbH = 38, wbX = cx - wbW / 2, wbY = 138;
+        const inRoom  = net.connected;
+        const ready   = net._preflightOk === true;
+        const failed  = net._preflightOk === false;
+        const checking = !inRoom && !ready && !failed;
+        const ok = inRoom || ready;
+        ctx.fillStyle = ok ? 'rgba(12,40,24,0.85)' : (failed ? 'rgba(40,16,12,0.85)' : 'rgba(20,28,40,0.85)');
         ctx.beginPath(); ctx.roundRect(wbX, wbY, wbW, wbH, 8); ctx.fill();
-        ctx.strokeStyle = ok ? '#44dd99' : '#ff7755'; ctx.lineWidth = 1.5; ctx.stroke();
-        ctx.fillStyle = ok ? '#88ffcc' : '#ff9988';
+        ctx.strokeStyle = ok ? '#44dd99' : (failed ? '#ff7755' : '#5588cc'); ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle  = ok ? '#88ffcc' : (failed ? '#ff9988' : '#aac9ff');
         ctx.font = 'bold 13px monospace';
-        ctx.fillText(ok ? '✓  CONNECTED — READY TO PLAY' : '○  NOT CONNECTED — CHECK INTERNET', cx, wbY + 24);
+        const peerN  = net.peers ? net.peers.size : 0;
+        const strat  = (typeof net.strategy === 'function' ? net.strategy() : null) || '';
+        const stratTag = strat ? `  ·  via ${strat}` : '';
+        const label = inRoom   ? (peerN > 0
+                                    ? `✓  IN ROOM — ${peerN} PEER${peerN === 1 ? '' : 'S'} CONNECTED${stratTag}`
+                                    : `✓  IN ROOM — WAITING FOR PEERS${stratTag}`)
+                    : ready    ? `✓  NETWORK READY — HOST OR JOIN${stratTag}`
+                    : failed   ? '⚠  NETWORK UNAVAILABLE — CHECK INTERNET'
+                    :            '⏳  CHECKING NETWORK…';
+        ctx.fillText(label, cx, wbY + 24);
       }
 
       // HOST button
@@ -3652,6 +3928,19 @@ function render() {
   // ── SHOP ──
   if (gameState === 'shop') {
     ui.drawShopScreen(renderer.ctx, shopCards, CardDefinitions);
+    if (window._shopWarnUntil && performance.now() < window._shopWarnUntil) {
+      const ctx = renderer.ctx;
+      const msg = window._shopWarnMsg || '';
+      const bw = 560, bh = 44;
+      const bx = (canvas.width - bw) / 2, by = 90;
+      ctx.fillStyle = 'rgba(60,10,10,0.94)';
+      ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 8); ctx.fill();
+      ctx.strokeStyle = '#ff5566'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#ffbbbb';
+      ctx.font = 'bold 15px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(msg, canvas.width / 2, by + 28);
+    }
     return;
   }
 
@@ -3823,14 +4112,14 @@ function render() {
   if (players.count > 1 && player.downed) {
     const ctx = renderer.ctx;
     ctx.beginPath();
-    ctx.arc(player.x, player.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (player.reviveProgress || 0));
+    ctx.arc(player.x, player.y + player.r * 0.7, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (player.reviveProgress || 0));
     ctx.strokeStyle = '#44ff88';
     ctx.lineWidth = 3;
     ctx.stroke();
     ctx.fillStyle = '#ff4444';
     ctx.font = 'bold 11px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('DOWN', player.x, player.y - 28);
+    ctx.fillText('DOWN', player.x, player.y + player.r * 0.7 - 28);
   }
   // RH2: draw additional players + their downed/revive UI + follow HP bar
   if (players.count > 1) {
@@ -3855,7 +4144,7 @@ function render() {
       const ctx = renderer.ctx;
       // Follow HP bar above the player's head — small, color-keyed
       if ((p.alive || p.downed) && p.maxHp) {
-        const bw = 36, bh = 4, bx = p.x - bw / 2, by = p.y - p.r - 12;
+        const bw = 36, bh = 4, bx = p.x - bw / 2, by = p.y + p.r * 0.7 - p.r - 12;
         const frac = Math.max(0, Math.min(1, p.hp / p.maxHp));
         ctx.fillStyle = 'rgba(0,0,0,0.55)';
         ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
@@ -3867,14 +4156,14 @@ function render() {
       }
       if (p.downed) {
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (p.reviveProgress || 0));
+        ctx.arc(p.x, p.y + p.r * 0.7, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (p.reviveProgress || 0));
         ctx.strokeStyle = '#44ff88';
         ctx.lineWidth = 3;
         ctx.stroke();
         ctx.fillStyle = '#ff4444';
         ctx.font = 'bold 11px monospace';
         ctx.textAlign = 'center';
-        ctx.fillText('DOWN', p.x, p.y - 28);
+        ctx.fillText('DOWN', p.x, p.y + p.r * 0.7 - 28);
       }
     }
     // P2 reticle

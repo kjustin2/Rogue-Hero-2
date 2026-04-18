@@ -169,6 +169,20 @@ export class Enemy extends Entity {
       ctx.stroke();
     }
 
+    // RH2 #20: explicit attack-windup circle so every enemy clearly signals
+    // "incoming attack" — radius grows + color brightens as telegraph completes.
+    if (this.state === 'telegraph' && !this.spawning && this.telegraphDuration > 0) {
+      const tp = Math.max(0, Math.min(1, 1 - (this.telegraphTimer / this.telegraphDuration)));
+      const ringR = drawR + 6 + tp * 14;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, ringR, 0, Math.PI * 2);
+      ctx.strokeStyle = tp > 0.7 ? 'rgba(255,40,40,0.95)' : 'rgba(255,140,40,0.75)';
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([6, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     ctx.fillStyle = '#ffffff';
     // Font is set once per frame by the draw loop in main.js (bold 13px monospace)
     ctx.textAlign = 'center';
