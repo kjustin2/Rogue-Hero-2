@@ -35,6 +35,21 @@ export class Room {
 
   // Called by the runtime whenever a WS message arrives (hibernation-safe).
   async webSocketMessage(ws, message) {
+    // Per-connection rate limit: max 30 messages per 10s window. Prevents
+    // accidental loops or malicious flooding from costing CF execution time.
+    let att;
+    try { att = ws.deserializeAttachment() || {}; } catch { att = {}; }
+    const now = Date.now();
+    if (!att._rlStart || now - att._rlStart > 10000) {
+      att._rlStart = now; att._rlCount = 0;
+    }
+    att._rlCount = (att._rlCount || 0) + 1;
+    if (att._rlCount > 30) {
+      try { ws.close(1013, 'rate limited'); } catch {}
+      return;
+    }
+    try { ws.serializeAttachment(att); } catch {}
+
     let msg;
     try { msg = JSON.parse(message); } catch { return; }
 

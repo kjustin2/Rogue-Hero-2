@@ -56,7 +56,19 @@ export class Engine {
       this.slowMoScale = 1.0;
     }
 
+    // Profile timings — exposed via window._profileSample for the Ctrl+P overlay
+    const _t0 = performance.now();
     this.updateFn(logicDt, realDt);
+    const _t1 = performance.now();
     this.renderFn();
+    const _t2 = performance.now();
+    if (typeof window !== 'undefined') {
+      // Rolling 30-frame average to keep the display readable
+      const s = window._profileSample = window._profileSample || { upd: 0, ren: 0, frame: 0, n: 0 };
+      s.upd   = s.upd   * 0.9 + (_t1 - _t0) * 0.1;
+      s.ren   = s.ren   * 0.9 + (_t2 - _t1) * 0.1;
+      s.frame = s.frame * 0.9 + (_t2 - _t0) * 0.1;
+      s.n++;
+    }
   }
 }

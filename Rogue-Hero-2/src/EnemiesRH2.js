@@ -37,7 +37,9 @@ export class TetherWitch extends Enemy {
     this.tickTimer -= dt;
     if (this.tickTimer <= 0) {
       this.tickTimer = 0.6;
-      const ps = (window._players && window._players.list) || [player];
+      const _all = (window._players && window._players.list) || [player];
+      const _standing = _all.filter(p => p && p.alive && !p.downed);
+      const ps = _standing.length ? _standing : _all; // fall back if everyone is downed
       if (ps.length >= 2) {
         for (let i = 0; i < ps.length; i++) {
           for (let j = i + 1; j < ps.length; j++) {
@@ -202,7 +204,9 @@ export class StaticHound extends Enemy {
       this.x += this.chargeDir.x * 480 * dt;
       this.y += this.chargeDir.y * 480 * dt;
       if (this.chargeTimer <= 0) this.charging = false;
-      const ps = (window._players && window._players.list) || [player];
+      const _all = (window._players && window._players.list) || [player];
+      const _standing = _all.filter(p => p && p.alive && !p.downed);
+      const ps = _standing.length ? _standing : _all; // fall back if everyone is downed
       for (const p of ps) {
         if (!p.alive) continue;
         const pdx = p.x - this.x, pdy = p.y - this.y;
@@ -329,7 +333,9 @@ export class BossAurora extends Enemy {
     this.wellTimer -= dt;
     if (this.wellTimer <= 0) {
       this.wellTimer = 2.5;
-      const ps = (window._players && window._players.list) || [player];
+      const _all = (window._players && window._players.list) || [player];
+      const _standing = _all.filter(p => p && p.alive && !p.downed);
+      const ps = _standing.length ? _standing : _all; // fall back if everyone is downed
       const target = ps[Math.floor(Math.random() * ps.length)];
       if (target && target.alive) this.wells.push({ x: target.x, y: target.y, t: 1.6, r: 90 });
     }

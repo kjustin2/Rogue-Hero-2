@@ -13,12 +13,16 @@ export class RunManager {
     this._mapGridH = 0;
   }
 
-  // Simple seeded RNG (mulberry32)
+  // Simple seeded RNG (mulberry32). State is stored on the instance so
+  // the host can ship it to the client in ENEMY_SPAWN_LIST / ROOM_CLEARED
+  // and keep both sides on the same position in the stream — otherwise
+  // the host's spawnEnemies() consumes RNG that the client's deferred
+  // combat path never consumes, and the next-floor generateMap() drifts.
   _createRng(seed) {
-    let t = seed;
+    this._rngState = seed | 0;
     return () => {
-      t = (t + 0x6D2B79F5) | 0;
-      let v = t;
+      this._rngState = (this._rngState + 0x6D2B79F5) | 0;
+      let v = this._rngState;
       v = Math.imul(v ^ (v >>> 15), v | 1);
       v ^= v + Math.imul(v ^ (v >>> 7), v | 61);
       return ((v ^ (v >>> 14)) >>> 0) / 4294967296;
@@ -32,6 +36,16 @@ export class RunManager {
 
   getRng() {
     return this.rng || Math.random;
+  }
+
+  // Expose RNG state so MP hosts can broadcast it and clients can snap to
+  // the same stream position. Safe to call before setSeed (returns null).
+  getRngState() {
+    return (typeof this._rngState === 'number') ? (this._rngState | 0) : null;
+  }
+  setRngState(state) {
+    if (typeof state !== 'number') return;
+    this._rngState = state | 0;
   }
 
   generateMap() {
@@ -111,26 +125,49 @@ export class RunManager {
   }
 
   handleMapClick(mx, my, width, height) {
+    const node = this.identifyNodeAtPoint(mx, my);
+    if (!node) return null;
+    this.currentNodeId = node.id;
+    console.log(`[Map] Advanced to node "${node.id}" type="${node.type}"`);
+    return node;
+  }
+
+  // RH2 multiplayer: returns the reachable node at (mx,my) without advancing
+  // currentNodeId. Used by both the vote system (which only advances after
+  // both players agree) and by handleMapClick (which advances immediately).
+  identifyNodeAtPoint(mx, my) {
     if (!this.clickSpheres || !this.currentNodeId) return null;
-
-    let curr = this.nodeMap[this.currentNodeId];
+    const curr = this.nodeMap[this.currentNodeId];
     if (!curr) return null;
-
-    let validTargets = curr.next;
-
-    for (let sphere of this.clickSpheres) {
+    const validTargets = curr.next;
+    for (const sphere of this.clickSpheres) {
       if (validTargets.includes(sphere.id)) {
         const dx = mx - sphere.x;
         const dy = my - sphere.y;
-        if (dx*dx + dy*dy <= sphere.r * sphere.r) {
-          this.currentNodeId = sphere.id;
-          let selectedNode = this.nodeMap[sphere.id];
-          console.log(`[Map] Advanced to node "${sphere.id}" type="${selectedNode.type}"`);
-          return selectedNode;
+        if (dx * dx + dy * dy <= sphere.r * sphere.r) {
+          return this.nodeMap[sphere.id];
         }
       }
     }
     return null;
+  }
+
+  // Returns the screen-space position of a known node id (or null).
+  getNodePosition(nodeId) {
+    if (!this.clickSpheres) return null;
+    for (const s of this.clickSpheres) {
+      if (s.id === nodeId) return { x: s.x, y: s.y, r: s.r };
+    }
+    return null;
+  }
+
+  // Advances the current node to the given id (used when a vote completes).
+  // Returns the resolved node, or null if the id is invalid.
+  selectNodeById(nodeId) {
+    const node = this.nodeMap[nodeId];
+    if (!node) return null;
+    this.currentNodeId = nodeId;
+    return node;
   }
 
   drawMap(ctx, width, height, mx, my) {

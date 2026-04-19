@@ -938,6 +938,284 @@ export const CardDefinitions = {
     desc: '[RELAY] Bounces between allies before homing on enemy. +12 Tempo.',
     bonusCard: true, relay: true, bounces: 3
   },
+
+  // ── DEEP_AUDIT §4 — Stance additions (3→8) ──────────────────────
+  frost_stance: {
+    id: 'frost_stance', name: 'Frost Stance', cost: 2, tempoShift: -8, rarity: 'rare',
+    damage: 0, range: 0, type: 'stance', color: '#88ddff',
+    desc: '[STANCE] Every 3rd melee freezes target 1s. Cancels on dodge.',
+    bonusCard: true, stanceMode: 'frost'
+  },
+  shadow_stance: {
+    id: 'shadow_stance', name: 'Shadow Stance', cost: 2, tempoShift: 5, rarity: 'rare',
+    damage: 0, range: 0, type: 'stance', color: '#aa66ff',
+    desc: '[STANCE] Perfect dodges grant a free 0-AP shot for 4s.',
+    bonusCard: true, stanceMode: 'shadow'
+  },
+  echo_stance: {
+    id: 'echo_stance', name: 'Echo Stance', cost: 3, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 0, type: 'stance', color: '#ddccff',
+    desc: '[STANCE] Projectiles fire twice (half dmg, second delayed 0.2s).',
+    bonusCard: true, stanceMode: 'echo'
+  },
+  vanguard_stance: {
+    id: 'vanguard_stance', name: 'Vanguard Stance', cost: 2, tempoShift: -5, rarity: 'rare',
+    damage: 0, range: 0, type: 'stance', color: '#aaccff',
+    desc: '[STANCE] Taking damage refunds 1 AP. Cancels at 0 HP.',
+    bonusCard: true, stanceMode: 'vanguard'
+  },
+  berserker_stance: {
+    id: 'berserker_stance', name: 'Berserker Stance', cost: 1, tempoShift: 15, rarity: 'rare',
+    damage: 0, range: 0, type: 'stance', color: '#ff4444',
+    desc: '[STANCE] +50% dmg, tempo decays 2× faster. -2 HP.',
+    bonusCard: true, hpCost: 2, stanceMode: 'berserker'
+  },
+
+  // ── DEEP_AUDIT §4 — Channel additions (3→8) ─────────────────────
+  frost_stream: {
+    id: 'frost_stream', name: 'Frost Stream', cost: 2, tempoShift: -10, rarity: 'rare',
+    damage: 0, range: 240, type: 'channel', color: '#88ccff',
+    desc: '[CHANNEL] Cone deals 1.5/s, slows 50%. Cools tempo while channeling.',
+    bonusCard: true, tickDamage: 1.5, tickRate: 0.2, channelType: 'frost'
+  },
+  repair_channel: {
+    id: 'repair_channel', name: 'Repair Channel', cost: 1, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 200, type: 'channel', color: '#66ffaa',
+    desc: '[CHANNEL][PACT] Heal nearest ally 1/s within range.',
+    bonusCard: true, pact: true, channelType: 'heal', tickDamage: -1, tickRate: 1.0
+  },
+  pulse_cannon: {
+    id: 'pulse_cannon', name: 'Pulse Cannon', cost: 3, tempoShift: 18, rarity: 'rare',
+    damage: 12, range: 260, type: 'channel', color: '#ffaa44',
+    desc: '[CHANNEL] Fires wide knockback wave every 0.5s.',
+    bonusCard: true, tickDamage: 12, tickRate: 0.5, channelType: 'pulse'
+  },
+  whisper_channel: {
+    id: 'whisper_channel', name: 'Whisper Channel', cost: 2, tempoShift: -5, rarity: 'rare',
+    damage: 0, range: 220, type: 'channel', color: '#cc88ff',
+    desc: '[CHANNEL] Marks all enemies in cone for death (4s).',
+    bonusCard: true, channelType: 'mark', tickRate: 0.3
+  },
+  bind_beam: {
+    id: 'bind_beam', name: 'Bind Beam', cost: 2, tempoShift: -8, rarity: 'rare',
+    damage: 0, range: 280, type: 'channel', color: '#ddee88',
+    desc: '[CHANNEL] Holds targeted enemy in place. No damage.',
+    bonusCard: true, channelType: 'bind', tickRate: 0.2
+  },
+
+  // ── DEEP_AUDIT §4 — Sigil additions (5→10) ──────────────────────
+  sigil_strikes: {
+    id: 'sigil_strikes', name: 'Sigil of Strikes', cost: 2, tempoShift: 10, rarity: 'rare',
+    damage: 0, range: 0, type: 'sigil', color: '#ffcc44',
+    desc: '[SIGIL] On nearby kill: 60 dmg burst. Snowballs in big fights.',
+    bonusCard: true, sigilTrigger: 'kill', sigilAoE: 130, sigilDmg: 60
+  },
+  sigil_reflection: {
+    id: 'sigil_reflection', name: 'Sigil of Reflection', cost: 2, tempoShift: 5, rarity: 'rare',
+    damage: 0, range: 0, type: 'sigil', color: '#aaccff',
+    desc: '[SIGIL] On enemy melee hit: mirror 80% damage back.',
+    bonusCard: true, sigilTrigger: 'hit', sigilAoE: 100, sigilDmg: 0
+  },
+  sigil_hunger: {
+    id: 'sigil_hunger', name: 'Sigil of Hunger', cost: 1, tempoShift: -5, rarity: 'rare',
+    damage: 0, range: 0, type: 'sigil', color: '#ff5577',
+    desc: '[SIGIL] Below 20% HP: heal 5/s for 3s. Last-ditch save.',
+    bonusCard: true, sigilTrigger: 'lowHp', sigilAoE: 0, sigilDmg: 0
+  },
+  sigil_tides: {
+    id: 'sigil_tides', name: 'Sigil of Tides', cost: 2, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 0, type: 'sigil', color: '#33ddee',
+    desc: '[SIGIL] On zone change: push all enemies 100px from sigil.',
+    bonusCard: true, sigilTrigger: 'zone', sigilAoE: 200, sigilDmg: 0
+  },
+  sigil_pact: {
+    id: 'sigil_pact', name: 'Sigil of Pact', cost: 1, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 0, type: 'sigil', color: '#ff99cc',
+    desc: '[SIGIL][PACT] Ally on it 1s: both heal 5 + draw a card.',
+    bonusCard: true, pact: true, sigilTrigger: 'allyContact', sigilAoE: 50
+  },
+
+  // ── DEEP_AUDIT §4 — Marker additions (2→6) ──────────────────────
+  mark_of_death: {
+    id: 'mark_of_death', name: 'Mark of Death', cost: 0, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 240, type: 'marker', color: '#ff4488',
+    desc: '[MARKER] Mark enemy. Next card vs them deals 2× and consumes mark.',
+    bonusCard: true, marker: true, markerCount: 1
+  },
+  way_sigil: {
+    id: 'way_sigil', name: 'Way Sigil', cost: 1, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 260, type: 'marker', color: '#ddffaa',
+    desc: '[MARKER] Place mark. Next dash teleports to it instantly.',
+    bonusCard: true, marker: true, markerCount: 1
+  },
+  echo_marker: {
+    id: 'echo_marker', name: 'Echo Marker', cost: 1, tempoShift: 5, rarity: 'rare',
+    damage: 0, range: 220, type: 'marker', color: '#aaffee',
+    desc: '[MARKER][ECHO] Cards within 4s also "play" at mark (0.4s delay).',
+    bonusCard: true, marker: true, markerCount: 1, echoDelay: 0.4
+  },
+  magnet_mark: {
+    id: 'magnet_mark', name: 'Magnet Mark', cost: 2, tempoShift: 8, rarity: 'rare',
+    damage: 0, range: 220, type: 'marker', color: '#aaffcc',
+    desc: '[MARKER] Pull enemies within 200px toward it over 2s.',
+    bonusCard: true, marker: true, markerCount: 1, pullRadius: 200
+  },
+
+  // ── DEEP_AUDIT §4 — Relay additions (2→6) ───────────────────────
+  storm_relay: {
+    id: 'storm_relay', name: 'Storm Relay', cost: 3, tempoShift: 22, rarity: 'rare',
+    damage: 14, range: 260, type: 'relay', color: '#ffff44',
+    desc: '[RELAY] Lightning bouncing 5 enemies. -20% dmg per bounce.',
+    bonusCard: true, relay: true, bounces: 5
+  },
+  frost_relay: {
+    id: 'frost_relay', name: 'Frost Relay', cost: 2, tempoShift: -12, rarity: 'rare',
+    damage: 8, range: 240, type: 'relay', color: '#aaeeff',
+    desc: '[RELAY] Ice ball; each bounce slows hit enemy 1s.',
+    bonusCard: true, relay: true, bounces: 4
+  },
+  echo_relay: {
+    id: 'echo_relay', name: 'Echo Relay', cost: 2, tempoShift: 10, rarity: 'rare',
+    damage: 10, range: 240, type: 'relay', color: '#cc88ff',
+    desc: '[RELAY][ECHO] Final bounce detonates as small AoE.',
+    bonusCard: true, relay: true, bounces: 3, echoDelay: 0.2
+  },
+  healing_relay: {
+    id: 'healing_relay', name: 'Healing Relay', cost: 2, tempoShift: 0, rarity: 'rare',
+    damage: -6, range: 220, type: 'relay', color: '#66ffaa',
+    desc: '[RELAY][PACT] Bounces between allies, healing 6 each.',
+    bonusCard: true, pact: true, relay: true, bounces: 4
+  },
+
+  // ── DEEP_AUDIT §4 — Overload additions (2→6) ────────────────────
+  overload_pulse: {
+    id: 'overload_pulse', name: 'Overload Pulse', cost: 2, tempoShift: 18, rarity: 'rare',
+    damage: 8, range: 200, type: 'overload', color: '#ff8844',
+    desc: '[OVERLOAD] Detonates ALL burn stacks for 1.5× dmg.',
+    bonusCard: true, overload: true
+  },
+  overload_sustain: {
+    id: 'overload_sustain', name: 'Overload Sustain', cost: 1, tempoShift: 5, rarity: 'rare',
+    damage: 0, range: 0, type: 'overload', color: '#ffaa66',
+    desc: '[OVERLOAD] Burn ticks gain +1 dmg per stack for 3s.',
+    bonusCard: true, overload: true
+  },
+  volatile_overload: {
+    id: 'volatile_overload', name: 'Volatile Overload', cost: 2, tempoShift: 12, rarity: 'rare',
+    damage: 0, range: 0, type: 'overload', color: '#ff4422',
+    desc: '[OVERLOAD] -2 HP. Next burn applied has 2× stacks.',
+    bonusCard: true, overload: true, hpCost: 2
+  },
+  cleansing_overload: {
+    id: 'cleansing_overload', name: 'Cleansing Overload', cost: 2, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 200, type: 'overload', color: '#aaff88',
+    desc: '[OVERLOAD] Removes your debuffs; each becomes a burn stack on enemy.',
+    bonusCard: true, overload: true
+  },
+
+  // ── DEEP_AUDIT §4 — Counter additions (4→8) ─────────────────────
+  frost_counter: {
+    id: 'frost_counter', name: 'Frost Counter', cost: 1, tempoShift: -10, rarity: 'rare',
+    damage: 8, range: 110, type: 'counter', color: '#88ddff',
+    desc: '[COUNTER] On parry: 90° freeze cone in front.',
+    bonusCard: true, parryWindow: 0.4, counterDmg: 8
+  },
+  phantom_counter: {
+    id: 'phantom_counter', name: 'Phantom Counter', cost: 1, tempoShift: 8, rarity: 'rare',
+    damage: 0, range: 0, type: 'counter', color: '#aa88ff',
+    desc: '[COUNTER] On parry: intangible 0.6s (cannot be hit).',
+    bonusCard: true, parryWindow: 0.4
+  },
+  tempo_counter: {
+    id: 'tempo_counter', name: 'Tempo Counter', cost: 0, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 0, type: 'counter', color: '#ffaa88',
+    desc: '[COUNTER] On parry: gain +20 Tempo.',
+    bonusCard: true, parryWindow: 0.4
+  },
+  reflective_aegis: {
+    id: 'reflective_aegis', name: 'Reflective Aegis', cost: 2, tempoShift: -5, rarity: 'rare',
+    damage: 6, range: 0, type: 'counter', color: '#aaccdd',
+    desc: '[COUNTER] On parry: ALL enemy projectiles in 400px reverse.',
+    bonusCard: true, parryWindow: 0.5, counterDmg: 6
+  },
+
+  // ── DEEP_AUDIT §4 — Echo additions (6→10) ───────────────────────
+  echo_trap: {
+    id: 'echo_trap', name: 'Echo Trap', cost: 2, tempoShift: 8, rarity: 'rare',
+    damage: 18, range: 220, type: 'echo', color: '#ff9988',
+    desc: '[ECHO][TRAP] Mark detonates if any enemy enters within 3s.',
+    bonusCard: true, echoDelay: 3.0, trapRadius: 80
+  },
+  echo_portal: {
+    id: 'echo_portal', name: 'Echo Portal', cost: 1, tempoShift: 5, rarity: 'rare',
+    damage: 0, range: 240, type: 'echo', color: '#88ccff',
+    desc: '[ECHO] Next cast within 4s also fires at mark.',
+    bonusCard: true, echoDelay: 4.0, echoType: 'portal'
+  },
+  echo_aegis: {
+    id: 'echo_aegis', name: 'Echo Aegis', cost: 2, tempoShift: 0, rarity: 'rare',
+    damage: 16, range: 220, type: 'echo', color: '#ddccaa',
+    desc: '[ECHO][COUNTER] Mark explodes if you take damage within 2s.',
+    bonusCard: true, echoDelay: 2.0
+  },
+  echo_of_past: {
+    id: 'echo_of_past', name: 'Echo of the Past', cost: 3, tempoShift: 12, rarity: 'rare',
+    damage: 0, range: 240, type: 'echo', color: '#ccaaff',
+    desc: '[ECHO] Replay your last non-utility card after 1s at mark.',
+    bonusCard: true, echoDelay: 1.0, echoType: 'replay'
+  },
+
+  // ── DEEP_AUDIT §4 — Pact additions (6→12) ───────────────────────
+  twin_strike: {
+    id: 'twin_strike', name: 'Twin Strike', cost: 1, tempoShift: 12, rarity: 'rare',
+    damage: 14, range: 110, type: 'melee', color: '#ff77cc',
+    desc: '[PACT] Plays from BOTH players at cursor. +1 AP per ally.',
+    bonusCard: true, pact: true, pactCostPerAlly: 1
+  },
+  shared_tempo: {
+    id: 'shared_tempo', name: 'Shared Tempo', cost: 2, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 0, type: 'utility', color: '#aaccff',
+    desc: '[PACT] Average tempo across all alive allies.',
+    bonusCard: true, pact: true
+  },
+  allied_resolve: {
+    id: 'allied_resolve', name: 'Allied Resolve', cost: 1, tempoShift: 0, rarity: 'rare',
+    damage: -3, range: 0, type: 'utility', color: '#aaffcc',
+    desc: '[PACT] Heal all allies 3 + grant each 1 AP.',
+    bonusCard: true, pact: true
+  },
+  pact_beam: {
+    id: 'pact_beam', name: 'Pact Beam', cost: 3, tempoShift: 22, rarity: 'rare',
+    damage: 18, range: 360, type: 'beam', color: '#ffcc66',
+    desc: '[PACT][BEAM] Beams from each ally converge on cursor.',
+    bonusCard: true, pact: true, pactCostPerAlly: 0
+  },
+  mark_of_resonance: {
+    id: 'mark_of_resonance', name: 'Mark of Resonance', cost: 1, tempoShift: 0, rarity: 'rare',
+    damage: 0, range: 0, type: 'sigil', color: '#ffaaff',
+    desc: '[PACT][SIGIL] While ally on it: party damage +20%.',
+    bonusCard: true, pact: true, sigilTrigger: 'allyContact', sigilAoE: 60
+  },
+  pact_of_sacrifice: {
+    id: 'pact_of_sacrifice', name: 'Pact of Sacrifice', cost: 0, tempoShift: 0, rarity: 'rare',
+    damage: -8, range: 220, type: 'utility', color: '#ff5577',
+    desc: '[PACT] -4 HP. Heal nearest ally 8 HP.',
+    bonusCard: true, pact: true, hpCost: 4
+  },
+
+  // ── DEEP_AUDIT §4 — Utility additions (deck-builder choices) ────
+  discard_card: {
+    id: 'discard_card', name: 'Tactical Discard', cost: 0, tempoShift: 0, rarity: 'uncommon',
+    damage: 0, range: 0, type: 'utility', color: '#aaccdd',
+    desc: 'Discard one hand slot to gain 2 AP.',
+    bonusCard: true
+  },
+  mulligan_card: {
+    id: 'mulligan_card', name: 'Mulligan', cost: 1, tempoShift: 0, rarity: 'uncommon',
+    damage: 0, range: 0, type: 'utility', color: '#ccddff',
+    desc: 'Reshuffle hand and redraw 2 cards.',
+    bonusCard: true
+  },
 };
 
 // Card unlock tiers for non-bonus cards.

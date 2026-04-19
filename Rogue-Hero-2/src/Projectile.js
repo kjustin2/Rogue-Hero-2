@@ -38,6 +38,11 @@ export class ProjectileManager {
 
   spawn(x, y, dx, dy, speed, damage, color, source, freezes, life, meta) {
     this.projectiles.push(new Projectile(x, y, dx, dy, speed, damage, color, source, freezes, life, meta));
+    // Broadcast player shots so teammates can see them. 'remote_player'
+    // source skips this path (it already came from the network).
+    if (source === 'player') {
+      events.emit('NET_PROJECTILE_SPAWN', { x, y, dx, dy, speed, damage, color, freezes, life, meta });
+    }
   }
 
   spawnSpread(x, y, targetX, targetY, count, spreadAngle, speed, damage, color, source, freezes, life) {
@@ -145,7 +150,9 @@ export class ProjectileManager {
       // RH2: `player` can be a single player or an array (local co-op)
       const _targets = Array.isArray(player) ? player : (player ? [player] : []);
       let _hitPlayer = null;
-      if (p.source !== 'player') {
+      // 'player' = our own shot, 'remote_player' = teammate's (visual-only).
+      // Only non-friendly sources (enemies) damage players.
+      if (p.source !== 'player' && p.source !== 'remote_player') {
         for (const _pl of _targets) {
           if (!_pl.alive || _pl.dodging) continue;
           const dx = p.x - _pl.x, dy = p.y - _pl.y;
@@ -162,7 +169,7 @@ export class ProjectileManager {
       }
 
       // Perfect dodge detection — projectile passes through player during i-frames (once per projectile)
-      if (!p.nearMissTriggered) {
+      if (!p.nearMissTriggered && p.source !== 'remote_player') {
         for (const _pl of _targets) {
           if (!_pl.alive || !_pl.dodging) continue;
           const dx = p.x - _pl.x, dy = p.y - _pl.y;

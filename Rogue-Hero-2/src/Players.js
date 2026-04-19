@@ -64,25 +64,33 @@ export class Players {
 
   // Run each frame after movement: any standing ally near a downed
   // player progresses revive; 2.0 s contact = full revive at 30% HP.
+  //
+  // Both sides run this in remote MP so the reviver sees their bar fill.
+  // Only the DOWNED player's side triggers the actual revival + broadcast
+  // (`_isRemote` placeholders skip the completion branch and wait for the
+  // authoritative PLAYER_REVIVED message from the peer).
   updateRevives(dt) {
     for (const p of this.list) {
       if (!p.alive || !p.downed) continue;
-      // In remote MP, the `_isRemote` placeholder is owned by the OTHER side —
-      // their machine handles its revive and broadcasts PLAYER_REVIVED back.
-      if (p._isRemote) continue;
+      const isRemotePlaceholder = !!p._isRemote;
       let inContact = false;
       for (const a of this.list) {
         if (a === p || !a.alive || a.downed) continue;
         const dx = a.x - p.x, dy = a.y - p.y;
-        if (dx * dx + dy * dy < (a.r + p.r + 8) ** 2) { inContact = true; break; }
+        // Widen tolerance for remote placeholders — their positions are
+        // interpolated from 20 Hz snapshots so tight contact radii flicker.
+        const pad = isRemotePlaceholder || a._isRemote ? 24 : 8;
+        if (dx * dx + dy * dy < (a.r + p.r + pad) ** 2) { inContact = true; break; }
       }
       if (inContact) {
         p.reviveProgress = Math.min(1, p.reviveProgress + dt / 2.0);
-        if (p.reviveProgress >= 1) {
+        if (p.reviveProgress >= 1 && !isRemotePlaceholder) {
           p.downed = false;
           p.reviveProgress = 0;
-          p.hp = Math.max(1, Math.round(p.maxHp * 0.3));
-          events.emit('PLAYER_REVIVED', { player: p });
+          const restored = Math.max(1, Math.round(p.maxHp * 0.3));
+          p.hp = restored;
+          events.emit('PLAYER_REVIVED', { player: p, hpRestored: restored });
+          events.emit('PLAY_SOUND', 'levelUp');
           // Tide passive: revive heals self
           for (const a of this.list) {
             if (a !== p && a.alive && a._classPassives?.reviveHealSelf) {

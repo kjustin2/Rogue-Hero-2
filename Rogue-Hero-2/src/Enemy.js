@@ -23,6 +23,18 @@ export class Enemy extends Entity {
     // Spawn animation
     this.spawnTimer = 0.35;
     this.spawning = true;
+    // ── Visual silhouette tag (DEEP_AUDIT §3.3) ───────────────────────
+    // Auto-classify by enemy type so each kind reads differently at a glance.
+    this.silhouette = (
+      this.isBoss                                                 ? 'boss'      :
+      ['turret','sentinel','shielddrone','ricochetdrone','blocker','disruptor','marksman'].includes(type)
+                                                                  ? 'construct' :
+      ['phantom','wraith','echo','splitter','split','timekeeper','stalker','tethewitch','tetherwitch']
+        .includes(type)                                           ? 'ethereal'  :
+      ['swarm','staticHound','statichound','bloomspawn','miretoad','mire_toad','choir','iron_choir']
+        .includes(type)                                           ? 'beast'     :
+      'humanoid'
+    );
   }
 
   spdMult() {
@@ -84,6 +96,17 @@ export class Enemy extends Entity {
     return true; // Still spawning — skip AI
   }
 
+  // Default draw. Subclasses OVERRIDE this to add telegraph rings /
+  // AoE indicators / custom colors, but any subclass that only
+  // overrides `drawBody` (e.g. the RH2 bosses HollowKing, VaultEngine,
+  // Aurora) would otherwise fall through to Entity's abstract no-op
+  // and render invisibly. This default routes through drawBody so
+  // those bosses are visible with their subclass-picked label/color.
+  draw(ctx, now) {
+    if (!this.alive) return;
+    this.drawBody(ctx, (this.type || 'enemy').toUpperCase(), '#888888', now);
+  }
+
   // Called in a batched pass from main.js after all enemy bodies — do not call inside drawBody
   drawHealthBar(ctx, color) {
     const w = Math.max(36, this.r * 3.5);
@@ -131,6 +154,64 @@ export class Enemy extends Entity {
     ctx.arc(this.x, this.y, drawR, 0, Math.PI * 2);
     ctx.fillStyle = this.hitFlash > 0 ? '#ffffff' : color;
     ctx.fill();
+
+    // ── Silhouette overlay (DEEP_AUDIT §3.3) ────────────────────────
+    // Tiny shape on top of the circle that conveys enemy "kind" without
+    // breaking the geometric language. Each silhouette is 2-4 ctx ops.
+    if (this.silhouette && !this.spawning && this.hitFlash <= 0) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 1.2;
+      switch (this.silhouette) {
+        case 'humanoid': {
+          // Small head circle on top of the body
+          const hr = drawR * 0.35;
+          ctx.beginPath();
+          ctx.arc(this.x, this.y - drawR * 0.45, hr, 0, Math.PI * 2);
+          ctx.fill(); ctx.stroke();
+          break;
+        }
+        case 'beast': {
+          // Two glowing eye dots
+          const er = drawR * 0.18;
+          ctx.fillStyle = '#ffeecc';
+          ctx.beginPath(); ctx.arc(this.x - drawR * 0.3, this.y - drawR * 0.1, er, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(this.x + drawR * 0.3, this.y - drawR * 0.1, er, 0, Math.PI * 2); ctx.fill();
+          break;
+        }
+        case 'construct': {
+          // Hexagonal core inside the body
+          ctx.beginPath();
+          for (let k = 0; k < 6; k++) {
+            const a = k * Math.PI / 3 - Math.PI / 6;
+            const px = this.x + Math.cos(a) * drawR * 0.5;
+            const py = this.y + Math.sin(a) * drawR * 0.5;
+            if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+          }
+          ctx.closePath();
+          ctx.stroke();
+          break;
+        }
+        case 'ethereal': {
+          // Wisp — thin offset ring
+          ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+          ctx.beginPath();
+          ctx.arc(this.x, this.y, drawR * 0.7, 0, Math.PI * 2);
+          ctx.stroke();
+          break;
+        }
+        case 'boss': {
+          // Large crown — three vertical bars on top
+          ctx.fillStyle = 'rgba(255,220,80,0.85)';
+          for (let k = -1; k <= 1; k++) {
+            ctx.fillRect(this.x + k * drawR * 0.32 - 1.5, this.y - drawR * 0.85, 3, drawR * 0.32);
+          }
+          break;
+        }
+      }
+      ctx.restore();
+    }
 
     // Spawn flash ring
     if (this.spawning) {
@@ -269,23 +350,26 @@ export class Chaser extends Enemy {
     this.sprintCooldown = Math.max(0, this.sprintCooldown - dt);
     if (this.staggerTimer > 0) { this.staggerTimer -= dt; return; }
 
+    // Perf: defer sqrt to when we actually need it (movement normalization).
+    // All gates use squared distance — we only call Math.sqrt inside the chase
+    // branch when motion is required.
     const dx = player.x - this.x, dy = player.y - this.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
+    const distSq = dx * dx + dy * dy;
     const baseSpd = 190 * (0.8 + (tempo.value / 100) * 0.5) * this.spdMult();
-    // Sprint burst: 1.6× speed when player is at range and Tempo is Hot/Critical
-    if (dist > 200 && tempo.value >= 70 && this.sprintCooldown <= 0 && this.state === 'chase') {
+    if (distSq > 200 * 200 && tempo.value >= 70 && this.sprintCooldown <= 0 && this.state === 'chase') {
       this.sprintTimer = 0.5;
       this.sprintCooldown = 3.0;
     }
     const spd = baseSpd * (this.sprintTimer > 0 ? 1.6 : 1.0);
 
-    if (this.state === 'idle' && dist < 900 && !player._phantomInkActive) this.state = 'chase';
+    if (this.state === 'idle' && distSq < 900 * 900 && !player._phantomInkActive) this.state = 'chase';
 
     if (this.state === 'chase') {
-      if (dist <= 75 && this.attackCooldown <= 0) {
+      if (distSq <= 75 * 75 && this.attackCooldown <= 0) {
         this.state = 'telegraph';
         this.telegraphTimer = this.telegraphDuration;
-      } else if (dist > 40) {
+      } else if (distSq > 40 * 40) {
+        const dist = Math.sqrt(distSq);
         this.x += (dx / dist) * spd * dt;
         this.y += (dy / dist) * spd * dt;
       }
@@ -294,7 +378,7 @@ export class Chaser extends Enemy {
     if (this.state === 'telegraph') {
       this.telegraphTimer -= dt;
       if (this.telegraphTimer <= 0) {
-        if (dist <= 85) events.emit('ENEMY_MELEE_HIT', { damage: 1, source: this });
+        if (distSq <= 85 * 85) events.emit('ENEMY_MELEE_HIT', { damage: 1, source: this });
         this.attackCooldown = 0.9;
         this.state = 'chase';
       }

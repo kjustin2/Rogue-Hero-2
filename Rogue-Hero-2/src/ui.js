@@ -1,6 +1,36 @@
 import { CardDefinitions } from './DeckManager.js';
 import { CosmeticById, CosmeticDefinitions, BOX_TIERS, RARITY_COLORS, RARITY_LABELS, CATEGORY_LABELS, drawPlayerShape, drawPlayerAura, getPrismaticColor } from './Cosmetics.js';
 
+// ── Card-type illustrations ─────────────────────────────────────────────────
+// Tiny Path2D shapes drawn as a watermark on each card. Each path is sized
+// in a 20×20 box centered on (0,0); the renderer scales/translates it.
+// Pre-built once at module load — zero per-frame allocation.
+const CARD_ART = (() => {
+  const m = {};
+  function P(builder) { const p = new Path2D(); builder(p); return p; }
+  m.melee      = P(p => { p.moveTo(-9,8); p.lineTo(9,-8); p.lineTo(7,-10); p.lineTo(-9,6); p.closePath(); p.moveTo(-9,8); p.arc(-9,8,2,0,Math.PI*2); });
+  m.cleave     = P(p => { p.moveTo(-10,2); p.quadraticCurveTo(0,-12,10,2); p.quadraticCurveTo(0,-4,-10,2); p.closePath(); });
+  m.dash       = P(p => { p.moveTo(-10,0); p.lineTo(6,0); p.moveTo(2,-5); p.lineTo(10,0); p.lineTo(2,5); });
+  m.projectile = P(p => { p.arc(0,0,4,0,Math.PI*2); p.moveTo(-10,0); p.lineTo(-4,0); p.moveTo(-12,-2); p.lineTo(-7,-2); });
+  m.shot       = P(p => { p.arc(0,0,4,0,Math.PI*2); p.moveTo(0,0); p.arc(0,0,7,0,Math.PI*2); });
+  m.beam       = P(p => { p.moveTo(-11,-2); p.lineTo(11,-2); p.moveTo(-11,0); p.lineTo(11,0); p.moveTo(-11,2); p.lineTo(11,2); });
+  m.trap       = P(p => { for (let i=0;i<4;i++){ const a=i*Math.PI/2; p.moveTo(0,0); p.lineTo(Math.cos(a)*10,Math.sin(a)*10); } });
+  m.orbit      = P(p => { p.arc(0,0,9,0,Math.PI*2); p.moveTo(9,0); p.arc(9,0,2,0,Math.PI*2); p.moveTo(-9,0); p.arc(-9,0,2,0,Math.PI*2); p.moveTo(0,9); p.arc(0,9,2,0,Math.PI*2); });
+  m.channel    = P(p => { for (let i=0;i<3;i++){ const yy=-6+i*6; p.moveTo(-10,yy); p.bezierCurveTo(-4,yy-3,4,yy+3,10,yy); } });
+  m.sigil      = P(p => { for (let i=0;i<6;i++){ const a=i*Math.PI/3; p.moveTo(0,0); p.lineTo(Math.cos(a)*9,Math.sin(a)*9); } });
+  m.echo       = P(p => { p.arc(0,0,4,0,Math.PI*2); p.moveTo(0,0); p.arc(0,0,7,0,Math.PI*2); p.moveTo(0,0); p.arc(0,0,10,0,Math.PI*2); });
+  m.ground     = P(p => { p.moveTo(-10,4); p.lineTo(0,-6); p.lineTo(10,4); p.closePath(); });
+  m.counter    = P(p => { p.moveTo(0,-10); p.lineTo(8,-3); p.lineTo(6,8); p.lineTo(-6,8); p.lineTo(-8,-3); p.closePath(); });
+  m.stance     = P(p => { p.arc(0,0,8,0,Math.PI*2); p.moveTo(0,-8); p.lineTo(0,8); p.moveTo(-8,0); p.lineTo(8,0); });
+  m.utility    = P(p => { p.moveTo(-8,-6); p.lineTo(8,-6); p.lineTo(8,6); p.lineTo(-8,6); p.closePath(); p.moveTo(-4,-2); p.lineTo(4,-2); p.moveTo(-4,2); p.lineTo(4,2); });
+  m.relay      = P(p => { p.moveTo(-10,-6); p.lineTo(0,2); p.lineTo(10,-6); p.moveTo(0,2); p.lineTo(0,9); });
+  m.overload   = P(p => { p.moveTo(-2,-10); p.lineTo(4,-2); p.lineTo(-4,2); p.lineTo(2,10); });
+  m.marker     = P(p => { p.moveTo(0,-10); p.lineTo(0,4); p.lineTo(8,-2); p.closePath(); });
+  m.pact       = P(p => { p.arc(-4,0,5,0,Math.PI*2); p.arc(4,0,5,0,Math.PI*2); });
+  return m;
+})();
+export function getCardArt(type) { return CARD_ART[type] || null; }
+
 // RH2: per-type glyph so players can tell card categories apart at a glance.
 // Single-codepoint symbols (no emoji rendering issues across browsers).
 export function cardGlyph(type) {
@@ -301,13 +331,26 @@ export class UI {
     ctx.fillStyle = '#0a0a12';
     ctx.fillRect(bx, by, BAR_W, BAR_H);
 
-    // Fill with clipping
+    // Fill with clipping — top edge is a sine wave so the resource feels liquid.
+    // Wave is cheap: 32 vertices per frame.
     ctx.save();
+    const _t = performance.now() / 1000;
+    const waveAmp = 1.6;
+    const waveLen = 38;
     ctx.beginPath();
-    ctx.rect(bx, by, fill, BAR_H);
+    ctx.moveTo(bx, by + BAR_H);
+    ctx.lineTo(bx, by);
+    const segs = 32;
+    for (let i = 0; i <= segs; i++) {
+      const fx = bx + (fill / segs) * i;
+      const fy = by + Math.sin(_t * 3 + i * 0.45) * waveAmp;
+      ctx.lineTo(fx, fy);
+    }
+    ctx.lineTo(bx + fill, by + BAR_H);
+    ctx.closePath();
     ctx.clip();
     ctx.fillStyle = grad;
-    ctx.fillRect(bx, by, BAR_W, BAR_H);
+    ctx.fillRect(bx, by - 4, BAR_W, BAR_H + 8);
 
     // Glow overlay at High tempo
     if (this.tempo.value >= 70) {
@@ -439,6 +482,35 @@ export class UI {
       ctx.fillRect(sx, y, segW, segH);
       ctx.strokeRect(sx, y, segW, segH);
     }
+    // Local 2P coop / remote MP: also draw P2's HP bar below P1's
+    const pl = window._players && window._players.list;
+    if (pl && pl.length > 1) {
+      const p2 = pl[1];
+      if (!p2 || !p2.maxHp) return;
+      const y2 = y + segH + 6;
+      const p2hp = Math.max(0, p2.hp);
+      const p2max = p2.maxHp;
+      const p2ratio = p2hp / p2max;
+      const p2segW = Math.min(20, Math.floor((this.width * 0.2) / p2max));
+      ctx.fillStyle = p2.haloColor || '#ff9944';
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText('P2', startX, y2 + segH - 4);
+      const p2col = p2ratio > 0.5 ? '#ff8855' : (p2ratio > 0.25 ? '#ff6644' : '#ff3322');
+      const downColor = p2.downed ? '#444' : p2col;
+      ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+      for (let i = 0; i < p2max; i++) {
+        const sx = startX + 30 + i * (p2segW + segGap);
+        ctx.fillStyle = i < p2hp ? downColor : '#222';
+        ctx.fillRect(sx, y2, p2segW, segH);
+        ctx.strokeRect(sx, y2, p2segW, segH);
+      }
+      // Status badge
+      if (p2.downed) {
+        ctx.fillStyle = '#ff6644';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText('▼ DOWN', startX + 30 + p2max * (p2segW + segGap) + 6, y2 + segH - 4);
+      }
+    }
   }
 
   // ── AP bar — top left below HP
@@ -446,7 +518,14 @@ export class UI {
     if (!this.player) return;
     const b = this.player.budget, mb = this.player.maxBudget;
     const segW = 18, segH = 14, segGap = 3;
-    const startX = 18, y = 44;
+    const startX = 18;
+    // When a second player exists (local co-op or remote MP), the P2 HP
+    // bar occupies y=42..60 directly beneath P1's HP. Shift the AP bar
+    // below that so the two don't overlap (previous y=44 sat on top of
+    // the P2 bar and produced the "double bar" visual).
+    const pl = window._players && window._players.list;
+    const hasP2 = !!(pl && pl.length > 1 && pl[1] && pl[1].maxHp);
+    const y = hasP2 ? 68 : 44;
 
     ctx.font = 'bold 13px monospace';
     ctx.textAlign = 'left';
@@ -494,7 +573,11 @@ export class UI {
   // ── Relics — top left below AP
   _drawRelics(ctx) {
     if (!this.itemManager || !this.itemManager.equipped.length) return;
-    const y = 68;
+    // Match the AP-bar offset: when there's a P2, everything shifts down
+    // to make room for the second HP bar between P1's HP and AP.
+    const pl = window._players && window._players.list;
+    const hasP2 = !!(pl && pl.length > 1 && pl[1] && pl[1].maxHp);
+    const y = hasP2 ? 92 : 68;
     const startX = 18;
     ctx.fillStyle = PAL.MUTED;
     ctx.font = '10px monospace';
@@ -653,11 +736,18 @@ export class UI {
 
       const x = startX + i * (CARD_W + GAP);
 
-      // Hover lift — disabled during battle so cards don't jump when aiming
+      // Hover lift — disabled during battle so cards don't jump when aiming.
+      // Smoothed via per-slot lerp so the card eases up/down instead of jumping.
       const mx = this._mouseX, my = this._mouseY;
       const isHovered = !this.battleMode && mx >= x && mx <= x + cardDrawW && my >= baseY - 20 && my <= baseY + CARD_H;
       if (isHovered) this._hoveredCard = i;
-      const y = baseY - (isHovered ? 18 : 0);
+      if (!this._hoverLift) this._hoverLift = [0, 0, 0, 0];
+      const liftTarget = isHovered ? 18 : 0;
+      this._hoverLift[i] += (liftTarget - this._hoverLift[i]) * 0.25;
+      // In-hand idle bob: each card oscillates at slightly different phase so
+      // the hand feels held in human hands, not glued to the screen.
+      const _bob = this.battleMode ? 0 : Math.sin(performance.now() / 1000 * 1.5 + i * 0.9) * 1.4;
+      const y = baseY - this._hoverLift[i] + _bob;
 
       ctx.save();
 
@@ -783,11 +873,24 @@ export class UI {
         ctx.fillText(def.cost, x + 16, y + 21);
 
         // Type glyph — small badge tucked against the AP cost badge.
-        // (Was top-right corner where it overlapped the [1]/[2]/[3]/[4] slot label.)
         ctx.fillStyle = canAfford ? (def.color || '#ddd') : '#444';
         ctx.font = 'bold 14px monospace';
         ctx.textAlign = 'left';
         ctx.fillText(cardGlyph(def.type), x + 32, y + 21);
+        // Card-type illustration — large faded watermark in card center, behind
+        // text. Uses pre-built Path2D constants (zero per-frame allocation).
+        const _art = CARD_ART[def.type];
+        if (_art) {
+          ctx.save();
+          ctx.translate(x + CARD_W - 26, y + 50);
+          ctx.scale(1.2, 1.2);
+          ctx.strokeStyle = canAfford ? (def.color || '#aabbcc') : '#333';
+          ctx.fillStyle   = canAfford ? (def.color || '#aabbcc') : '#333';
+          ctx.globalAlpha = canAfford ? 0.40 : 0.18;
+          ctx.lineWidth = 1.5;
+          ctx.stroke(_art);
+          ctx.restore();
+        }
 
         // Tempo shift — prominent
         const tsCol = def.tempoShift > 0 ? (canAfford ? PAL.HOT : '#553322') : (canAfford ? PAL.COLD : '#223344');
@@ -836,10 +939,35 @@ export class UI {
         ctx.fill();
       }
 
+      // Visual refresh 3.10: card-played pulse — outline + slight shrink for
+      // 120ms after a card was played from this slot.
+      const _pulseInfo = window._cardPulse;
+      if (_pulseInfo && _pulseInfo.slot === i) {
+        const age = performance.now() / 1000 - _pulseInfo.t0;
+        if (age < 0.4) {
+          const k = 1 - age / 0.4;
+          ctx.save();
+          ctx.globalAlpha = k * 0.85;
+          ctx.strokeStyle = '#ffeeaa';
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.roundRect(x - 3, y - 3, cardDrawW + 6, CARD_H + 6, RADIUS + 3);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
       this.handBoxes.push({ x, y: baseY, w: cardDrawW, h: CARD_H + 20, slotIndex: i });
       ctx.restore();
     }
 
+    // Local co-op: clarify that the hand is shared between P1 and P2 so new
+    // players don't think each has their own deck.
+    if (this.selectedCardSlotP2 != null) {
+      ctx.fillStyle = 'rgba(255,221,68,0.55)';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('— SHARED HAND —', this.width / 2, baseY - 26);
+    }
     // Control hint
     ctx.fillStyle = 'rgba(255,255,255,0.22)';
     ctx.font = '11px monospace';
@@ -989,9 +1117,14 @@ export class UI {
       ctx.fillStyle = PAL.TEXT;
       ctx.font = 'bold 20px monospace';
       ctx.fillText(def.name, x + CARD_W / 2, y + 36);
+      // Type glyph — anchored top-left (inside the color strip) so the
+      // SLOT label in the top-right has clear space. Previously the glyph
+      // sat at x+CARD_W-18 and overlapped "SLOT N".
       ctx.fillStyle = def.color || '#ddd';
       ctx.font = 'bold 22px monospace';
-      ctx.fillText(cardGlyph(def.type), x + CARD_W - 18, y + 26);
+      ctx.textAlign = 'left';
+      ctx.fillText(cardGlyph(def.type), x + 10, y + 26);
+      ctx.textAlign = 'center';
       ctx.fillStyle = rarCol;
       ctx.textAlign = 'center';
       ctx.font = '14px monospace';

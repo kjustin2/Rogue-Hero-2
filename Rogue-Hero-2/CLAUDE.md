@@ -61,11 +61,12 @@ Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest
 | `src/Biomes.js` | **RH2** — 6 biome defs (verdant/frostforge/cathedral/tide/voidline/clockwork) with palette/ambience/music/hazard/postFx + `pickBiomeForFloor(floor, rng)` |
 | `src/SpatialHash.js` | **RH2** — uniform-grid spatial hash for O(n+k) hitbox queries; `rebuild/query/forEachInCircle` |
 | `src/EnemiesRH2.js` | **RH2** — 8 new enemy classes (TetherWitch, MireToad, Bloomspawn, IronChoir, StaticHound, BossHollowKing, BossVaultEngine, BossAurora) |
-| `src/net/Net.js` | **RH2** — transport stub (`connect/sendUnreliable/sendReliable/on/disconnect`); solo mode no-ops |
-| `src/net/Snapshot.js` | **RH2** — delta encoder/decoder with int16 quantized positions + bitfield flags; `SNAP_TYPES = { POS, EVT, FULL }` |
+| `src/net/Net.js` | **RH2** — WebRTC DataChannel transport. Primary: Cloudflare Worker signaling (`CF_SIGNAL_URL`). Fallback: Trystero (torrent → nostr). Public API (`connect/sendUnreliable/sendReliable/on/disconnect`). Auto-detects ArrayBuffer vs JSON on snap channel |
+| `src/net/Snapshot.js` | **RH2** — delta encoder/decoder. Binary wire format (int16 quantized positions + u8 flags, ~12× smaller than JSON). `SNAP_TYPES = { POS, EVT, FULL }`. Both classes expose `reset()` for room transitions |
 | `src/net/Lobby.js` | **RH2** — room codes, ready checks, host migration; `LOBBY_STATES` enum |
-| `src/net/HostSim.js` | **RH2** — host-only 15 Hz position broadcast + reliable event forwarding |
-| `src/net/Reconcile.js` | **RH2** — client prediction (8 px drift threshold, 0.3 lerp) + remote-entity interpolation (~100 ms render delay) |
+| `src/net/HostSim.js` | **RH2** — 20 Hz position broadcast + reliable event forwarding + **per-frame DAMAGE_BATCH coalescer**. Both sides broadcast own player; host additionally broadcasts enemies. `reset()` drops encoder/batch state on room/run transitions |
+| `src/net/Reconcile.js` | **RH2** — client prediction (8 px drift threshold, 0.3 lerp) + remote-entity interpolation (~100 ms render delay). Currently **dead code** — main.js uses a simpler per-frame `snapDecoder.positions` lerp (main.js:~3275) |
+| `workers/signaling.js` | **RH2** — Cloudflare Durable Object WebSocket relay for WebRTC SDP/ICE signaling. Hibernatable sockets; 30 msgs / 10 s per-connection rate limit. Deployed at `rh2-signal.jpk91.workers.dev` |
 
 ---
 
@@ -73,11 +74,30 @@ Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest
 
 **Local 2-player co-op:** Toggle with the **2P CO-OP button** in the top-right of the character select screen (also bound to **F2**). Host plays P1 (WASD + mouse + Space dodge + 1–4 cards). P2 uses **arrow keys** to move, **I/J/K/L** to aim the reticle, **U** to fire, **O** to dodge, **7/8/9/0** to play from the shared hand (mapped onto slots 1–4). Numpad is intentionally unused — keep all P2 keys on the right-hand side of a standard keyboard. P2 input is exposed via `input.player2View()`, and `input.updateP2Reticle(p2, dt)` must be called once per frame *before* P2's `updateLogic`.
 
-**Remote co-op (up to 4):** wired through `src/net/`. `Net` is a stub — production transport (WebRTC DataChannel, ordered+unordered) plugs in there without changing call sites. The wiring is already live in `main.js`:
-- `hostSim.tick(logicDt, players.list, enemies)` runs every frame after the sim step. In solo mode it returns immediately; in `host` mode it broadcasts 15 Hz position snapshots and forwards reliable world events (KILL, PLAYER_DOWNED, BOSS_PHASE, ZONE_TRANSITION, CONTROLS_INVERT, etc.).
-- `net.on('snap', ...)` is registered at startup and feeds `SnapshotDecoder.apply()`, then calls `reconcile.applyOwn(player, ...)` for the local player and `reconcile.interpolateRemote(p, ...)` for each remote ally.
+**Remote co-op (up to 4):** live WebRTC DataChannel transport. Clients find each other through a Cloudflare Worker (`workers/signaling.js`, deployed to `CF_SIGNAL_URL` in `Net.js`); all gameplay traffic flows peer-to-peer. When the CF worker is unreachable, `Net._connectTrystero()` falls back to BitTorrent (then nostr) relays automatically. Two DataChannels per peer: `snap` (unordered, `maxRetransmits: 0`) for position snapshots, `evt` (ordered+reliable) for world events.
 
-Clients apply own-player snapshots via `Reconcile.applyOwn` (gentle pull at >8 px drift) and remote entities via `Reconcile.interpolateRemote`. Swapping the stub for real WebRTC means populating `net.peers` and forwarding messages to `_dispatch(channel, msg, peerId)` — no main-loop changes required.
+**Main-loop wiring (all in `main.js`):**
+- `hostSim.tick(logicDt, players.list, enemies)` runs every frame after the sim step. Solo: early-return. MP: flushes `DAMAGE_BATCH` then (at 20 Hz in `playing`, 2 Hz elsewhere) emits a position snapshot. Host-role broadcasts own player + enemies; client broadcasts just its own player.
+- `net.on('snap', ...)` auto-detects binary `ArrayBuffer` vs JSON object, routes through `snapDecoder.applyBinary` / `snapDecoder.apply`, then applies boolean flags (`downed`, `dodging`) to the `_isRemote` placeholder immediately. Smooth-movement lerp is separate — see next bullet.
+- **Per-frame interpolation** (main.js lines ~3275–3292, gated on `net.role !== 'solo' && net.peers.size > 0`): lerps `_isRemote` player position toward `snapDecoder.positions.get(p.id)` each frame with `logicDt * 14`. On `client` role, enemies get the same treatment (host is authoritative for enemies). This hides the 20 Hz sample rate so remote entities move at 60 fps visually.
+- `net.on('evt', ...)` demuxes reliable messages. Two wire shapes coexist: direct `{ type, …data }` and HostSim-relayed `{ name, p: payload }`.
+
+**Event flow (reliable channel):**
+- **Host → client (forwarded by `HostSim`):** `KILL`, `BOSS_PHASE`, `ZONE_TRANSITION`, `ROOM_ENTERED`, `CONTROLS_INVERT`, `COLD_CRASH`, `CRASH_ATTACK`, `SPAWN_PUDDLE`, `SPAWN_BLOOMSPAWN`, `SPAWN_HOLLOW_CLONE`, `CHOIR_HEAL`. Also direct sends from main.js: `GAME_STARTED`, `START_LOBBY`, `MAP_NODE_CHOSEN`, `ROOM_CLEARED`, `BATTLE_START`, `PING/PONG`.
+- **Client → host:** `CHAR_SELECTED`, `PLAYER_READY`, `PREP_READY`, `PHASE_DONE`, `MAP_VOTE`, `DAMAGE_BATCH` (per-frame coalesced hits). Legacy single-hit `DAMAGE_DEALT` still accepted.
+- **Bidirectional:** `PLAYER_DOWNED`, `PLAYER_REVIVED` (the receiver applies the flags to the `_isRemote` placeholder).
+
+**DAMAGE_BATCH optimization:** `Combat.applyDamageToEnemy` emits `DAMAGE_DEALT` on every hit. In the client role, `HostSim` intercepts those into a per-frame `_damageBatch` map (keyed by enemy id, summing amounts). `hostSim.tick()` flushes the batch once per frame as a single `DAMAGE_BATCH` reliable message. Host's `net.on('evt')` handler unwraps `p.hits = [[id, amount], …]` and calls the shield-aware `takeDamage` variant for `shielddrone` / `boss_conductor` so host-side HP matches client-side HP. Without the shield-aware routing, host would believe those enemies took damage they actually mitigated, causing kill-timing desync.
+
+**Snapshot hygiene.** Enemy IDs (`e1`, `e2`, …) are reused across rooms, so `snapDecoder.reset()` + `hostSim.reset()` **must** run on every room spawn and at `startNewRun()` — otherwise a new room's `e1` interpolates from the previous room's final position (~70 ms visible jump). `hostSim.reset()` does not rewind `this.frame` since the decoder rejects stale frames by monotonic counter.
+
+**RNG determinism.** Seeded `mulberry32` in `RunManager` drives map generation, enemy spawns, draft rolls. Host and client stay in sync only if they consume RNG values in the *exact* same order. Two guards: (1) floor-curse roll always consumes an RNG value regardless of `selectedDifficulty` (see `handleCombatClear`); (2) client-side event/shop generation is skipped — client waits for host's `MAP_NODE_CHOSEN` payload. Any new RNG consumer on a difficulty-conditional code path must also consume on all paths.
+
+**Peer lifecycle.** WebRTC `'disconnected'` is transient (ICE may recover in <5 s) and does NOT prune the peer — `Net.js` only removes on `'failed'` or `'closed'`. The UI shows a "link unstable" banner during transient dips.
+
+**Lobby / connect flow.** `mode_remote` on the intro screen sends the player to `gameState === 'lobby'`. Hosting calls `lobby.createHosted(…)` (6-char alphanumeric room code, collision-free enough for the small peer population) → `net.connect(code)`. Joining posts `lobby.join(code)`. `net.preflight()` warms the CF worker + Trystero CDN so the lobby banner shows real status immediately.
+
+**Debug HUDs.** `Ctrl+N` toggles the network debug overlay (role, strategy, peer count, in/out msg & byte counters, rate, sync-state flags, last 8 reliable events). `Ctrl+P` toggles the frame profile overlay. `_logNetEvent` is a monkeypatch over `net.sendReliable` that records every outgoing reliable for the overlay.
 
 **Downed/revive:** when `player._coopMode === true`, `player.takeDamage()` enters the **downed** state instead of dying. Downed players move at 0.35× speed, cannot dodge, and may only play cards approved by `player.canPlayCardWhileDowned()`. Allies revive by standing within range — `players.updateRevives(dt)` advances the revive timer.
 

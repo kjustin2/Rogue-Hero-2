@@ -56,6 +56,12 @@ export class AudioSynthesizer {
     if (this.ctx) return;
     try {
       this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Single shared SFX gain — every per-shot envelope routes through this.
+      // Prevents allocating a fresh GainNode per SFX (was leaking 1 node per
+      // call ⇒ thousands per minute of fast play).
+      this._sfxBus = this.ctx.createGain();
+      this._sfxBus.gain.value = 1.0;
+      this._sfxBus.connect(this.ctx.destination);
     } catch (e) {}
   }
 
@@ -121,16 +127,21 @@ export class AudioSynthesizer {
   _tone(freq, type, dur, vol, attack) {
     if (!this.ctx) return;
     try {
+      // Visual-refresh audio tier: small per-shot pitch + volume jitter so
+      // repeating sounds don't feel robotic. ±4% pitch, ±8% vol.
+      const pitchJitter = 1 + (Math.random() - 0.5) * 0.08;
+      const volJitter   = 1 + (Math.random() - 0.5) * 0.16;
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = type || 'square';
-      osc.frequency.value = freq;
-      const scaledVol = vol * this.masterVolume;
+      osc.frequency.value = freq * pitchJitter;
+      const scaledVol = vol * volJitter * this.masterVolume;
       gain.gain.setValueAtTime(0, this.ctx.currentTime);
       gain.gain.linearRampToValueAtTime(scaledVol, this.ctx.currentTime + (attack || 0.01));
       gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + dur);
       osc.connect(gain);
-      gain.connect(this.ctx.destination);
+      // Route through shared SFX bus instead of straight to destination.
+      gain.connect(this._sfxBus || this.ctx.destination);
       osc.start();
       osc.stop(this.ctx.currentTime + dur + 0.05);
     } catch (e) {}
@@ -152,7 +163,7 @@ export class AudioSynthesizer {
       const gain = this.ctx.createGain();
       gain.gain.setValueAtTime(vol * this.masterVolume, this.ctx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + dur);
-      src.connect(filter); filter.connect(gain); gain.connect(this.ctx.destination);
+      src.connect(filter); filter.connect(gain); gain.connect(this._sfxBus || this.ctx.destination);
       src.start(); src.stop(this.ctx.currentTime + dur);
     } catch (e) {}
   }

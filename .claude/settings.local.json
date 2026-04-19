@@ -4,7 +4,11 @@
       "Bash(node check-syntax.js)",
       "Bash(curl -sI \"https://esm.sh/trystero@0.21.6/nostr\")",
       "Bash(curl -s \"https://esm.sh/trystero@0.21.6/nostr\")",
-      "Bash(curl -s \"https://esm.sh/trystero@0.21.6/es2022/nostr.mjs\")"
+      "Bash(curl -s \"https://esm.sh/trystero@0.21.6/es2022/nostr.mjs\")",
+      "Bash(node -e ' *)",
+      "Bash(cat)",
+      "Read(//tmp/**)",
+      "Bash(grep -n \"\\\\\\\\bi\\\\\\\\b\\\\|\\\\\\\\bj\\\\\\\\b\\\\|\\\\\\\\bk\\\\\\\\b\\\\|\\\\\\\\bl\\\\\\\\b\" \"E:\\\\Storage\\\\SAAS\\\\Rogue-Hero-2\\\\Rogue-Hero-2\\\\src\\\\Input.js\")"
     ]
   }
 }

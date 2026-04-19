@@ -86,20 +86,28 @@ export class TempoSystem {
   setValue(newVal, isLerpStep = false) {
     const oldZone = this.stateName();
     const actualVal = Math.max(0, Math.min(100, newVal));
-    
+
     if (isLerpStep) {
       this.value = actualVal;
     } else {
       this.value = actualVal;
       this.targetValue = actualVal;
     }
-    
+
     const newZone = this.stateName();
 
     if (oldZone !== newZone) {
       events.emit('ZONE_TRANSITION', { oldZone, newZone });
     }
 
+    // Non-lerp sets that push to the extremes must trigger the same
+    // crash behavior as _add(), otherwise tempo can pin at 100 (e.g.
+    // a card with +tempoShift raising value via setValue bypasses
+    // the accidental-crash path in _add).
+    if (!isLerpStep && !this.isCrashed) {
+      if (newVal >= 100) this._triggerAccidentalCrash();
+      else if (newVal <= 0) this._triggerColdCrash();
+    }
   }
 
   _add(amount) {

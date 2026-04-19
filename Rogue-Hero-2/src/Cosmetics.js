@@ -466,6 +466,277 @@ export const CosmeticDefinitions = [
     animated:true,
     animFn:null  // color handled in render using getPrismaticColor
   },
+
+  // ── DEEP_AUDIT §5 — TITLES (commons added; +9 lore-flavored) ────
+  { id:'title_aspirant',   name:'The Aspirant',    category:'title', rarity:'common',    value:'The Aspirant',    color:'#aaccdd' },
+  { id:'title_rookie',     name:'Rookie',          category:'title', rarity:'common',    value:'Rookie',          color:'#cccccc' },
+  { id:'title_steady',     name:'The Steady Hand', category:'title', rarity:'common',    value:'The Steady Hand', color:'#bbaa88' },
+  { id:'title_wandering',  name:'Wandering Blade', category:'title', rarity:'uncommon',  value:'Wandering Blade', color:'#ddccaa' },
+  { id:'title_frostborn',  name:'Frostborn',       category:'title', rarity:'uncommon',  value:'Frostborn',       color:'#88ddff' },
+  { id:'title_shadowbound',name:'Shadowbound',     category:'title', rarity:'uncommon',  value:'Shadowbound',     color:'#aa66ff' },
+  { id:'title_echo',       name:'The Echo-Speaker',category:'title', rarity:'rare',      value:'The Echo-Speaker',color:'#ccaaff' },
+  { id:'title_resonance',  name:'The Resonance',   category:'title', rarity:'rare',      value:'The Resonance',   color:'#ffdd44' },
+  { id:'title_conductor',  name:'The Conductor',   category:'title', rarity:'legendary', value:'The Conductor',   color:'#ffaa44' },
+  { id:'title_final_hour', name:'Of the Final Hour',category:'title', rarity:'superleg', value:'Of the Final Hour',color:'#ff3322' },
+
+  // ── DEEP_AUDIT §5 — AURA (+6) ───────────────────────────────────
+  {
+    id:'aura_twin_crescent', name:'Twin Crescent', category:'aura', rarity:'rare',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t) => {
+      const baseR = r + 8;
+      for (let k = 0; k < 2; k++) {
+        const ang = t * 1.4 + k * Math.PI;
+        ctx.save();
+        ctx.strokeStyle = '#cce0ff';
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.7;
+        ctx.beginPath();
+        ctx.arc(x, y, baseR, ang, ang + Math.PI * 0.6);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  },
+  {
+    id:'aura_storm_cell', name:'Storm Cell', category:'aura', rarity:'legendary',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t) => {
+      ctx.save();
+      ctx.fillStyle = 'rgba(60,80,120,0.7)';
+      ctx.beginPath();
+      ctx.ellipse(x, y - r - 14, 16, 6, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Periodic lightning (every ~2s)
+      const fork = (t * 0.5) % 1;
+      if (fork < 0.08) {
+        ctx.strokeStyle = '#eef';
+        ctx.lineWidth = 1.5;
+        ctx.globalAlpha = 1 - fork / 0.08;
+        ctx.beginPath();
+        ctx.moveTo(x - 3, y - r - 12);
+        ctx.lineTo(x + 1, y - r - 6);
+        ctx.lineTo(x - 1, y - r - 2);
+        ctx.lineTo(x + 2, y - r + 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  },
+  {
+    id:'aura_petals', name:'Halo of Petals', category:'aura', rarity:'uncommon',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t) => {
+      const baseR = r + 10;
+      for (let k = 0; k < 6; k++) {
+        const ang = t * 0.8 + k * (Math.PI / 3);
+        const px = x + Math.cos(ang) * baseR;
+        const py = y + Math.sin(ang) * baseR;
+        ctx.save();
+        ctx.translate(px, py);
+        ctx.rotate(ang);
+        ctx.fillStyle = `hsl(${(t * 30 + k * 60) % 360},70%,75%)`;
+        ctx.globalAlpha = 0.65;
+        ctx.beginPath();
+        ctx.moveTo(0, -3); ctx.lineTo(4, 0); ctx.lineTo(0, 3); ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  },
+  {
+    id:'aura_equation', name:'Equation Field', category:'aura', rarity:'rare',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t) => {
+      const symbols = ['π', '∂', '∮', 'Σ', '∇', '∞'];
+      ctx.save();
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#aaeeff';
+      for (let k = 0; k < 6; k++) {
+        const phase = (t * 0.4 + k * 0.18) % 1;
+        const ang = (k / 6) * Math.PI * 2;
+        const dist = r + 6 + phase * 28;
+        ctx.globalAlpha = (1 - phase) * 0.7;
+        ctx.fillText(symbols[k], x + Math.cos(ang) * dist, y + Math.sin(ang) * dist);
+      }
+      ctx.restore();
+    }
+  },
+  {
+    id:'aura_ember_lattice', name:'Ember Lattice', category:'aura', rarity:'uncommon',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t) => {
+      const baseR = r + 9;
+      for (let k = 0; k < 4; k++) {
+        const ang = t * 0.6 + k * (Math.PI / 2);
+        const px = x + Math.cos(ang) * baseR;
+        const py = y + Math.sin(ang) * baseR;
+        ctx.save();
+        ctx.fillStyle = '#ff8844';
+        ctx.globalAlpha = 0.6 + 0.3 * Math.sin(t * 4 + k);
+        ctx.beginPath(); ctx.arc(px, py, 2.5, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      }
+    }
+  },
+  {
+    id:'aura_vortex_spiral', name:'Vortex Spiral', category:'aura', rarity:'legendary',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t) => {
+      ctx.save();
+      ctx.strokeStyle = '#aa88ff';
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      for (let k = 0; k <= 40; k++) {
+        const a = t * 1.2 + k * 0.4;
+        const rad = r + 4 + k * 0.4;
+        const px = x + Math.cos(a) * rad;
+        const py = y + Math.sin(a) * rad;
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+  },
+
+  // ── DEEP_AUDIT §5 — KILL EFFECTS (+8) ───────────────────────────
+  { id:'kill_shatter',     name:'Shatter',      category:'killEffect', rarity:'uncommon',  value:'shatter',      duration:0.40 },
+  { id:'kill_dissolve',    name:'Dissolve',     category:'killEffect', rarity:'rare',      value:'dissolve',     duration:0.60 },
+  { id:'kill_coin_drop',   name:'Coin Drop',    category:'killEffect', rarity:'uncommon',  value:'coin_drop',    duration:0.40 },
+  { id:'kill_soul_pull',   name:'Soul Pull',    category:'killEffect', rarity:'rare',      value:'soul_pull',    duration:0.55 },
+  { id:'kill_tribute',     name:'Tribute',      category:'killEffect', rarity:'legendary', value:'tribute',      duration:0.80 },
+  { id:'kill_devour',      name:'Devour',       category:'killEffect', rarity:'legendary', value:'devour',       duration:0.45 },
+  { id:'kill_frost_burst', name:'Frost Burst',  category:'killEffect', rarity:'uncommon',  value:'frost_burst',  duration:0.45 },
+  { id:'kill_glory',       name:'Glory',        category:'killEffect', rarity:'superleg',  value:'glory',        duration:1.50 },
+
+  // ── DEEP_AUDIT §5 — SHAPE (+5) ──────────────────────────────────
+  {
+    id:'shape_vortex', name:'Vortex', category:'shape', rarity:'legendary',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t, fillColor) => {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(t * 1.5);
+      ctx.fillStyle = fillColor || '#88aacc';
+      for (let k = 0; k < 4; k++) {
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.arc(0, 0, r, k * (Math.PI / 2), k * (Math.PI / 2) + 0.6);
+        ctx.closePath();
+        ctx.fill();
+        ctx.rotate(Math.PI / 2);
+      }
+      ctx.restore();
+    }
+  },
+  {
+    id:'shape_origami', name:'Origami Crane', category:'shape', rarity:'rare',
+    value:null, animated:false,
+    animFn:(ctx, x, y, r, t, fillColor) => {
+      ctx.save();
+      ctx.fillStyle = fillColor || '#eecccc';
+      ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, y - r);
+      ctx.lineTo(x + r * 0.8, y);
+      ctx.lineTo(x + r * 0.4, y + r);
+      ctx.lineTo(x - r * 0.4, y + r);
+      ctx.lineTo(x - r * 0.8, y);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+  },
+  {
+    id:'shape_constellation', name:'Constellation', category:'shape', rarity:'rare',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t, fillColor) => {
+      const dots = [[0, -r], [r * 0.7, -r * 0.4], [r * 0.5, r * 0.3], [-r * 0.4, r * 0.6], [-r * 0.7, -r * 0.2], [r * 0.2, r * 0.8]];
+      ctx.save();
+      ctx.strokeStyle = fillColor || '#eeeeff';
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath();
+      for (let k = 0; k < dots.length; k++) {
+        if (k === 0) ctx.moveTo(x + dots[k][0], y + dots[k][1]);
+        else ctx.lineTo(x + dots[k][0], y + dots[k][1]);
+      }
+      ctx.stroke();
+      ctx.fillStyle = fillColor || '#eeeeff';
+      ctx.globalAlpha = 0.7 + 0.3 * Math.sin(t * 3);
+      for (const d of dots) {
+        ctx.beginPath();
+        ctx.arc(x + d[0], y + d[1], 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+  },
+  {
+    id:'shape_aether_eye', name:'Eye of Aether', category:'shape', rarity:'superleg',
+    value:null, animated:true,
+    animFn:(ctx, x, y, r, t, fillColor) => {
+      const blink = (Math.sin(t * 0.6) + 1) / 2; // 0..1
+      const open = 0.3 + blink * 0.7;
+      ctx.save();
+      ctx.fillStyle = '#1a1a2a';
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, r * open, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = fillColor || '#88aaff';
+      ctx.beginPath();
+      ctx.ellipse(x, y, r * 0.5, r * open * 0.7, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  },
+  {
+    id:'shape_hexline', name:'Hexline', category:'shape', rarity:'uncommon',
+    value:null, animated:false,
+    animFn:(ctx, x, y, r, t, fillColor) => {
+      ctx.save();
+      ctx.strokeStyle = fillColor || '#88ccaa';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let k = 0; k <= 6; k++) {
+        const a = (k / 6) * Math.PI * 2 + Math.PI / 6;
+        const px = x + Math.cos(a) * r;
+        const py = y + Math.sin(a) * r;
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+  },
+
+  // ── DEEP_AUDIT §5 — TRAIL (+5) ──────────────────────────────────
+  { id:'trail_embers',      name:'Embers',          category:'trail', rarity:'uncommon',  value:'rgba(255,140,40,0.7)' },
+  {
+    id:'trail_frost_crystals', name:'Frost Crystals', category:'trail', rarity:'rare',
+    value:null, animated:true,
+    getColor:(t) => `hsl(${190 + Math.sin(t) * 20},70%,75%)`
+  },
+  {
+    id:'trail_glyphic', name:'Glyphic Path', category:'trail', rarity:'rare',
+    value:null, animated:true,
+    getColor:(t) => `hsla(${(t * 60) % 360},80%,70%,0.7)`
+  },
+  {
+    id:'trail_phasewake', name:'Phasewake', category:'trail', rarity:'legendary',
+    value:null, animated:true,
+    getColor:(t) => `hsla(${280 + Math.sin(t) * 30},60%,65%,0.6)`
+  },
+  { id:'trail_ribbon', name:'Ribbon', category:'trail', rarity:'uncommon', value:'rgba(255,200,80,0.55)' },
+
+  // ── DEEP_AUDIT §5 — DEATH BURST (+5) ────────────────────────────
+  { id:'burst_confetti', name:'Confetti',  category:'deathBurst', rarity:'uncommon',  value:null, burstColors:['#ff4488','#44ff88','#ffdd44','#44ddff','#aa66ff'] },
+  { id:'burst_ash',      name:'Ash',       category:'deathBurst', rarity:'rare',      value:null, burstColors:['#666666','#888888','#aaaaaa'] },
+  { id:'burst_bloom',    name:'Bloom',     category:'deathBurst', rarity:'rare',      value:null, burstColors:['#88dd66','#aaff88','#66cc44'] },
+  { id:'burst_pixel',    name:'Pixel Burst',category:'deathBurst', rarity:'uncommon', value:null, burstColors:['#44ffff','#ff44ff','#ffff44'] },
+  { id:'burst_soul_smoke',name:'Soul Smoke',category:'deathBurst', rarity:'legendary',value:null, burstColors:['#aaaaff','#ccccff','#8888cc'] },
 ];
 
 // Fast lookup by id

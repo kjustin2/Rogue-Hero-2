@@ -198,41 +198,83 @@ export class InputManager {
       const newState = { connected: true, lx, ly, rx, ry, btns, enabled, localCoop };
       this._gpState[i] = newState;
 
-      // Per-slot enable: still track connected/state for UI, but skip input dispatch
       const isP1 = i === 0;
-      if (!enabled) continue;
       if (i > 1) continue; // we only support pads 0 and 1 for now
 
-      // Edge-trigger buttons → justPressed map
-      const dodgeKey = isP1 ? ' ' : 'e';
-      const fireKey  = isP1 ? null : 'q';   // P1 fires via mouse click
-      // P1 in solo uses 1-4; in coop uses 7-0 (right cluster). P2 always 1-4 (left cluster).
-      const cardKeys = isP1 ? (localCoop ? ['7','8','9','0'] : ['1','2','3','4']) : ['1','2','3','4'];
-
-      // A button (idx 0)
-      if (btns[0] && !prevBtns[0]) {
-        if (isP1) {
+      // Cursor + A button ALWAYS work for pad 0 so menus are navigable even
+      // before the player has clicked the gamepad toggle on. (P2's A maps to
+      // 'q' which is in-game; gate it behind enabled to avoid keyboard fights.)
+      if (isP1 && this.canvas) {
+        const mag2 = rx * rx + ry * ry;
+        if (mag2 > 0.04) {
+          const speed = 12;
+          this.mouse.x = Math.max(0, Math.min(this.canvas.width,  this.mouse.x + rx * speed));
+          this.mouse.y = Math.max(0, Math.min(this.canvas.height, this.mouse.y + ry * speed));
+        }
+        if (btns[0] && !prevBtns[0]) {
           this.mouse.justClicked = true;
           this.mouse.leftDown = true;
-        } else if (fireKey) {
-          this.justPressed.add(fireKey);
+        } else if (!btns[0] && prevBtns[0]) {
+          this.mouse.leftDown = false;
         }
-      } else if (!btns[0] && prevBtns[0] && isP1) {
-        this.mouse.leftDown = false;
+        // Start always advances menus (lobby code, draft, etc.)
+        if (btns[9] && !prevBtns[9]) this.justPressed.add('enter');
+        // Back/Select always escapes
+        if (btns[8] && !prevBtns[8]) this.justPressed.add('escape');
       }
-      // B button (idx 1) → dodge
-      if (btns[1] && !prevBtns[1]) this.justPressed.add(dodgeKey);
-      // X / Y → cycle card slot
-      if (btns[2] && !prevBtns[2]) this.justPressed.add(cardKeys[0]);
-      if (btns[3] && !prevBtns[3]) this.justPressed.add(cardKeys[1]);
-      // Bumpers (4/5) → card 3/4
-      if (btns[4] && !prevBtns[4]) this.justPressed.add(cardKeys[2]);
+
+      // Everything else (movement, dodge, card slot keys, in-game P2 fire)
+      // is gated by the per-slot enable so a connected-but-disabled pad can't
+      // fight the keyboard during gameplay.
+      if (!enabled) continue;
+
+      // Edge-trigger buttons → justPressed map.
+      // Mapping (Xbox layout, both pads):
+      //   A      → attack / click / confirm (P2 emits 'q')
+      //   B      → dodge (P1: space, P2: e) / back in menus (escape)
+      //   X      → cycle PREVIOUS card slot
+      //   Y      → cycle NEXT card slot
+      //   LB     → quick-select card slot 1
+      //   RB     → quick-select card slot 4
+      //   D-pad  → direct slot select (Up=1, Right=2, Down=3, Left=4)
+      //   Start  → enter (start combat / advance menus)
+      const dodgeKey = isP1 ? ' ' : 'e';
+      const fireKey  = isP1 ? null : 'q';   // P1 fires via mouse click
+      // P1 in solo uses 1-4; in coop uses 7-0 (right cluster). P2 always 1-4.
+      const cardKeys = isP1 ? (localCoop ? ['7','8','9','0'] : ['1','2','3','4']) : ['1','2','3','4'];
+
+      // P2's A → fire 'q' (only when enabled, since this is gameplay input)
+      if (!isP1 && fireKey) {
+        if (btns[0] && !prevBtns[0]) this.justPressed.add(fireKey);
+      }
+      // B button (idx 1): dodge. Escape lives on the Back button so combat
+      // dodge doesn't accidentally pause.
+      if (btns[1] && !prevBtns[1]) {
+        this.justPressed.add(dodgeKey);
+      }
+      // X (idx 2): cycle PREVIOUS card slot (right-click on P1; key on P2).
+      if (btns[2] && !prevBtns[2]) {
+        if (isP1) this.mouse.justRightClicked = true;
+        else this.justPressed.add(cardKeys[0]);
+      }
+      // Y (idx 3): cycle NEXT card slot — main "scroll cards" button.
+      if (btns[3] && !prevBtns[3]) {
+        if (isP1) this.mouse.justRightClicked = true;
+        else this.justPressed.add(cardKeys[1]);
+      }
+      // LB (idx 4): jump to card slot 1
+      if (btns[4] && !prevBtns[4]) this.justPressed.add(cardKeys[0]);
+      // RB (idx 5): jump to card slot 4
       if (btns[5] && !prevBtns[5]) this.justPressed.add(cardKeys[3]);
+      // D-pad (idx 12-15): direct slot select Up=1, Right=2, Down=3, Left=4
+      if (btns[12] && !prevBtns[12]) this.justPressed.add(cardKeys[0]);
+      if (btns[13] && !prevBtns[13]) this.justPressed.add(cardKeys[2]);
+      if (btns[14] && !prevBtns[14]) this.justPressed.add(cardKeys[3]);
+      if (btns[15] && !prevBtns[15]) this.justPressed.add(cardKeys[1]);
 
-      // Start (9) → enter (menus / start combat)
-      if (btns[9] && !prevBtns[9]) this.justPressed.add('enter');
-
-      // Right stick on P1's pad → move the mouse cursor for aim
+      // Right stick on P1's pad → move the mouse cursor for aim (in-game).
+      // Menu cursor movement is already handled in the always-on block above;
+      // this duplicate covers in-game aim — same code, same speed.
       if (isP1 && this.canvas) {
         const mag2 = rx * rx + ry * ry;
         if (mag2 > 0.04) {
@@ -248,6 +290,13 @@ export class InputManager {
   isGamepadConnected(slot) {
     const g = this._gpState && this._gpState[slot];
     return !!(g && g.connected);
+  }
+
+  // Live state for the sanity-test UI: { connected, enabled, btns, lx, ly, rx, ry }
+  getGamepadState(slot) {
+    const g = this._gpState && this._gpState[slot];
+    if (!g) return { connected: false, enabled: false, btns: [], lx: 0, ly: 0, rx: 0, ry: 0 };
+    return g;
   }
 
   // True if any gamepad is currently connected (UI hint)
@@ -286,34 +335,57 @@ export class InputManager {
     return view;
   }
 
-  // Update P2 reticle: auto-aim toward the closest alive enemy.
-  // Called each frame by main.js before p2.updateLogic, with the enemies list.
+  // Update P2 reticle. Default mode is auto-aim toward closest enemy. While
+  // P2 holds I/J/K/L, switch to MANUAL aim — the reticle nudges in that
+  // direction at a constant speed and stays put. Releasing all I/J/K/L
+  // returns to auto-aim. Called each frame by main.js before p2.updateLogic.
   updateP2Reticle(p2, dt, enemies) {
     if (!this._p2View) return;
     const v = this._p2View;
     if (!v._aimInit) { v._aimX = p2.x + 60; v._aimY = p2.y; v._aimInit = true; }
-    // Find closest alive enemy
-    let target = null, bestD = Infinity;
-    if (enemies) {
-      for (const e of enemies) {
-        if (!e.alive || e._dying) continue;
-        const dx = e.x - p2.x, dy = e.y - p2.y;
-        const d = dx * dx + dy * dy;
-        if (d < bestD) { bestD = d; target = e; }
+    // Manual aim override — I/J/K/L like a virtual stick.
+    const up = this.keys.has('i'), down = this.keys.has('k');
+    const lt = this.keys.has('j'), rt = this.keys.has('l');
+    const manual = up || down || lt || rt;
+    if (manual) {
+      v._manualMode = true;
+      v._manualHoldTimer = 1.5; // stay manual for 1.5s after last input
+      const speed = 480; // px/s — feels close to a fast cursor
+      if (lt) v._aimX -= speed * dt;
+      if (rt) v._aimX += speed * dt;
+      if (up) v._aimY -= speed * dt;
+      if (down) v._aimY += speed * dt;
+      // Clamp to canvas
+      if (this.canvas) {
+        v._aimX = Math.max(0, Math.min(this.canvas.width, v._aimX));
+        v._aimY = Math.max(0, Math.min(this.canvas.height, v._aimY));
       }
+    } else if (v._manualMode) {
+      v._manualHoldTimer -= dt;
+      if (v._manualHoldTimer <= 0) v._manualMode = false;
     }
-    if (target) {
-      // Smooth-chase the target so the reticle isn't snappy
-      const tx = target.x, ty = target.y;
-      const lerp = Math.min(1, dt * 8);
-      v._aimX += (tx - v._aimX) * lerp;
-      v._aimY += (ty - v._aimY) * lerp;
-    } else {
-      // Idle: park reticle slightly ahead of P2's facing
-      const tx = p2.x + 80, ty = p2.y;
-      const lerp = Math.min(1, dt * 4);
-      v._aimX += (tx - v._aimX) * lerp;
-      v._aimY += (ty - v._aimY) * lerp;
+    if (!v._manualMode) {
+      // Auto-aim: closest alive enemy
+      let target = null, bestD = Infinity;
+      if (enemies) {
+        for (const e of enemies) {
+          if (!e.alive || e._dying) continue;
+          const dx = e.x - p2.x, dy = e.y - p2.y;
+          const d = dx * dx + dy * dy;
+          if (d < bestD) { bestD = d; target = e; }
+        }
+      }
+      if (target) {
+        const tx = target.x, ty = target.y;
+        const lerp = Math.min(1, dt * 8);
+        v._aimX += (tx - v._aimX) * lerp;
+        v._aimY += (ty - v._aimY) * lerp;
+      } else {
+        const tx = p2.x + 80, ty = p2.y;
+        const lerp = Math.min(1, dt * 4);
+        v._aimX += (tx - v._aimX) * lerp;
+        v._aimY += (ty - v._aimY) * lerp;
+      }
     }
     v.mouse.x = v._aimX; v.mouse.y = v._aimY;
     // Q press → fire selected card

@@ -11,8 +11,12 @@ export class CombatManager {
     this.lastCardType = null; // for synergy combos
 
     events.on('CRASH_ATTACK', ({ x, y, radius, dmg }) => {
-      this.circularHitbox(x, y, radius, dmg, true);
-      // Crash burst visual
+      // Crash AoE used to lag when 20+ enemies were in range because each
+      // hit spawned its own damage number + fracture shards + death burst,
+      // saturating the 400-particle pool and allocating heavily. Pass a
+      // "quiet" flag so the hitbox skips per-enemy visuals — the single
+      // centered crashburst already communicates the hit clearly.
+      this.circularHitbox(x, y, radius, dmg, true, true);
       this.particles.spawnCrashBurst(x, y, radius);
     });
 
@@ -34,14 +38,14 @@ export class CombatManager {
     }
   }
 
-  circularHitbox(x, y, radius, dmg, severeStagger = false) {
+  circularHitbox(x, y, radius, dmg, severeStagger = false, quiet = false) {
     if (!this.enemies) return false;
     let hitAny = false;
     for (const e of this.enemies) {
       if (!e.alive) continue;
       const dx = e.x - x, dy = e.y - y;
       if (dx * dx + dy * dy < (radius + e.r) * (radius + e.r)) {
-        this.applyDamageToEnemy(e, dmg);
+        this.applyDamageToEnemy(e, dmg, quiet);
         if (e.alive && (severeStagger || this.tempo.value < 30)) {
           e.stagger(severeStagger ? 0.6 : 0.25);
         }
@@ -51,7 +55,7 @@ export class CombatManager {
     return hitAny;
   }
 
-  applyDamageToEnemy(enemy, amount) {
+  applyDamageToEnemy(enemy, amount, quiet = false) {
     // Post-dodge crit (Shadow passive)
     if (this.postDodgeCritActive && this.tempo.classPassives?.postDodgeCrit) {
       amount = Math.round(amount * 2);
@@ -72,18 +76,34 @@ export class CombatManager {
       amount = Math.round(amount * 2);
     }
 
+    // On the network CLIENT, the host is authoritative for enemy HP and
+    // death. The client only shows visuals (damage number + hit flash) and
+    // forwards the damage intent; it never mutates enemy.hp or .alive —
+    // the host broadcasts ENEMY_HP_SYNC after applying the damage, which
+    // is what actually moves the client's HP bar. This eliminates the
+    // "desynced HP / enemy won't die / can't hurt it" bugs that came from
+    // mixing client-side and host-side damage application.
+    const isNetClient = typeof window !== 'undefined' && window._net && window._net.role === 'client' && window._net.peers && window._net.peers.size > 0;
+    if (isNetClient) {
+      if (!quiet) {
+        this.particles.spawnDamageNumber(enemy.x, enemy.y, amount);
+        enemy.hitFlash = 0.12;
+      }
+      events.emit('DAMAGE_DEALT', { id: enemy.id, amount });
+      return false; // authoritative outcome comes back as ENEMY_HP_SYNC / KILL
+    }
     // ShieldDrone/Conductor immunity check
     if (enemy.type === 'shielddrone') {
       const actualDmg = enemy.takeDamage(amount, this.tempo);
       if (actualDmg === 0) return false; // Was shielded
-      this.particles.spawnDamageNumber(enemy.x, enemy.y, actualDmg);
+      if (!quiet) this.particles.spawnDamageNumber(enemy.x, enemy.y, actualDmg);
     } else if (enemy.type === 'boss_conductor') {
       const actualDmg = enemy.takeDamage(amount, this.tempo, this.enemies);
       if (actualDmg === 0) return false;
-      this.particles.spawnDamageNumber(enemy.x, enemy.y, actualDmg);
+      if (!quiet) this.particles.spawnDamageNumber(enemy.x, enemy.y, actualDmg);
     } else {
       enemy.takeDamage(amount);
-      this.particles.spawnDamageNumber(enemy.x, enemy.y, amount);
+      if (!quiet) this.particles.spawnDamageNumber(enemy.x, enemy.y, amount);
     }
 
     // Forward damage to peers so the host's authoritative copy of the enemy
@@ -91,7 +111,10 @@ export class CombatManager {
     events.emit('DAMAGE_DEALT', { id: enemy.id, amount });
 
     if (!enemy.alive) {
-      this.particles.spawnBurst(enemy.x, enemy.y, '#dd3333');
+      if (!quiet) {
+        this.particles.spawnBurst(enemy.x, enemy.y, '#dd3333');
+        if (this.particles.spawnFractureShards) this.particles.spawnFractureShards(enemy.x, enemy.y, enemy.color || '#ff8866');
+      }
       events.emit('KILL', { id: enemy.id });
       events.emit('PLAY_SOUND', 'kill');
 

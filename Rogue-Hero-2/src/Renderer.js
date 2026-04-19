@@ -61,12 +61,19 @@ export class Renderer {
   }
 
   beginShakeScope() {
+    // Skip the save/translate when no shake — saves a save/restore pair per
+    // frame in the common case (shake intensity is 0 most of the time).
+    if (this.shakeOffsetX === 0 && this.shakeOffsetY === 0) {
+      this._shakenScope = false;
+      return;
+    }
+    this._shakenScope = true;
     this.ctx.save();
     this.ctx.translate(this.shakeOffsetX, this.shakeOffsetY);
   }
 
   endShakeScope() {
-    this.ctx.restore();
+    if (this._shakenScope) this.ctx.restore();
   }
 
   // ── Cached scanline overlay ────────────────────────────────────
@@ -122,20 +129,26 @@ export class Renderer {
   }
 
   // ── Edge chromatic-aberration flash ───────────────────────────
+  // Cached gradient objects rebuilt only on resize (was: per-frame allocation
+  // for the whole 0.14 s flash duration on every crash / heavy hit).
   drawCAFlash() {
     if (this.caTimer <= 0) return;
     const p = this.caTimer / this._caMaxTime;
     const w = this.width, h = this.height;
+    if (!this._caGradL || this._caGradW !== w) {
+      this._caGradW = w;
+      this._caGradL = this.ctx.createLinearGradient(0, 0, w * 0.28, 0);
+      this._caGradL.addColorStop(0, 'rgba(255,0,30,1)');
+      this._caGradL.addColorStop(1, 'rgba(255,0,30,0)');
+      this._caGradR = this.ctx.createLinearGradient(w * 0.72, 0, w, 0);
+      this._caGradR.addColorStop(0, 'rgba(0,80,255,0)');
+      this._caGradR.addColorStop(1, 'rgba(0,80,255,1)');
+    }
     this.ctx.save();
-    const rg = this.ctx.createLinearGradient(0, 0, w * 0.28, 0);
-    rg.addColorStop(0, `rgba(255,0,30,${p * 0.38})`);
-    rg.addColorStop(1, 'rgba(255,0,30,0)');
-    this.ctx.fillStyle = rg;
+    this.ctx.globalAlpha = p * 0.38;
+    this.ctx.fillStyle = this._caGradL;
     this.ctx.fillRect(0, 0, w, h);
-    const bg = this.ctx.createLinearGradient(w * 0.72, 0, w, 0);
-    bg.addColorStop(0, 'rgba(0,80,255,0)');
-    bg.addColorStop(1, `rgba(0,80,255,${p * 0.38})`);
-    this.ctx.fillStyle = bg;
+    this.ctx.fillStyle = this._caGradR;
     this.ctx.fillRect(0, 0, w, h);
     this.ctx.restore();
   }

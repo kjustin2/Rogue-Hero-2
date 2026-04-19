@@ -128,12 +128,16 @@ export class ParticleSystem {
         ctx.fillText(t.text, t.x + 1, t.y + 1);
       }
       lastFont = null;
+      const _now = performance.now() / 1000;
       for (let i = 0; i < this.texts.length; i++) {
         const t = this.texts[i];
         const alpha = Math.max(0, t.life / t.maxLife);
         ctx.globalAlpha = alpha;
         ctx.fillStyle = t.color;
-        const font = `bold ${t.size || 16}px monospace`;
+        // Pulsing big numbers — tiny scale up/down, draws attention to crits
+        let size = t.size || 16;
+        if (t.pulse) size = size + Math.sin(_now * 14) * 2;
+        const font = `bold ${Math.round(size)}px monospace`;
         if (font !== lastFont) { ctx.font = font; lastFont = font; }
         ctx.fillText(t.text, t.x, t.y);
       }
@@ -317,17 +321,57 @@ export class ParticleSystem {
     }
   }
 
+  // Visual refresh: 6-8 fast-moving short line shards on enemy death.
+  // Each is just an angled velocity burst with extra drag — pooled & cheap.
+  spawnFractureShards(x, y, color) {
+    const n = 7;
+    for (let i = 0; i < n; i++) {
+      const angle = (i / n) * Math.PI * 2 + (Math.random() - 0.5) * 0.6;
+      const speed = 90 + Math.random() * 80;
+      this._pushParticle({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        r: 2 + Math.random() * 1.5,
+        color: color || '#ffaa66',
+        life: 0.32, maxLife: 0.36, drag: 0.84,
+      });
+    }
+  }
+
   spawnDamageNumber(x, y, amount) {
     const isText = typeof amount === 'string';
+    // Visual variants based on magnitude — reads better at a glance.
+    let size = 16, color = '#ffffff', text = String(amount), pulse = false, weight = 'bold';
+    if (isText) {
+      color = '#88ffaa';
+      size = 14;
+      // text labels (e.g. "+3 HP", "DOWN!", "REVIVING") keep their color
+    } else if (amount >= 30) {
+      // Big hit: large pulsing red
+      size = 26;
+      color = '#ff5544';
+      text = 'HUGE ' + amount + '!';
+      pulse = true;
+    } else if (amount >= 15) {
+      size = 20;
+      color = '#ffaa66';
+    } else if (amount >= 8) {
+      size = 17;
+      color = '#ffd699';
+    } else {
+      // Small hit: muted
+      size = 14;
+      color = '#cccccc';
+      text = '+' + amount;
+    }
     this.texts.push({
       x: x + (Math.random() * 24 - 12),
       y: y - 10,
       vx: (Math.random() - 0.5) * 40,
       vy: -80,
-      text: String(amount),
-      color: isText ? '#44ff88' : '#ffffff',
-      size: isText ? 14 : 16,
-      life: 0.8, maxLife: 0.8
+      text, color, size, pulse, weight,
+      life: 0.9, maxLife: 0.9
     });
   }
 

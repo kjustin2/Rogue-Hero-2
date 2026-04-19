@@ -209,12 +209,29 @@ export class Net {
       if (s === 'connected') {
         this._dispatch('peer', { kind: 'join', peerId }, peerId);
         this._dispatch('status', { kind: 'peer', msg: `Peer connected (${this.peers.size} total)` });
-      } else if (s === 'failed' || s === 'disconnected') {
+      } else if (s === 'failed' || s === 'closed') {
+        // 'disconnected' is transient (brief network hiccup) — WebRTC may
+        // auto-recover in <5s. Only fatal states prune the peer.
         this._cfRemovePeer(peerId);
+      } else if (s === 'disconnected') {
+        // Tell the UI so a status banner appears, but keep the peer record
+        // so we can recover if ICE heals itself.
+        this._dispatch('status', { kind: 'peer-error', msg: `Peer ${peerId} link unstable — attempting recovery` });
       }
     };
 
     return peer;
+  }
+
+  // Snap channel may carry either binary (compact) or JSON (legacy). We
+  // detect at receive time so an old peer can still talk to a new one.
+  _onSnapMessage(e, peerId) {
+    if (e.data instanceof ArrayBuffer) {
+      this._dispatch('snap', e.data, peerId);
+    } else {
+      // Legacy / JSON path
+      try { this._dispatch('snap', JSON.parse(e.data), peerId); } catch {}
+    }
   }
 
   // We are the initiator: create offer + data channels.
@@ -223,7 +240,8 @@ export class Net {
     // snap: unordered/lossy for positions; evt: ordered/reliable for game events
     peer.snapDc = peer.pc.createDataChannel('snap', { ordered: false, maxRetransmits: 0 });
     peer.evtDc  = peer.pc.createDataChannel('evt',  { ordered: true });
-    peer.snapDc.onmessage = (e) => this._dispatch('snap', JSON.parse(e.data), peerId);
+    peer.snapDc.binaryType = 'arraybuffer';
+    peer.snapDc.onmessage = (e) => this._onSnapMessage(e, peerId);
     peer.evtDc.onmessage  = (e) => this._dispatch('evt',  JSON.parse(e.data), peerId);
     const offer = await peer.pc.createOffer();
     await peer.pc.setLocalDescription(offer);
@@ -237,7 +255,8 @@ export class Net {
       const dc = evt.channel;
       if (dc.label === 'snap') {
         peer.snapDc = dc;
-        dc.onmessage = (e) => this._dispatch('snap', JSON.parse(e.data), peerId);
+        dc.binaryType = 'arraybuffer';
+        dc.onmessage = (e) => this._onSnapMessage(e, peerId);
       } else if (dc.label === 'evt') {
         peer.evtDc = dc;
         dc.onmessage = (e) => this._dispatch('evt', JSON.parse(e.data), peerId);
@@ -362,13 +381,25 @@ export class Net {
   // ── Send ─────────────────────────────────────────────────────────────────────
 
   // Best-effort, unordered — position snapshots.
+  // Payload may be a Uint8Array/ArrayBuffer (binary, preferred) or a plain
+  // object (JSON fallback). Auto-detects and uses the right send path.
   sendUnreliable(channel, payload) {
     if (!this.connected || this.role === 'solo' || channel !== 'snap') return;
+    const isBin = payload && (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload));
     if (this._strategy === 'cloudflare') {
-      const json = JSON.stringify(payload);
-      for (const peer of this.peers.values()) {
-        if (peer.snapDc?.readyState === 'open') {
-          try { peer.snapDc.send(json); this._sendStats.msgsOut++; } catch {}
+      if (isBin) {
+        const buf = payload instanceof ArrayBuffer ? payload : payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+        for (const peer of this.peers.values()) {
+          if (peer.snapDc?.readyState === 'open') {
+            try { peer.snapDc.send(buf); this._sendStats.msgsOut++; this._sendStats.bytesOut += buf.byteLength; } catch {}
+          }
+        }
+      } else {
+        const json = JSON.stringify(payload);
+        for (const peer of this.peers.values()) {
+          if (peer.snapDc?.readyState === 'open') {
+            try { peer.snapDc.send(json); this._sendStats.msgsOut++; this._sendStats.bytesOut += json.length; } catch {}
+          }
         }
       }
     } else if (this._sendSnap) {

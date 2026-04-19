@@ -130,6 +130,8 @@ export class Player extends Entity {
           }
           events.emit('DODGE');
           events.emit('PLAY_SOUND', 'dodge');
+          // Visual refresh: brief micro-shake reinforces dash-as-impact.
+          events.emit('SCREEN_SHAKE', { duration: 0.05, intensity: 0.15 });
         }
       }
     } else {

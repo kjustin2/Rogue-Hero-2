@@ -192,13 +192,67 @@ export class RoomManager {
       ctx.fillRect(p.x + shadowOff, p.y + shadowOff, p.w, p.h);
     }
 
-    // Draw pillars
+    // Draw pillars with vertical detail line for depth
     for (const p of this.pillars) {
       ctx.fillStyle = tc.pillar;
       ctx.fillRect(p.x, p.y, p.w, p.h);
       ctx.strokeStyle = tc.pillarStroke;
       ctx.lineWidth = 2;
       ctx.strokeRect(p.x, p.y, p.w, p.h);
+      // Inner highlight + shadow (free since cached)
+      ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(p.x + 2, p.y + 2); ctx.lineTo(p.x + p.w - 2, p.y + 2);
+      ctx.moveTo(p.x + 2, p.y + 2); ctx.lineTo(p.x + 2, p.y + p.h - 2);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(0,0,0,0.30)';
+      ctx.beginPath();
+      ctx.moveTo(p.x + p.w - 1, p.y + 4); ctx.lineTo(p.x + p.w - 1, p.y + p.h - 1);
+      ctx.moveTo(p.x + 4, p.y + p.h - 1); ctx.lineTo(p.x + p.w - 1, p.y + p.h - 1);
+      ctx.stroke();
+    }
+
+    // ── Floor crack patterns — seeded, scattered hairlines for texture ──
+    {
+      const seedCk = ((this.variant.charCodeAt(0) || 1) * 53 + 17) | 0;
+      const numCracks = 8;
+      ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < numCracks; i++) {
+        const s1 = ((seedCk * 1664525 + 1013904223 + i * 22695477) >>> 0);
+        const s2 = ((s1 * 1664525 + 1013904223) >>> 0);
+        const s3 = ((s2 * 1664525 + 1013904223) >>> 0);
+        const cx0 = this.FLOOR_X1 + 30 + (s1 % (fw - 60));
+        const cy0 = this.FLOOR_Y1 + 30 + (s2 % (fh - 60));
+        const len = 14 + (s3 % 30);
+        const ang = ((s1 ^ s2) % 360) * Math.PI / 180;
+        ctx.beginPath();
+        ctx.moveTo(cx0, cy0);
+        ctx.lineTo(cx0 + Math.cos(ang) * len, cy0 + Math.sin(ang) * len);
+        // Branching mini-line
+        const ang2 = ang + 0.6;
+        ctx.moveTo(cx0 + Math.cos(ang) * len * 0.5, cy0 + Math.sin(ang) * len * 0.5);
+        ctx.lineTo(cx0 + Math.cos(ang) * len * 0.5 + Math.cos(ang2) * len * 0.4,
+                   cy0 + Math.sin(ang) * len * 0.5 + Math.sin(ang2) * len * 0.4);
+        ctx.stroke();
+      }
+    }
+
+    // ── Wall edge lighting — subtle gradient on wall borders ──
+    {
+      const wallAlpha = 0.18;
+      const lg = ctx.createLinearGradient(0, this.FLOOR_Y1, 0, this.FLOOR_Y1 + 20);
+      lg.addColorStop(0, `rgba(255,255,255,${wallAlpha})`);
+      lg.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = lg;
+      ctx.fillRect(this.FLOOR_X1, this.FLOOR_Y1, fw, 20);
+
+      const lg2 = ctx.createLinearGradient(0, this.FLOOR_Y2 - 20, 0, this.FLOOR_Y2);
+      lg2.addColorStop(0, 'rgba(0,0,0,0)');
+      lg2.addColorStop(1, 'rgba(0,0,0,0.30)');
+      ctx.fillStyle = lg2;
+      ctx.fillRect(this.FLOOR_X1, this.FLOOR_Y2 - 20, fw, 20);
     }
 
     this._gridCache = canvas;
