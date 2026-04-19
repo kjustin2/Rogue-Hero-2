@@ -8,7 +8,10 @@
       "Bash(node -e ' *)",
       "Bash(cat)",
       "Read(//tmp/**)",
-      "Bash(grep -n \"\\\\\\\\bi\\\\\\\\b\\\\|\\\\\\\\bj\\\\\\\\b\\\\|\\\\\\\\bk\\\\\\\\b\\\\|\\\\\\\\bl\\\\\\\\b\" \"E:\\\\Storage\\\\SAAS\\\\Rogue-Hero-2\\\\Rogue-Hero-2\\\\src\\\\Input.js\")"
+      "Bash(grep -n \"\\\\\\\\bi\\\\\\\\b\\\\|\\\\\\\\bj\\\\\\\\b\\\\|\\\\\\\\bk\\\\\\\\b\\\\|\\\\\\\\bl\\\\\\\\b\" \"E:\\\\Storage\\\\SAAS\\\\Rogue-Hero-2\\\\Rogue-Hero-2\\\\src\\\\Input.js\")",
+      "Bash(node --input-type=module -e ' *)",
+      "Bash(node mp-smoke.mjs)",
+      "Bash(npm test *)"
     ]
   }
 }

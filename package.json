@@ -1,0 +1,12 @@
+{
+  "name": "rogue-hero-2-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Root delegator — all real scripts live in ./Rogue-Hero-2. This exists so `npm start` from the repo root doesn't ENOENT.",
+  "scripts": {
+    "start": "npm start --prefix Rogue-Hero-2",
+    "test": "npm test --prefix Rogue-Hero-2",
+    "dist": "npm run dist --prefix Rogue-Hero-2",
+    "serve": "python -m http.server 8000 --directory Rogue-Hero-2"
+  }
+}

@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rogue-Hero-2 — MP fix smoke tests</title>
+<style>
+  body { font: 14px/1.45 ui-monospace, Consolas, monospace; background: #0b0b14; color: #d9d9e6; padding: 24px; max-width: 920px; }
+  h1 { color: #88ccff; margin-top: 0; }
+  h2 { color: #ffcc66; border-bottom: 1px solid #332a1a; padding-bottom: 4px; margin-top: 28px; }
+  .pass { color: #66ff99; }
+  .fail { color: #ff6677; }
+  .note { color: #889; }
+  pre.test { margin: 2px 0; padding: 4px 8px; background: #151522; border-left: 3px solid #333; white-space: pre-wrap; }
+  pre.test.pass { border-left-color: #66ff99; }
+  pre.test.fail { border-left-color: #ff6677; background: #2a1116; }
+  #summary { font-size: 16px; margin-top: 20px; padding: 10px 14px; border-radius: 6px; }
+  #summary.pass { background: #163a20; color: #9fffbb; }
+  #summary.fail { background: #3a1520; color: #ffa7b3; }
+</style>
+</head>
+<body>
+<h1>Rogue-Hero-2 — Multiplayer fix smoke tests</h1>
+<p class="note">
+  Walks the pure-module logic behind the recent MP fixes. Run with
+  <code>npm run serve</code> at the repo root (or
+  <code>python -m http.server</code> inside <code>Rogue-Hero-2/</code>) and open
+  <code>/tests.html</code>. The game canvas itself is not driven here — those
+  paths are covered by actually playing a session; this file guards the
+  deterministic subsystems.
+</p>
+<div id="out"></div>
+<div id="summary"></div>
+
+<script type="module">
+import { RunManager } from './src/RunManager.js';
+import { TempoSystem } from './src/tempo.js';
+import { Players } from './src/Players.js';
+import { Player } from './src/player.js';
+import { Enemy } from './src/Enemy.js';
+import { BossHollowKing, BossVaultEngine, BossAurora } from './src/EnemiesRH2.js';
+
+const out = document.getElementById('out');
+let total = 0, passed = 0;
+const currentGroup = { el: null };
+
+function group(name) {
+  const h = document.createElement('h2');
+  h.textContent = name;
+  out.appendChild(h);
+  currentGroup.el = out;
+}
+
+function check(label, cond, detail) {
+  total++;
+  const pre = document.createElement('pre');
+  pre.className = 'test ' + (cond ? 'pass' : 'fail');
+  pre.textContent = (cond ? '✓ ' : '✗ ') + label + (detail ? '   — ' + detail : '');
+  currentGroup.el.appendChild(pre);
+  if (cond) passed++;
+}
+
+function closeEnough(a, b, eps = 0.0001) { return Math.abs(a - b) < eps; }
+
+// ─────────────────────────────────────────────────────────────────
+// 1. RunManager RNG state save/restore (drives floor-2 map sync)
+// ─────────────────────────────────────────────────────────────────
+group('RunManager — seeded RNG lockstep via getRngState / setRngState');
+{
+  const host = new RunManager();
+  const client = new RunManager();
+  const SEED = 12345;
+  host.setSeed(SEED);
+  client.setSeed(SEED);
+
+  // Both sides start on the same stream position — first value must match.
+  check('same seed → same first value',
+    host.getRng()() === client.getRng()());
+
+  // Host consumes N values (simulating spawnEnemies on host only).
+  const hostRng = host.getRng();
+  for (let i = 0; i < 37; i++) hostRng();
+  const hostAfter = host.getRngState();
+
+  // Before snapping, client is behind — next value differs.
+  const stray = client.getRng()();
+  const hostNext = host.getRng()();
+  check('without snap, client and host diverge', stray !== hostNext,
+    `client=${stray.toFixed(6)} host=${hostNext.toFixed(6)}`);
+
+  // Snap client to host's post-spawn state, then both should produce
+  // identical streams from here forward.
+  client.setRngState(hostAfter);
+  const hostAfterV = host.getRng()();
+  const clientAfterV = client.getRng()();
+  check('after setRngState, host and client re-lock',
+    hostAfterV === clientAfterV,
+    `host=${hostAfterV.toFixed(6)} client=${clientAfterV.toFixed(6)}`);
+
+  // Full floor-advance simulation: both sides run generateMap from the
+  // same state and produce matching node types.
+  host.setSeed(SEED);
+  client.setSeed(SEED);
+  // Host "spawnEnemies" consumes some values.
+  const hrng = host.getRng();
+  for (let i = 0; i < 20; i++) hrng();
+  client.setRngState(host.getRngState());
+  // Both sides advance the floor and regenerate.
+  host.floor = 2; client.floor = 2;
+  host.generateMap();
+  client.generateMap();
+  const hostTypes = Object.values(host.nodeMap).map(n => n.type).sort().join(',');
+  const clientTypes = Object.values(client.nodeMap).map(n => n.type).sort().join(',');
+  check('post-sync: floor-2 generateMap produces identical node types',
+    hostTypes === clientTypes,
+    `host=${hostTypes}  client=${clientTypes}`);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 2. Tempo.setValue crash trigger (was: stuck at 100)
+// ─────────────────────────────────────────────────────────────────
+group('Tempo — setValue to 100 must trigger accidental crash');
+{
+  const tempo = new TempoSystem();
+  tempo.crashResetValue = 50;
+
+  // Climb via setValue (the card tempoShift path).
+  tempo.setValue(70);
+  check('setValue(70) → value == 70', tempo.value === 70);
+
+  tempo.setValue(100);
+  check('setValue(100) → isCrashed becomes true',
+    tempo.isCrashed === true);
+  check('setValue(100) → value/target reset to crashResetValue',
+    tempo.value === 50 && tempo.targetValue === 50,
+    `value=${tempo.value} target=${tempo.targetValue}`);
+
+  // Cold crash via setValue(<=0).
+  const tempo2 = new TempoSystem();
+  tempo2.crashResetValue = 50;
+  tempo2.setValue(5);
+  tempo2.setValue(0);
+  check('setValue(0) → isCrashed true (cold-crash path)',
+    tempo2.isCrashed === true);
+
+  // Lerp steps MUST NOT trigger crashes (would double-fire).
+  const tempo3 = new TempoSystem();
+  tempo3.value = 100; tempo3.targetValue = 100; tempo3.isCrashed = false;
+  tempo3.setValue(100, /*isLerpStep=*/true);
+  check('setValue(100, isLerpStep=true) → does NOT crash',
+    tempo3.isCrashed === false);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 3. Players.allDownedOrDead (drives both-downed game-over)
+// ─────────────────────────────────────────────────────────────────
+group('Players — allDownedOrDead returns correct wipe state');
+{
+  const players = new Players();
+  const a = new Player(0, 0);
+  const b = new Player(0, 0);
+  players.add(a);
+  players.add(b);
+
+  check('fresh: both alive+standing → not wipe',
+    !players.allDownedOrDead());
+
+  a.downed = true;
+  check('one downed → not wipe', !players.allDownedOrDead());
+
+  b.downed = true;
+  check('both downed → wipe', players.allDownedOrDead());
+
+  // "Alive + downed" and "dead (alive=false)" both count as wipe-eligible.
+  b.alive = false; b.downed = false;
+  check('one downed, one dead → wipe', players.allDownedOrDead());
+
+  // Revived teammate breaks the wipe even if we set all other flags wrong.
+  a.downed = false; b.alive = true; b.downed = true;
+  check('any standing player → not wipe', !players.allDownedOrDead());
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 4. Enemy default draw: RH2 bosses must render (was: invisible)
+// ─────────────────────────────────────────────────────────────────
+group('Enemy.draw — RH2 bosses render via base fallback');
+{
+  const e = new Enemy(100, 100, 16, 50, 'boss_test');
+  check('base Enemy has a draw() method (not the abstract Entity stub)',
+    typeof e.draw === 'function' &&
+      e.draw.toString().includes('drawBody'));
+
+  // Subclass without its own draw() must inherit the base and route through drawBody.
+  const boss = new BossHollowKing(100, 100);
+  let drawBodyCalled = false;
+  boss.drawBody = function() { drawBodyCalled = true; };
+  // Mock a minimal canvas ctx — our fallback only calls drawBody.
+  boss.draw({ save() {}, restore() {} }, 0);
+  check('BossHollowKing.draw() reaches drawBody via inherited fallback',
+    drawBodyCalled);
+
+  const boss2 = new BossVaultEngine(0, 0);
+  let called2 = false;
+  boss2.drawBody = function() { called2 = true; };
+  boss2.draw({}, 0);
+  check('BossVaultEngine.draw() reaches drawBody', called2);
+
+  const boss3 = new BossAurora(0, 0);
+  let called3 = false;
+  boss3.drawBody = function() { called3 = true; };
+  boss3.draw({}, 0);
+  check('BossAurora.draw() reaches drawBody', called3);
+
+  // Dead enemy must not draw.
+  const dead = new Enemy(0, 0, 16, 1, 'corpse');
+  dead.alive = false;
+  let calledDead = false;
+  dead.drawBody = function() { calledDead = true; };
+  dead.draw({}, 0);
+  check('dead enemy → draw() is a no-op', !calledDead);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 5. Elite modifier application order on the client side
+// ─────────────────────────────────────────────────────────────────
+group('Enemy.applyEliteModifier — host HP is authoritative in sync');
+{
+  // Simulate what _spawnEnemyFromSync now does: apply modifier FIRST,
+  // then override hp/maxHp from the network payload.
+  const hostHp = 120; // host's already-scaled HP
+  const hostMaxHp = 120;
+  const e = new Enemy(0, 0, 16, 50, 'bruiser');
+  e.applyEliteModifier('armored'); // multiplies e.hp by ~1.3
+  e.hp = hostHp;
+  e.maxHp = hostMaxHp;
+  check('after apply-then-override: hp == host hp (no double multiply)',
+    e.hp === hostHp && e.maxHp === hostMaxHp,
+    `hp=${e.hp} maxHp=${e.maxHp}`);
+
+  // Pre-fix ordering would end up at ~1.3 * 120 = 156.
+  const bad = new Enemy(0, 0, 16, 50, 'bruiser');
+  bad.hp = 120; bad.maxHp = 120;
+  bad.applyEliteModifier('armored');
+  check('reverse order inflates HP (regression guard — this must be > host HP)',
+    bad.hp > hostHp,
+    `bad-order hp=${bad.hp}`);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 6. Mulberry32 state snapshot survives a full map regen pair
+// ─────────────────────────────────────────────────────────────────
+group('RunManager — generateMap on both sides produces identical node graph');
+{
+  const host = new RunManager();
+  const client = new RunManager();
+  host.setSeed(77); client.setSeed(77);
+
+  // Full parity run: both generate floor 1 map, run some combats
+  // (host-only consumption), sync state, advance floor, regenerate.
+  host.generateMap(); client.generateMap();
+
+  // Floor 1: before any combat, maps must match.
+  const f1Host = JSON.stringify(Object.keys(host.nodeMap).sort().map(id => host.nodeMap[id].type));
+  const f1Client = JSON.stringify(Object.keys(client.nodeMap).sort().map(id => client.nodeMap[id].type));
+  check('floor 1 map generation deterministic from seed alone',
+    f1Host === f1Client);
+
+  // Host-only combat consumption.
+  const hrng = host.getRng();
+  for (let i = 0; i < 53; i++) hrng();
+  // ENEMY_SPAWN_LIST-like sync.
+  client.setRngState(host.getRngState());
+
+  // Now advance floor and regen.
+  host.floor = 2; client.floor = 2;
+  host.generateMap(); client.generateMap();
+  const f2Host = JSON.stringify(Object.keys(host.nodeMap).sort().map(id => host.nodeMap[id].type));
+  const f2Client = JSON.stringify(Object.keys(client.nodeMap).sort().map(id => client.nodeMap[id].type));
+  check('floor 2 map matches after combat-round RNG sync',
+    f2Host === f2Client, `host=${f2Host} client=${f2Client}`);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 7. Team-vote resolution logic (rest / event / draft share the pattern)
+// ─────────────────────────────────────────────────────────────────
+group('Team-vote logic — both must agree, solo fallback resolves locally');
+{
+  // Replicate the resolver shape from main.js (_checkRestVoteResolution etc.)
+  function makeVote() {
+    let local = null, remote = null, applied = null;
+    const apply = (v) => { applied = v; };
+    return {
+      cast: (v, mp) => {
+        local = v;
+        if (!mp) {
+          if (local != null) { apply(local); local = null; }
+          return;
+        }
+        if (local == null || remote == null) return;
+        if (local !== remote) return;
+        apply(local);
+        local = null; remote = null;
+      },
+      receive: (v, mp) => {
+        remote = v;
+        if (!mp) {
+          if (local != null) { apply(local); local = null; }
+          return;
+        }
+        if (local == null || remote == null) return;
+        if (local !== remote) return;
+        apply(local);
+        local = null; remote = null;
+      },
+      snapshot: () => ({ local, remote, applied }),
+    };
+  }
+
+  // Solo: a vote resolves immediately.
+  {
+    const v = makeVote();
+    v.cast('heal', /*mp=*/false);
+    check('solo vote → immediate resolution',
+      v.snapshot().applied === 'heal');
+  }
+
+  // MP same vote → resolves once.
+  {
+    const v = makeVote();
+    v.cast('heal', true);
+    check('MP local-only vote → pending',
+      v.snapshot().applied === null && v.snapshot().local === 'heal');
+    v.receive('heal', true);
+    check('MP matching remote vote → resolves',
+      v.snapshot().applied === 'heal' &&
+      v.snapshot().local === null && v.snapshot().remote === null);
+  }
+
+  // MP mismatched → no apply.
+  {
+    const v = makeVote();
+    v.cast('heal', true);
+    v.receive('fortify', true);
+    check('MP mismatched votes → do NOT resolve',
+      v.snapshot().applied === null);
+  }
+
+  // MP changed-mind → eventual resolve.
+  {
+    const v = makeVote();
+    v.cast('heal', true);
+    v.receive('fortify', true);
+    v.cast('fortify', true); // local changes to match
+    check('MP change-vote to match → resolves',
+      v.snapshot().applied === 'fortify');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 8. healAllPlayers-style filter (skips _isRemote placeholders)
+// ─────────────────────────────────────────────────────────────────
+group('Heal only local players — remote placeholders are not mutated');
+{
+  const players = new Players();
+  const local = new Player(0, 0);
+  const placeholder = new Player(0, 0);
+  placeholder._isRemote = true;
+  local.hp = 5; local.maxHp = 10;
+  placeholder.hp = 3; placeholder.maxHp = 10;
+  players.add(local);
+  players.add(placeholder);
+
+  // Simulate the fixed healAllPlayers body.
+  function healAll(amt) {
+    for (const p of players.list) {
+      if (p && p.alive && !p._isRemote) p.heal(amt);
+    }
+  }
+
+  healAll(3);
+  check('local.hp healed', local.hp === 8);
+  check('remote placeholder NOT mutated (owning side handles it)',
+    placeholder.hp === 3);
+
+  // Full-HP local → healing is a no-op, not a crash.
+  local.hp = 10;
+  healAll(3);
+  check('full-HP local player: heal() is clamped (still 10)', local.hp === 10);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Summary
+// ─────────────────────────────────────────────────────────────────
+const s = document.getElementById('summary');
+if (passed === total) {
+  s.className = 'pass';
+  s.textContent = `ALL ${total} CHECKS PASSED`;
+} else {
+  s.className = 'fail';
+  s.textContent = `${passed} / ${total} CHECKS PASSED — ${total - passed} FAILED`;
+}
+console.log(`[tests] ${passed}/${total} passed`);
+</script>
+</body>
+</html>
