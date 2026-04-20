@@ -415,10 +415,12 @@ group('DeckManager — host & client stay consistent when each picks independent
   check('removeCard + mirror → collections match',
     JSON.stringify(host.collection) === JSON.stringify(client.collection));
 
+  // Upgrades are per-player — host pick must NOT bleed onto client.
   host.upgradeCard('lunge');
-  client.upgradeCard('lunge');
-  check('upgradeCard + mirror → upgrades match',
-    JSON.stringify(host.upgrades) === JSON.stringify(client.upgrades));
+  check('upgrade on host only → client upgrades stay empty',
+    JSON.stringify(client.upgrades) === '{}');
+  check('host upgrade reflected locally',
+    host.upgrades.lunge === 1);
 }
 
 // ─────────────────────────────────────────────────────────────────

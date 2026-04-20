@@ -198,11 +198,14 @@ group('DeckManager — peer-mirrored add / remove / upgrade');
   check('after DECK_CARD_REMOVED, collections match',
     JSON.stringify(host.collection) === JSON.stringify(client.collection));
 
-  // Upgrades mirror through the upgrades map.
+  // Upgrades are per-player — the host upgrading MUST NOT mirror onto
+  // the client, otherwise both players benefit from one upgrade pick.
   host.upgradeCard('lunge');
-  client.upgradeCard('lunge');
-  check('after DECK_CARD_UPGRADED, upgrades match',
-    JSON.stringify(host.upgrades) === JSON.stringify(client.upgrades));
+  check('after upgrade on host only, client upgrades stay empty',
+    JSON.stringify(client.upgrades) === '{}',
+    `client.upgrades=${JSON.stringify(client.upgrades)}`);
+  check('host upgrades reflect the pick',
+    host.upgrades.lunge === 1);
 }
 
 console.log(`\n${failed === 0 ? '✓' : '✗'}  ${total - failed}/${total} checks passed`

@@ -482,35 +482,10 @@ export class UI {
       ctx.fillRect(sx, y, segW, segH);
       ctx.strokeRect(sx, y, segW, segH);
     }
-    // Local 2P coop / remote MP: also draw P2's HP bar below P1's
-    const pl = window._players && window._players.list;
-    if (pl && pl.length > 1) {
-      const p2 = pl[1];
-      if (!p2 || !p2.maxHp) return;
-      const y2 = y + segH + 6;
-      const p2hp = Math.max(0, p2.hp);
-      const p2max = p2.maxHp;
-      const p2ratio = p2hp / p2max;
-      const p2segW = Math.min(20, Math.floor((this.width * 0.2) / p2max));
-      ctx.fillStyle = p2.haloColor || '#ff9944';
-      ctx.font = 'bold 13px monospace';
-      ctx.fillText('P2', startX, y2 + segH - 4);
-      const p2col = p2ratio > 0.5 ? '#ff8855' : (p2ratio > 0.25 ? '#ff6644' : '#ff3322');
-      const downColor = p2.downed ? '#444' : p2col;
-      ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
-      for (let i = 0; i < p2max; i++) {
-        const sx = startX + 30 + i * (p2segW + segGap);
-        ctx.fillStyle = i < p2hp ? downColor : '#222';
-        ctx.fillRect(sx, y2, p2segW, segH);
-        ctx.strokeRect(sx, y2, p2segW, segH);
-      }
-      // Status badge
-      if (p2.downed) {
-        ctx.fillStyle = '#ff6644';
-        ctx.font = 'bold 11px monospace';
-        ctx.fillText('▼ DOWN', startX + 30 + p2max * (p2segW + segGap) + 6, y2 + segH - 4);
-      }
-    }
+    // NOTE: the P2 HP bar that used to live here has been removed — the
+    // co-op summary panel (see main.js, below RELICS) already shows the
+    // teammate's HP / AP / downed status, so duplicating it here was
+    // just visual clutter.
   }
 
   // ── AP bar — top left below HP
@@ -518,14 +493,7 @@ export class UI {
     if (!this.player) return;
     const b = this.player.budget, mb = this.player.maxBudget;
     const segW = 18, segH = 14, segGap = 3;
-    const startX = 18;
-    // When a second player exists (local co-op or remote MP), the P2 HP
-    // bar occupies y=42..60 directly beneath P1's HP. Shift the AP bar
-    // below that so the two don't overlap (previous y=44 sat on top of
-    // the P2 bar and produced the "double bar" visual).
-    const pl = window._players && window._players.list;
-    const hasP2 = !!(pl && pl.length > 1 && pl[1] && pl[1].maxHp);
-    const y = hasP2 ? 68 : 44;
+    const startX = 18, y = 44;
 
     ctx.font = 'bold 13px monospace';
     ctx.textAlign = 'left';
@@ -573,11 +541,7 @@ export class UI {
   // ── Relics — top left below AP
   _drawRelics(ctx) {
     if (!this.itemManager || !this.itemManager.equipped.length) return;
-    // Match the AP-bar offset: when there's a P2, everything shifts down
-    // to make room for the second HP bar between P1's HP and AP.
-    const pl = window._players && window._players.list;
-    const hasP2 = !!(pl && pl.length > 1 && pl[1] && pl[1].maxHp);
-    const y = hasP2 ? 92 : 68;
+    const y = 68;
     const startX = 18;
     ctx.fillStyle = PAL.MUTED;
     ctx.font = '10px monospace';

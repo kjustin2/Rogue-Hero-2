@@ -505,9 +505,11 @@ net.on('evt', (msg) => {
     const cid = msg.cardId || p.cardId;
     if (cid) deckManager.removeCard(cid);
 
-  } else if (type === 'DECK_CARD_UPGRADED') {
-    const cid = msg.cardId || p.cardId;
-    if (cid) deckManager.upgradeCard(cid);
+  // NOTE: DECK_CARD_UPGRADED is intentionally NOT received. Upgrades are
+  // a per-player effect — only the player who chose to spend the
+  // upgrade should benefit. The shared `deckManager.upgrades` map
+  // therefore diverges between peers by design, even though the
+  // `collection` stays in sync via DECK_CARD_ADDED/REMOVED.
 
   } else if (type === 'PING') {
     // Echo back with the original t so the sender can compute RTT
@@ -723,6 +725,17 @@ net.on('evt', (msg) => {
       if (net.role !== 'solo' && net.peers.size > 0) {
         net.sendReliable('evt', { type: 'GAME_OVER', reason: 'wipe' });
       }
+    }
+
+  } else if (type === 'PLAYER_AP') {
+    // Mirror peer's AP onto the remote placeholder so the co-op summary
+    // panel's AP bar actually fills. Without this the placeholder's
+    // `budget` stays at its construction default (0) and the UI shows
+    // a permanently empty bar.
+    if (players.list.length > 1 && players.list[1]._isRemote) {
+      const rp = players.list[1];
+      if (typeof msg.budget === 'number')    rp.budget    = msg.budget;
+      if (typeof msg.maxBudget === 'number') rp.maxBudget = msg.maxBudget;
     }
 
   } else if (type === 'PLAYER_HIT') {
@@ -1251,10 +1264,9 @@ function _broadcastDeckRemove(cardId) {
   if (!_isNetMp() || !cardId) return;
   net.sendReliable('evt', { type: 'DECK_CARD_REMOVED', cardId });
 }
-function _broadcastDeckUpgrade(cardId) {
-  if (!_isNetMp() || !cardId) return;
-  net.sendReliable('evt', { type: 'DECK_CARD_UPGRADED', cardId });
-}
+// Upgrades are per-player — no broadcast. Only the player who picked
+// the upgrade gets the effect on their side. The card collection stays
+// shared (add/remove are synced), but the upgrades map is personal.
 
 // Called whenever a vote arrives or is cast locally. If both votes match the
 // SAME node id, the host computes the room contents (shop cards / event
@@ -2075,7 +2087,8 @@ function startNewRun(explicitSeed) {
   _remoteMapVote = null;
   _prevSyncState = null;
   // Force HP broadcast on first frame of the new run.
-  _lastHpBroadcast = { hp: -1, maxHp: -1, alive: null };
+  _lastHpBroadcast = { hp: -1, maxHp: -1, alive: null, downed: null };
+  _lastApBroadcast = { pip: -1, maxBudget: -1 };
   // Clear any stale disconnect banner from a prior session — otherwise the
   // "REMOTE PLAYER DISCONNECTED" notice can flash on the first battle of a
   // new run if the previous run ended with a disconnect.
@@ -2798,6 +2811,22 @@ function _broadcastLocalHp() {
   });
 }
 
+// Broadcast the local player's AP (budget) so the co-op summary panel's
+// teammate AP bar actually updates. AP regenerates every frame, so send
+// only when the integer pip count or maxBudget changes — that keeps the
+// reliable channel quiet (a few sends per fight, not 60/sec).
+let _lastApBroadcast = { pip: -1, maxBudget: -1 };
+function _broadcastLocalAp() {
+  if (net.role === 'solo' || net.peers.size === 0) return;
+  if (!player) return;
+  const pip = Math.floor(player.budget || 0);
+  const mb = player.maxBudget || 0;
+  if (_lastApBroadcast.pip === pip && _lastApBroadcast.maxBudget === mb) return;
+  _lastApBroadcast.pip = pip;
+  _lastApBroadcast.maxBudget = mb;
+  net.sendReliable('evt', { type: 'PLAYER_AP', budget: pip, maxBudget: mb });
+}
+
 function _syncNetPhase() {
   if (_prevSyncState === gameState) {
     // Defensive: if we're sitting on the map and somehow _localPhaseDone
@@ -2858,6 +2887,7 @@ function update(logicDt, realDt) {
   // itemReward → map correctly fire PHASE_DONE.
   _syncNetPhase();
   _broadcastLocalHp();
+  _broadcastLocalAp();
   // Poll Xbox / standard gamepads each frame so they feed key & mouse state.
   // Per-slot enable comes from MetaProgress (toggled in char select).
   input.pollGamepads({
@@ -3599,8 +3629,9 @@ function update(logicDt, realDt) {
       const cardId = ui.handleUpgradeClick(input.mouse.x, input.mouse.y);
       if (cardId === '__skip') { gameState = 'map'; }
       else if (cardId) {
+        // Per-player upgrade — do NOT broadcast. See DECK_CARD_UPGRADED
+        // comment in net.on('evt') for rationale.
         deckManager.upgradeCard(cardId);
-        _broadcastDeckUpgrade(cardId);
         events.emit('PLAY_SOUND', 'upgrade');
         gameState = 'map';
       }
@@ -6686,7 +6717,7 @@ function render() {
       // Height grows with content
       let panelH = 8;
       if (currentBiome) panelH += 18;
-      if (hasP2) panelH += 22 + 18 + 16; // P2 HP row + P2 AP row + P2 selected card row
+      if (hasP2) panelH += 22 + 18; // P2 HP row + P2 AP row
       if (hasReso) panelH += 18;
       panelH += 4;
       const panelX = 8;
@@ -6748,13 +6779,12 @@ function render() {
         ctx.font = '10px monospace';
         ctx.fillText(p2.budget.toFixed(1) + '/' + mb, apX + mb * (segW + segGap) + 4, yCursor + 12);
         yCursor += 18;
-        // Show P2's currently-selected card so they know what Q will fire
-        const p2CardId = deckManager.hand[selectedCardSlotP2];
-        const p2Def = p2CardId ? deckManager.getCardDef(p2CardId) : null;
-        ctx.fillStyle = '#aaff88';
-        ctx.font = 'bold 10px monospace';
-        ctx.fillText('P2 ▸ ' + (selectedCardSlotP2 + 1) + ' ' + (p2Def ? p2Def.name : '—'), 14, yCursor + 10);
-        yCursor += 16;
+        // NOTE: the "P2 ▸ <card>" line used to live here, but
+        // `selectedCardSlotP2` only tracks the LOCAL 2P-coop partner's
+        // selection, not a remote peer's — so in networked MP it would
+        // display a card the teammate isn't actually holding. The
+        // teammate's HP / AP / downed status above is enough situational
+        // awareness; their card choice is private.
       }
 
       if (hasReso) {
