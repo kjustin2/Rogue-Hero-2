@@ -10,6 +10,7 @@ import { Players } from './src/Players.js';
 import { Player } from './src/player.js';
 import { Enemy } from './src/Enemy.js';
 import { BossHollowKing, BossVaultEngine, BossAurora } from './src/EnemiesRH2.js';
+import { DeckManager } from './src/DeckManager.js';
 
 let total = 0, failed = 0;
 function check(label, cond, detail) {
@@ -124,8 +125,11 @@ group('Players — wipe detection + MP-safe heal');
   check('heal clamps at maxHp', local.hp === 10);
 }
 
-// ─── Team-vote resolution pattern ────────────────────────────────────
-group('Team-vote resolution pattern (rest / event / draft share this)');
+// ─── Rest-node team vote (the ONLY screen that still uses voting) ───
+// Draft / event / shop / upgrade are per-player picks with DECK_CARD_*
+// broadcasts instead; rest stays a vote because the outcome (heal /
+// upgrade / fortify) has to apply uniformly to everyone.
+group('Rest-node team vote resolution');
 {
   function makeVote() {
     let local = null, remote = null, applied = null;
@@ -163,6 +167,42 @@ group('Team-vote resolution pattern (rest / event / draft share this)');
   check('MP mismatched → not resolved', v3.applied === null);
   v3.cast('fortify', true);
   check('MP change-vote → resolves', v3.applied === 'fortify');
+}
+
+// ─── Deck sync: per-player picks mirrored across peers ───────────────
+// With the shared DeckManager, each peer broadcasts add / remove /
+// upgrade so the other side's collection stays consistent without
+// requiring both players to agree on the pick.
+group('DeckManager — peer-mirrored add / remove / upgrade');
+{
+  const host = new DeckManager();
+  const client = new DeckManager();
+  host.initDeck(['strike']);
+  client.initDeck(['strike']);
+
+  // Host "picks" a card (e.g. from draft): local add + broadcast.
+  host.addCard('lunge');
+  // Simulated DECK_CARD_ADDED arrives at client.
+  client.addCard('lunge');
+  check('after DECK_CARD_ADDED, collections match',
+    JSON.stringify(host.collection) === JSON.stringify(client.collection));
+
+  // Duplicate broadcast (both sides picked the same card in a race):
+  // addCard returns false if already present, so no double-add.
+  const hostRet = host.addCard('lunge');
+  check('duplicate addCard is a no-op (race-safe)', hostRet === false);
+
+  // Host "sells" a card via merchant event.
+  host.removeCard('strike');
+  client.removeCard('strike');
+  check('after DECK_CARD_REMOVED, collections match',
+    JSON.stringify(host.collection) === JSON.stringify(client.collection));
+
+  // Upgrades mirror through the upgrades map.
+  host.upgradeCard('lunge');
+  client.upgradeCard('lunge');
+  check('after DECK_CARD_UPGRADED, upgrades match',
+    JSON.stringify(host.upgrades) === JSON.stringify(client.upgrades));
 }
 
 console.log(`\n${failed === 0 ? '✓' : '✗'}  ${total - failed}/${total} checks passed`

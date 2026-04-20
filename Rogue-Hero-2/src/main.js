@@ -491,16 +491,23 @@ net.on('evt', (msg) => {
     _remoteRestVote = msg.action || p.action;
     _checkRestVoteResolution();
 
-  } else if (type === 'EVENT_VOTE') {
-    // Peer picked an event choice (0 / 1 / 2). Same handshake as rest.
-    const v = (msg.idx != null ? msg.idx : p.idx);
-    _remoteEventVote = (typeof v === 'number') ? v : null;
-    _checkEventVoteResolution();
+  } else if (type === 'DECK_CARD_ADDED') {
+    // Peer bought / drafted / shopped a card; mirror on our deck so the
+    // shared collection + hand stay in sync. Purely local add — don't
+    // re-broadcast and don't re-trigger the full-deck discard flow on
+    // the peer (the originator handled that on their own side).
+    const cid = msg.cardId || p.cardId;
+    if (cid && deckManager.collection.length < deckManager.MAX_DECK_SIZE) {
+      deckManager.addCard(cid);
+    }
 
-  } else if (type === 'DRAFT_VOTE') {
-    const v = (msg.idx != null ? msg.idx : p.idx);
-    _remoteDraftVote = (typeof v === 'number') ? v : null;
-    _checkDraftVoteResolution();
+  } else if (type === 'DECK_CARD_REMOVED') {
+    const cid = msg.cardId || p.cardId;
+    if (cid) deckManager.removeCard(cid);
+
+  } else if (type === 'DECK_CARD_UPGRADED') {
+    const cid = msg.cardId || p.cardId;
+    if (cid) deckManager.upgradeCard(cid);
 
   } else if (type === 'PING') {
     // Echo back with the original t so the sender can compute RTT
@@ -909,15 +916,12 @@ let _mapVoteFlash = 0; // brief celebration when the vote completes
 // applied on both sides so players heal/buy/etc. in lock-step. This fixes
 // the bug where the host's "heal" healed both players but the client's
 // "heal" only healed themselves — everyone now votes, outcome is shared.
+// REST is the ONLY screen that uses a team vote — the outcome (heal /
+// upgrade / fortify) needs to apply to every player, so both have to
+// agree. Draft, events, shop, upgrade, itemReward are per-player picks
+// whose results are synced via DECK_* broadcasts below instead.
 let _localRestVote = null;   // 'heal' | 'upgrade' | 'fortify'
 let _remoteRestVote = null;
-let _localEventVote = null;  // 0 | 1 | 2
-let _remoteEventVote = null;
-// DRAFT_VOTE — both players pick the same card from the draft choices.
-// Without this, each side can independently add a (different) card to the
-// shared deck, producing a divergent collection.
-let _localDraftVote = null;  // 0 | 1 | 2
-let _remoteDraftVote = null;
 // Floor-name banner: animated chapter break on floor advance.
 let _floorBanner = null; // { floor, name, t0 }
 // Queues the banner so it fires when the map state is entered, not at the
@@ -1235,58 +1239,21 @@ function _applyRestAction(action) {
   }
 }
 
-// Event-choice voting. Same handshake as rest but the payload is the
-// 0/1/2 button index. `handleEvent(idx)` already applies the effect
-// locally (and calls healAllPlayers for the heal branches), so we just
-// invoke it on both sides once the votes match.
-function _castEventVote(idx) {
-  _localEventVote = idx;
-  if (_isNetMp()) {
-    net.sendReliable('evt', { type: 'EVENT_VOTE', idx });
-  }
-  _checkEventVoteResolution();
+// Deck-sync broadcasts. Draft / event / shop / upgrade screens are
+// per-player picks, but the deckManager is a SHARED collection across
+// both players, so any local mutation has to be mirrored on the peer
+// so their hand / prep screen / shop display match reality.
+function _broadcastDeckAdd(cardId) {
+  if (!_isNetMp() || !cardId) return;
+  net.sendReliable('evt', { type: 'DECK_CARD_ADDED', cardId });
 }
-function _checkEventVoteResolution() {
-  if (!_isNetMp()) {
-    if (_localEventVote != null) {
-      const i = _localEventVote;
-      _localEventVote = null;
-      handleEvent(i);
-    }
-    return;
-  }
-  if (_localEventVote == null || _remoteEventVote == null) return;
-  if (_localEventVote !== _remoteEventVote) return;
-  const i = _localEventVote;
-  _localEventVote = null; _remoteEventVote = null;
-  handleEvent(i);
+function _broadcastDeckRemove(cardId) {
+  if (!_isNetMp() || !cardId) return;
+  net.sendReliable('evt', { type: 'DECK_CARD_REMOVED', cardId });
 }
-
-// Draft-pick voting. Both sides already generated identical draftChoices
-// via seeded RNG; this vote ensures both sides add the SAME card to the
-// shared deck. Without it, two simultaneous clicks each add a different
-// card and the collection diverges.
-function _castDraftVote(idx) {
-  _localDraftVote = idx;
-  if (_isNetMp()) {
-    net.sendReliable('evt', { type: 'DRAFT_VOTE', idx });
-  }
-  _checkDraftVoteResolution();
-}
-function _checkDraftVoteResolution() {
-  if (!_isNetMp()) {
-    if (_localDraftVote != null) {
-      const i = _localDraftVote;
-      _localDraftVote = null;
-      pickDraft(i);
-    }
-    return;
-  }
-  if (_localDraftVote == null || _remoteDraftVote == null) return;
-  if (_localDraftVote !== _remoteDraftVote) return;
-  const i = _localDraftVote;
-  _localDraftVote = null; _remoteDraftVote = null;
-  pickDraft(i);
+function _broadcastDeckUpgrade(cardId) {
+  if (!_isNetMp() || !cardId) return;
+  net.sendReliable('evt', { type: 'DECK_CARD_UPGRADED', cardId });
 }
 
 // Called whenever a vote arrives or is cast locally. If both votes match the
@@ -2405,6 +2372,8 @@ function tryAddCard(cardId, onSuccess) {
     window._discardCallback = onSuccess;
     return false;
   }
+  // Mirror the add to the peer so their deckManager stays consistent.
+  _broadcastDeckAdd(cardId);
   if (onSuccess) onSuccess();
   return true;
 }
@@ -2693,13 +2662,17 @@ function _fireChannelTick(ch, dmgMult) {
 }
 
 function handleEvent(choiceIdx) {
+  // Events are per-player picks. HP changes apply to the caller only and
+  // propagate via PLAYER_HP broadcast. Shared-deck mutations are mirrored
+  // via DECK_CARD_* events. Relics are per-player, no sync needed.
   if (currentEventType === 'merchant') {
     switch (choiceIdx) {
       case 0: // Sell oldest card for +3 HP
         if (deckManager.collection.length > 1) {
           const sold = deckManager.collection[0];
           deckManager.removeCard(sold);
-          healAllPlayers(3);
+          _broadcastDeckRemove(sold);
+          player.heal(3);
           particles.spawnDamageNumber(player.x || 640, 300, `Sold "${CardDefinitions[sold]?.name || sold}" +3 HP`);
           events.emit('PLAY_SOUND', 'upgrade');
         }
@@ -2725,7 +2698,7 @@ function handleEvent(choiceIdx) {
         if (upgradeChoices.length > 0) { gameState = 'upgrade'; return; }
         break;
       case 1: // Forge warmth — heal 1 HP
-        healAllPlayers(1);
+        player.heal(1);
         break;
       case 2: break; // pass
     }
@@ -2745,10 +2718,13 @@ function handleEvent(choiceIdx) {
         }
         break;
       case 1: // Heal 2 HP
-        healAllPlayers(2);
+        player.heal(2);
         break;
-      case 2: // Gamble (BUG-06: seeded RNG)
-        if (runManager.getRng()() < 0.5) { healAllPlayers(2); }
+      case 2: // Gamble — picker-only outcome.
+        // NOTE: uses Math.random here instead of the seeded RNG because
+        // only the picker rolls; consuming seeded RNG would desync the
+        // peer's stream (they never roll this value on their side).
+        if (Math.random() < 0.5) { player.heal(2); }
         else { player.hp = Math.max(1, player.hp - 1); }
         break;
     }
@@ -2867,19 +2843,11 @@ function _syncNetPhase() {
       _pendingFloorBanner = 0;
     }
   }
-  // Entering rest / event clears the prior round's vote so stale votes
-  // from a previous node can't auto-resolve the new screen.
+  // Entering rest clears the prior round's vote so a stale vote from a
+  // previous rest node can't auto-resolve the new screen.
   if (gameState === 'rest' && _prevSyncState !== 'rest') {
     _localRestVote = null;
     _remoteRestVote = null;
-  }
-  if (gameState === 'event' && _prevSyncState !== 'event') {
-    _localEventVote = null;
-    _remoteEventVote = null;
-  }
-  if (gameState === 'draft' && _prevSyncState !== 'draft') {
-    _localDraftVote = null;
-    _remoteDraftVote = null;
   }
   _prevSyncState = gameState;
 }
@@ -3529,11 +3497,11 @@ function update(logicDt, realDt) {
   if (gameState === 'event') {
     if (input.consumeKey('escape')) { gameState = 'map'; input.clearFrame(); return; }
     for (let i = 0; i < 3; i++) {
-      if (input.consumeKey((i + 1).toString())) { _castEventVote(i); break; }
+      if (input.consumeKey((i + 1).toString())) { handleEvent(i); break; }
     }
     if (input.consumeClick()) {
       const idx = ui.handleEventClick(input.mouse.x, input.mouse.y);
-      if (idx >= 0) _castEventVote(idx);
+      if (idx >= 0) handleEvent(idx);
     }
     input.clearFrame();
     return;
@@ -3560,6 +3528,7 @@ function update(logicDt, realDt) {
         } else {
           shopCards = shopCards.filter(c => c !== cardId);
           events.emit('PLAY_SOUND', 'itemPickup');
+          _broadcastDeckAdd(cardId);
         }
       }
     }
@@ -3573,6 +3542,7 @@ function update(logicDt, realDt) {
       const discardId = ui.handleDiscardClick(input.mouse.x, input.mouse.y);
       if (discardId && discardPendingCardId) {
         deckManager.removeCard(discardId);
+        _broadcastDeckRemove(discardId);
         events.emit('PLAY_SOUND', 'itemPickup');
         if (discardPendingCardId === '__BURN__') {
           // Rest node burn: just remove, don't add a replacement
@@ -3581,6 +3551,7 @@ function update(logicDt, realDt) {
           gameState = 'map';
         } else {
           deckManager.addCard(discardPendingCardId);
+          _broadcastDeckAdd(discardPendingCardId);
           shopCards = shopCards.filter(c => c !== discardPendingCardId); // BUG-08: remove from shop after discard
           console.log(`[Deck] Discarded "${discardId}", added "${discardPendingCardId}"`);
           if (window._discardCallback) {
@@ -3629,6 +3600,7 @@ function update(logicDt, realDt) {
       if (cardId === '__skip') { gameState = 'map'; }
       else if (cardId) {
         deckManager.upgradeCard(cardId);
+        _broadcastDeckUpgrade(cardId);
         events.emit('PLAY_SOUND', 'upgrade');
         gameState = 'map';
       }
@@ -3640,11 +3612,11 @@ function update(logicDt, realDt) {
   // ── DRAFT ──
   if (gameState === 'draft') {
     for (let i = 0; i < draftChoices.length; i++) {
-      if (input.consumeKey((i + 1).toString())) { _castDraftVote(i); break; }
+      if (input.consumeKey((i + 1).toString())) { pickDraft(i); break; }
     }
     if (input.consumeClick()) {
       const idx = getDraftClickIndex(input.mouse.x, input.mouse.y);
-      if (idx >= 0) _castDraftVote(idx);
+      if (idx >= 0) pickDraft(idx);
     }
     _draftRevealTimer += realDt;
     input.clearFrame();
@@ -6408,22 +6380,6 @@ function render() {
   // ── EVENT ──
   if (gameState === 'event') {
     ui.drawEventScreen(renderer.ctx, currentEventType);
-    if (_isNetMp()) {
-      const ctx = renderer.ctx;
-      let msg = '';
-      if (_localEventVote != null && _remoteEventVote == null) msg = `Voted option ${_localEventVote + 1} — waiting for teammate…`;
-      else if (_localEventVote == null && _remoteEventVote != null) msg = `Teammate voted option ${_remoteEventVote + 1} — cast your vote`;
-      else if (_localEventVote != null && _remoteEventVote != null && _localEventVote !== _remoteEventVote) msg = `Votes differ (you: ${_localEventVote + 1}, teammate: ${_remoteEventVote + 1})`;
-      else if (_localEventVote == null && _remoteEventVote == null) msg = 'Team vote: pick together (1 / 2 / 3)';
-      if (msg) {
-        ctx.save();
-        ctx.fillStyle = '#ffcc66';
-        ctx.font = 'bold 14px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(msg, canvas.width / 2, canvas.height - 60);
-        ctx.restore();
-      }
-    }
     return;
   }
 
@@ -6948,7 +6904,6 @@ function render() {
     drawPauseMenu();
   } else if (gameState === 'draft') {
     drawDraftScreen();
-    _drawDraftVoteBanner();
   } else if (gameState === 'prep') {
     ui.drawPrepScreen(renderer.ctx);
     // Remote MP: show a READY-UP banner with both players' status. Combat
@@ -7424,23 +7379,6 @@ function _easeOutBack(t) {
   return 1+c3*Math.pow(t-1,3)+c1*Math.pow(t-1,2);
 }
 
-// Small banner surface for draft — "waiting for teammate" / "votes differ"
-// so players know why their click didn't immediately add the card.
-function _drawDraftVoteBanner() {
-  if (!_isNetMp()) return;
-  const ctx = renderer.ctx;
-  let msg = '';
-  if (_localDraftVote != null && _remoteDraftVote == null) msg = `Voted card ${_localDraftVote + 1} — waiting for teammate…`;
-  else if (_localDraftVote == null && _remoteDraftVote != null) msg = `Teammate voted card ${_remoteDraftVote + 1} — cast your vote`;
-  else if (_localDraftVote != null && _remoteDraftVote != null && _localDraftVote !== _remoteDraftVote) msg = `Votes differ (you: ${_localDraftVote + 1}, teammate: ${_remoteDraftVote + 1})`;
-  else msg = 'Team vote: pick the same card';
-  ctx.save();
-  ctx.fillStyle = '#ffcc66';
-  ctx.font = 'bold 14px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(msg, canvas.width / 2, canvas.height - 40);
-  ctx.restore();
-}
 
 function renderLootBoxOpen(ctx, t) {
   const lb = lootBoxOpen;

@@ -38,6 +38,7 @@ import { Players } from './src/Players.js';
 import { Player } from './src/player.js';
 import { Enemy } from './src/Enemy.js';
 import { BossHollowKing, BossVaultEngine, BossAurora } from './src/EnemiesRH2.js';
+import { DeckManager } from './src/DeckManager.js';
 
 const out = document.getElementById('out');
 let total = 0, passed = 0;
@@ -280,9 +281,12 @@ group('RunManager — generateMap on both sides produces identical node graph');
 }
 
 // ─────────────────────────────────────────────────────────────────
-// 7. Team-vote resolution logic (rest / event / draft share the pattern)
+// 7. Rest-node team vote (the ONLY screen that still uses voting)
 // ─────────────────────────────────────────────────────────────────
-group('Team-vote logic — both must agree, solo fallback resolves locally');
+// Draft / event / shop / upgrade are per-player picks; rest stays a
+// vote because its outcome (heal / upgrade / fortify) applies to
+// every player at once.
+group('Rest-node team vote — both must agree, solo resolves locally');
 {
   // Replicate the resolver shape from main.js (_checkRestVoteResolution etc.)
   function makeVote() {
@@ -385,6 +389,36 @@ group('Heal only local players — remote placeholders are not mutated');
   local.hp = 10;
   healAll(3);
   check('full-HP local player: heal() is clamped (still 10)', local.hp === 10);
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 9. Deck sync — per-player picks mirrored via DECK_CARD_* events
+// ─────────────────────────────────────────────────────────────────
+group('DeckManager — host & client stay consistent when each picks independently');
+{
+  const host = new DeckManager();
+  const client = new DeckManager();
+  host.initDeck(['strike']);
+  client.initDeck(['strike']);
+
+  host.addCard('lunge');                // local add on host
+  client.addCard('lunge');              // simulated DECK_CARD_ADDED mirror
+  check('addCard + mirror → collections match',
+    JSON.stringify(host.collection) === JSON.stringify(client.collection));
+
+  // Duplicate broadcast (race): addCard is a no-op when already present.
+  check('duplicate addCard → false (race-safe)',
+    host.addCard('lunge') === false);
+
+  host.removeCard('strike');
+  client.removeCard('strike');
+  check('removeCard + mirror → collections match',
+    JSON.stringify(host.collection) === JSON.stringify(client.collection));
+
+  host.upgradeCard('lunge');
+  client.upgradeCard('lunge');
+  check('upgradeCard + mirror → upgrades match',
+    JSON.stringify(host.upgrades) === JSON.stringify(client.upgrades));
 }
 
 // ─────────────────────────────────────────────────────────────────
