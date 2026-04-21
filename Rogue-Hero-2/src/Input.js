@@ -179,6 +179,9 @@ export class InputManager {
     const enabledP1 = !opts || opts.enabledP1 !== false; // default on for backward compat
     const enabledP2 = !!(opts && opts.enabledP2);
     const localCoop = !!(opts && opts.localCoop);
+    // In menu mode, B button → escape (back) instead of dodge. Gameplay
+    // leaves B mapped to dodge since that's the combat expectation.
+    const inMenu = !!(opts && opts.inMenu);
     if (!this._gpState) this._gpState = [null, null, null, null];
     const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
     for (let i = 0; i < 4; i++) {
@@ -221,6 +224,10 @@ export class InputManager {
         if (btns[9] && !prevBtns[9]) this.justPressed.add('enter');
         // Back/Select always escapes
         if (btns[8] && !prevBtns[8]) this.justPressed.add('escape');
+        // In menus, B (btn 1) acts as back so players don't have to hunt for
+        // the tiny Select/Back button on Xbox pads. Suppress the dodge-space
+        // emit below since we're not in gameplay.
+        if (inMenu && btns[1] && !prevBtns[1]) this.justPressed.add('escape');
       }
 
       // Everything else (movement, dodge, card slot keys, in-game P2 fire)
@@ -247,9 +254,9 @@ export class InputManager {
       if (!isP1 && fireKey) {
         if (btns[0] && !prevBtns[0]) this.justPressed.add(fireKey);
       }
-      // B button (idx 1): dodge. Escape lives on the Back button so combat
-      // dodge doesn't accidentally pause.
-      if (btns[1] && !prevBtns[1]) {
+      // B button (idx 1): dodge. In menus the always-on block above remaps B
+      // to 'escape', so skip the dodge emit here to avoid double-firing it.
+      if (btns[1] && !prevBtns[1] && !(isP1 && inMenu)) {
         this.justPressed.add(dodgeKey);
       }
       // X (idx 2): cycle PREVIOUS card slot (right-click on P1; key on P2).

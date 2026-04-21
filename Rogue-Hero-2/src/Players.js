@@ -20,9 +20,13 @@ export class Players {
 
   add(player, opts = {}) {
     if (this.list.length >= this.maxCount) return false;
-    player.playerIndex = this.list.length;
-    player.haloColor   = opts.haloColor || PLAYER_HALO_COLORS[player.playerIndex];
-    player.netRole     = opts.netRole || 'local';
+    // Preserve a caller-assigned playerIndex (3–4 player co-op needs stable
+    // host-assigned indices, not just insertion order). Only fill in a new
+    // index when the caller didn't specify one.
+    if (typeof player.playerIndex !== 'number') player.playerIndex = this.list.length;
+    player.haloColor   = opts.haloColor || player.haloColor ||
+                         PLAYER_HALO_COLORS[player.playerIndex % PLAYER_HALO_COLORS.length];
+    player.netRole     = opts.netRole || player.netRole || 'local';
     player.downed      = false;
     player.downedTimer = 0;
     player.reviveProgress = 0;

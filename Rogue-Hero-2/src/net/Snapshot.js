@@ -142,6 +142,10 @@ export class SnapshotDecoder {
   constructor() {
     this.positions = new Map();   // id → { x, y, flags, ts }
     this._lastFrame = -1;
+    // Per-sender frame counters so a 3–4 player mesh doesn't reject peer B's
+    // snapshot because peer A's counter happens to be higher. Each peerId
+    // gets its own monotonically-increasing baseline.
+    this._lastFrameByPeer = new Map();
   }
 
   // Clear stale entries — call on room transitions so reused enemy IDs
@@ -151,11 +155,15 @@ export class SnapshotDecoder {
   reset() {
     this.positions.clear();
     this._lastFrame = -1;
+    this._lastFrameByPeer.clear();
   }
 
-  apply(snapshot) {
+  apply(snapshot, peerId) {
     if (snapshot.t === SNAP_TYPES.POS) {
-      if (snapshot.n <= this._lastFrame) return; // stale
+      const key = peerId || '__default';
+      const last = this._lastFrameByPeer.get(key) ?? -1;
+      if (snapshot.n <= last) return; // stale from this sender
+      this._lastFrameByPeer.set(key, snapshot.n);
       this._lastFrame = snapshot.n;
       const ts = performance.now();
       for (const e of snapshot.e) {
@@ -168,14 +176,17 @@ export class SnapshotDecoder {
   // Returns true if the buffer was a recognized binary snapshot (and was
   // applied). Returns false if it doesn't match the magic byte — caller can
   // then fall back to JSON parse.
-  applyBinary(arrayBuffer) {
+  applyBinary(arrayBuffer, peerId) {
     if (!arrayBuffer || arrayBuffer.byteLength < 7) return false;
     const dv = new DataView(arrayBuffer);
     if (dv.getUint8(0) !== SNAP_MAGIC) return false;
     const type = dv.getUint8(1);
     if (type !== SNAP_TYPES.POS && type !== SNAP_TYPES.FULL) return false;
     const frame = dv.getUint32(2, true);
-    if (type === SNAP_TYPES.POS && frame <= this._lastFrame) return true; // stale, ack-consumed
+    const key = peerId || '__default';
+    const last = this._lastFrameByPeer.get(key) ?? -1;
+    if (type === SNAP_TYPES.POS && frame <= last) return true; // stale from this sender
+    this._lastFrameByPeer.set(key, frame);
     this._lastFrame = frame;
     const n = dv.getUint8(6);
     const ts = performance.now();

@@ -172,16 +172,17 @@ const snapDecoder = new SnapshotDecoder();
 const reconcile = new Reconcile();
 // Apply incoming position snapshots to the player & remote-entity placeholders.
 // Solo: never fires (Net.connect is no-op).
-net.on('snap', (snap) => {
+net.on('snap', (snap, senderPeerId) => {
   // Co-op model: each side is authoritative for its OWN player position.
   // Snap arrives at 15Hz — we ONLY store positions here. The actual smooth
   // movement happens every frame in the main update loop so a 60fps client
   // doesn't visibly stutter to 15fps.
-  // Accept binary (ArrayBuffer) or JSON-decoded object.
+  // Accept binary (ArrayBuffer) or JSON-decoded object. The peerId is passed
+  // to the decoder so 3–4 player mesh traffic doesn't cross-reject frames.
   if (snap instanceof ArrayBuffer) {
-    if (!snapDecoder.applyBinary(snap)) return;
+    if (!snapDecoder.applyBinary(snap, senderPeerId)) return;
   } else if (snap && snap.e) {
-    snapDecoder.apply(snap);
+    snapDecoder.apply(snap, senderPeerId);
   } else {
     return;
   }
@@ -213,6 +214,11 @@ net.on('peer', (msg) => {
   if (msg.kind === 'join') {
     if (net.role === 'host') {
       _lobbyPeers.push({ peerId: msg.peerId, name: 'Player ' + (net.peers.size + 1) });
+      // Assign this peer a slot (1, 2, or 3) and broadcast the full map so
+      // every peer agrees on who is whom. This is what unlocks 3–4 player
+      // routing for CHAR_SELECTED / PLAYER_HP / PLAYER_DOWNED / etc.
+      _hostAssignPeerIndex(msg.peerId);
+      _hostBroadcastPeerIndices();
       if (gameState === 'lobby') lobbyStatusMsg = `Player connected! ${net.peers.size} peer(s) in room`;
     } else if (net.role === 'client' && gameState === 'lobby') {
       lobbyMode = 'connected';
@@ -220,20 +226,41 @@ net.on('peer', (msg) => {
     }
   } else if (msg.kind === 'leave') {
     _lobbyPeers = _lobbyPeers.filter(p => p.peerId !== msg.peerId);
+    // Forget the departed peer's index/charId/ready so a later rejoin
+    // doesn't inherit stale state.
+    _peerToIndex.delete(msg.peerId);
+    _remoteCharIds.delete(msg.peerId);
+    _remoteReadyByPeer.delete(msg.peerId);
+    if (net.role === 'host') _hostBroadcastPeerIndices();
     const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard'].includes(gameState);
     if (inRun) {
       _remoteDisconnected = true;
       _remoteDisconnectTimer = 12; // long enough for the user to actually read it
-      players.list = players.list.filter(p => !p._isRemote);
-      // Switch local player out of co-op mode so they can die normally now (no reviver)
-      if (player) player._coopMode = false;
-      // If client just lost host, they become authoritative for room-clear etc.
-      if (net.role === 'client') net.role = 'solo';
-      // Drop any wait-for-peer gates so the remaining player can advance the map
-      _remotePhaseDone = true;
-      _localPhaseDone = true;
-      _prepReadyLocal = true;
-      _prepReadyRemote = true;
+      // 3–4P: only prune the specific peer that left. If no remote allies
+      // remain, fall back to solo gameplay just like the 2P case did.
+      players.list = players.list.filter(p => p._remotePeerId !== msg.peerId);
+      // Drop stale per-peer state specifically for the departed peer.
+      _remotePhaseDoneByPeer.delete(msg.peerId);
+      _prepReadyByPeer.delete(msg.peerId);
+      _remoteMapVoteByPeer.delete(msg.peerId);
+      _remoteRestVoteByPeer.delete(msg.peerId);
+      const remotesLeft = players.list.some(p => p._isRemote);
+      if (!remotesLeft) {
+        if (player) player._coopMode = false;
+        if (net.role === 'client') net.role = 'solo';
+        _remotePhaseDone = true;
+        _localPhaseDone = true;
+        _prepReadyLocal = true;
+        _prepReadyRemote = true;
+        _remotePhaseDoneByPeer.clear();
+        _prepReadyByPeer.clear();
+        _remoteMapVoteByPeer.clear();
+        _remoteRestVoteByPeer.clear();
+      } else {
+        // With other allies still connected, just recompute aggregates so
+        // gates open correctly if the departed peer was the last holdout.
+        _recomputeRemoteAggregates();
+      }
       // Audio cue + screen shake so the disconnect is impossible to miss
       events.emit('PLAY_SOUND', 'crash');
       events.emit('SCREEN_SHAKE', { duration: 0.5, intensity: 0.6 });
@@ -274,31 +301,49 @@ net.sendReliable = (channel, payload) => {
   return _origSendReliable(channel, payload);
 };
 
-net.on('evt', (msg) => {
+net.on('evt', (msg, senderPeerId) => {
   if (!msg) return;
   const type = msg.type || msg.name;
   if (!type) return;
   _logNetEvent('in', type);
   const p = msg.p ?? msg; // HostSim wraps extra data in .p; direct events are flat
 
-  if (type === 'CHAR_SELECTED') {
+  if (type === 'PEER_INDEX_ASSIGN') {
+    // Host is authoritative for the peer→index mapping. Rebuild the local
+    // map from the broadcast and figure out our own slot so UI labels and
+    // placeholders use the right indices for 3–4 player setups.
+    _peerToIndex.clear();
+    const indices = msg.indices || p.indices || {};
+    for (const k in indices) _peerToIndex.set(k, indices[k]);
+    if (net.role === 'client') {
+      const myIdx = _peerToIndex.get(net.localPeerId);
+      if (typeof myIdx === 'number') _myPlayerIndex = myIdx;
+    }
+
+  } else if (type === 'CHAR_SELECTED') {
     const newCharId = p.charId || msg.charId;
-    // If the peer switched to a different character after having marked
-    // themselves READY, clear their ready flag — the READY was for the
-    // OLD char. Forces them (and the UI) to re-confirm the new pick.
-    if (_remoteCharId && newCharId && newCharId !== _remoteCharId && _remoteReady) {
-      _remoteReady = false;
+    const prev = _remoteCharIds.get(senderPeerId);
+    // Peer changed characters after readying → clear their ready flag so
+    // they have to re-confirm on the new pick.
+    if (prev && newCharId && newCharId !== prev && _remoteReadyByPeer.get(senderPeerId)) {
+      _remoteReadyByPeer.set(senderPeerId, false);
     }
-    _remoteCharId = newCharId;
-    // Update placeholder charId if it already exists
-    if (players.list.length > 1 && players.list[1]._isRemote) {
-      players.list[1].charId = _remoteCharId;
-    }
+    _remoteCharIds.set(senderPeerId, newCharId);
+    _remoteCharId = newCharId; // legacy alias — most UI still reads this
+    // Aggregate: any remote still ready? (used by legacy 2-player paths)
+    let anyReady = false;
+    for (const [, r] of _remoteReadyByPeer) if (r) { anyReady = true; break; }
+    _remoteReady = anyReady;
+    // Update the specific placeholder's charId if it's already been built.
+    const slot = _remotePlayerFor(senderPeerId);
+    if (slot) slot.charId = newCharId;
 
   } else if (type === 'PLAYER_READY') {
     if (net.role === 'host') {
+      _remoteReadyByPeer.set(senderPeerId, true);
+      const cid = p.charId || msg.charId;
+      if (cid) { _remoteCharIds.set(senderPeerId, cid); _remoteCharId = cid; }
       _remoteReady = true;
-      _remoteCharId = p.charId || msg.charId || _remoteCharId;
     }
 
   } else if (type === 'START_LOBBY') {
@@ -331,6 +376,7 @@ net.on('evt', (msg) => {
     // Clear map-vote state — the node has been resolved.
     _localMapVote = null;
     _remoteMapVote = null;
+    _remoteMapVoteByPeer.clear();
     if (nodeType === 'rest') {
       restChoiceBoxes = [];
       gameState = 'rest';
@@ -447,11 +493,13 @@ net.on('evt', (msg) => {
     }
 
   } else if (type === 'PLAYER_DOWNED') {
-    // Mark the remote placeholder as downed so local revive logic + UI work
-    if (players.list.length > 1 && players.list[1]._isRemote) {
-      players.list[1].downed = true;
-      players.list[1].hp = 0;
-      players.list[1].reviveProgress = 0;
+    // Mark the remote placeholder as downed so local revive logic + UI work.
+    // Route to the sender's slot so 3–4 player games mark the RIGHT ally.
+    const rp = _remotePlayerFor(senderPeerId);
+    if (rp) {
+      rp.downed = true;
+      rp.hp = 0;
+      rp.reviveProgress = 0;
     }
     // Belt-and-suspenders: if this event plus our current state means
     // everyone is down, trigger the wipe immediately instead of waiting
@@ -473,43 +521,32 @@ net.on('evt', (msg) => {
     }
 
   } else if (type === 'PLAYER_REVIVED') {
-    if (players.list.length > 1 && players.list[1]._isRemote) {
-      players.list[1].downed = false;
-      players.list[1].reviveProgress = 0;
-      players.list[1].hp = Math.max(1, Math.round(players.list[1].maxHp * 0.3));
+    const rp = _remotePlayerFor(senderPeerId);
+    if (rp) {
+      rp.downed = false;
+      rp.reviveProgress = 0;
+      rp.hp = Math.max(1, Math.round(rp.maxHp * 0.3));
     }
 
   } else if (type === 'MAP_VOTE') {
-    // Peer voted on a map node. Store; if both votes match, host triggers
-    // MAP_NODE_CHOSEN to actually advance both clients.
-    _remoteMapVote = msg.nodeId || p.nodeId;
+    // Peer voted on a map node. Track per-peer so 3–4P doesn't short-circuit
+    // on the first vote that arrives.
+    const vote = msg.nodeId || p.nodeId;
+    if (senderPeerId) _remoteMapVoteByPeer.set(senderPeerId, vote);
+    _remoteMapVote = vote; // legacy singleton for 2P-style readers
     _checkMapVoteResolution();
 
   } else if (type === 'REST_VOTE') {
-    // Peer picked a rest action. Store; if both match, resolve locally on
-    // this side too so the outcome applies to both players.
-    _remoteRestVote = msg.action || p.action;
+    const act = msg.action || p.action;
+    if (senderPeerId) _remoteRestVoteByPeer.set(senderPeerId, act);
+    _remoteRestVote = act;
     _checkRestVoteResolution();
 
-  } else if (type === 'DECK_CARD_ADDED') {
-    // Peer bought / drafted / shopped a card; mirror on our deck so the
-    // shared collection + hand stay in sync. Purely local add — don't
-    // re-broadcast and don't re-trigger the full-deck discard flow on
-    // the peer (the originator handled that on their own side).
-    const cid = msg.cardId || p.cardId;
-    if (cid && deckManager.collection.length < deckManager.MAX_DECK_SIZE) {
-      deckManager.addCard(cid);
-    }
-
-  } else if (type === 'DECK_CARD_REMOVED') {
-    const cid = msg.cardId || p.cardId;
-    if (cid) deckManager.removeCard(cid);
-
-  // NOTE: DECK_CARD_UPGRADED is intentionally NOT received. Upgrades are
-  // a per-player effect — only the player who chose to spend the
-  // upgrade should benefit. The shared `deckManager.upgrades` map
-  // therefore diverges between peers by design, even though the
-  // `collection` stays in sync via DECK_CARD_ADDED/REMOVED.
+  } else if (type === 'DECK_CARD_ADDED' || type === 'DECK_CARD_REMOVED') {
+    // Decks are PER-PLAYER. A peer's draft / shop / discard choice must not
+    // mutate our local deck — they pick independently from the same offered
+    // cards (draft is RNG-seeded so both sides see the same 3 options, but
+    // each player keeps the one they chose). Ignore the broadcast.
 
   } else if (type === 'PING') {
     // Echo back with the original t so the sender can compute RTT
@@ -520,14 +557,17 @@ net.on('evt', (msg) => {
     if (typeof t === 'number') _pushRtt(performance.now() - t);
 
   } else if (type === 'PHASE_DONE') {
-    // Peer finished their post-combat decision phase — host can now advance the map
-    _remotePhaseDone = true;
+    // Peer finished their post-combat decision phase. In 3–4P the map only
+    // advances once EVERY peer has reported done (aggregated below).
+    if (senderPeerId) _remotePhaseDoneByPeer.set(senderPeerId, true);
+    _recomputeRemoteAggregates();
 
   } else if (type === 'PREP_READY') {
-    // Peer hit READY. We mark them ready unconditionally — the actual battle
-    // start fires whenever BOTH flags are true AND host is in prep.
-    _prepReadyRemote = true;
-    if (net.role === 'host' && _prepReadyLocal && gameState === 'prep') {
+    // Peer hit READY. Track per-peer so 3–4P waits for all clients; combat
+    // only starts when _prepReadyLocal + every remote ready flag is true.
+    if (senderPeerId) _prepReadyByPeer.set(senderPeerId, true);
+    _recomputeRemoteAggregates();
+    if (net.role === 'host' && _prepReadyLocal && _prepReadyRemote && gameState === 'prep') {
       net.sendReliable('evt', { type: 'BATTLE_START' });
       _startCombatNow();
     }
@@ -703,14 +743,16 @@ net.on('evt', (msg) => {
     // the map / stats UI shows the other player's true HP after heals,
     // damage, rests, shops, and events. Without this, each side only
     // knew its own HP and the ally card on the map drifted.
-    if (players.list.length > 1 && players.list[1]._isRemote) {
-      const rp = players.list[1];
-      if (typeof msg.hp === 'number')    rp.hp    = msg.hp;
-      if (typeof msg.maxHp === 'number') rp.maxHp = msg.maxHp;
-      if (typeof msg.alive === 'boolean') rp.alive = msg.alive;
-      // `downed` piggybacks on PLAYER_HP so we don't depend on the
-      // discrete PLAYER_DOWNED event racing with a simultaneous wipe.
-      if (typeof msg.downed === 'boolean') rp.downed = msg.downed;
+    {
+      const rp = _remotePlayerFor(senderPeerId);
+      if (rp) {
+        if (typeof msg.hp === 'number')    rp.hp    = msg.hp;
+        if (typeof msg.maxHp === 'number') rp.maxHp = msg.maxHp;
+        if (typeof msg.alive === 'boolean') rp.alive = msg.alive;
+        // `downed` piggybacks on PLAYER_HP so we don't depend on the
+        // discrete PLAYER_DOWNED event racing with a simultaneous wipe.
+        if (typeof msg.downed === 'boolean') rp.downed = msg.downed;
+      }
     }
     // Re-check wipe condition — the placeholder's flags just changed and
     // we may now satisfy allDownedOrDead after being one-flag-short.
@@ -732,10 +774,12 @@ net.on('evt', (msg) => {
     // panel's AP bar actually fills. Without this the placeholder's
     // `budget` stays at its construction default (0) and the UI shows
     // a permanently empty bar.
-    if (players.list.length > 1 && players.list[1]._isRemote) {
-      const rp = players.list[1];
-      if (typeof msg.budget === 'number')    rp.budget    = msg.budget;
-      if (typeof msg.maxBudget === 'number') rp.maxBudget = msg.maxBudget;
+    {
+      const rp = _remotePlayerFor(senderPeerId);
+      if (rp) {
+        if (typeof msg.budget === 'number')    rp.budget    = msg.budget;
+        if (typeof msg.maxBudget === 'number') rp.maxBudget = msg.maxBudget;
+      }
     }
 
   } else if (type === 'PLAYER_HIT') {
@@ -790,7 +834,7 @@ net.on('evt', (msg) => {
     const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard','upgrade','paused','victory'].includes(gameState);
     try { net.disconnect(); } catch {}
     net.role = 'solo';
-    _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+    _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
     _remoteDisconnected = true;
     _remoteDisconnectTimer = 12;
     players.list = players.list.filter(p => !p._isRemote);
@@ -890,8 +934,12 @@ let lobbyMode = 'menu';          // 'menu' | 'hosting' | 'joining'
 let lobbyJoinCode = '';          // text being typed for join
 let lobbyStatusMsg = '';         // bottom-line status text
 let lobbyBoxes = [];
-let _remoteCharId = null;        // remote peer's selected character (for placeholder rendering)
-let _remoteReady = false;        // host: remote client has clicked READY in charSelect
+let _remoteCharId = null;        // legacy single-remote alias (points at first remote's charId)
+let _remoteCharIds = new Map();  // peerId → charId for every remote peer (3-4 player support)
+let _peerToIndex = new Map();    // peerId → playerIndex assigned by host (host = 0)
+let _myPlayerIndex = 0;          // this peer's assigned slot — host stays 0, clients 1..3
+let _remoteReady = false;        // legacy: "any remote ready" aggregate (kept for UI)
+let _remoteReadyByPeer = new Map(); // peerId → boolean ready flag
 let _clientReady = false;        // client: local player has clicked READY in charSelect
 let _remoteDisconnected = false; // in-game: remote peer disconnected mid-run
 let _remoteDisconnectTimer = 0;  // seconds until banner auto-hides
@@ -903,26 +951,49 @@ let _hsDisconnectReason = ''; // short human label ("left session" / "lost conne
 let _hsDisconnectBoxes = [];  // modal OK button hit region
 let _charSelectQuitConfirm = false; // MP: second click on Main Menu actually leaves
 let _lobbyPeers = [];            // host: [{ peerId, name }] peers currently in lobby
-// PHASE_DONE handshake — gate map advance until both players have finished
+// PHASE_DONE handshake — gate map advance until EVERY player has finished
 // the post-combat decision phase (draft / itemReward / shop / rest / event).
+// `_remotePhaseDone` is kept as the aggregate "all remotes done" for legacy
+// readers; per-peer state lives in `_remotePhaseDoneByPeer` so 3–4 player
+// sessions correctly wait for all clients.
 let _localPhaseDone = true;      // we've signaled "done" to the peer
-let _remotePhaseDone = true;     // peer has signaled "done" to us
+let _remotePhaseDone = true;     // aggregate: are ALL remote peers done?
+let _remotePhaseDoneByPeer = new Map();
 let _prevSyncState = null;       // tracks gameState transitions for the handshake
-// PREP_READY handshake — both players must ready up before combat starts.
-// _prepReadyRemote is event-driven (set when PREP_READY arrives, cleared in
-// _startCombatNow). It is NOT cleared on entering prep — that would wipe a
-// peer's ready event that arrived first due to network ordering.
+// PREP_READY handshake — every player must ready up before combat starts.
 let _prepReadyLocal = false;
-let _prepReadyRemote = false;
+let _prepReadyRemote = false;    // aggregate: are ALL remote peers ready?
+let _prepReadyByPeer = new Map();
 function _peerIsReady() {
   if (net.role === 'solo' || net.peers.size === 0) return true;
-  return _prepReadyRemote;
+  // Every connected peer must have signalled ready.
+  for (const [pid] of net.peers) {
+    if (!_prepReadyByPeer.get(pid)) return false;
+  }
+  return true;
+}
+// Recompute aggregates from the per-peer maps. Keeps the legacy singletons
+// in sync for any callers / debug overlays still reading them.
+function _recomputeRemoteAggregates() {
+  // PHASE_DONE: true only if every connected peer has signalled done.
+  let allDone = true;
+  for (const [pid] of net.peers) {
+    if (!_remotePhaseDoneByPeer.get(pid)) { allDone = false; break; }
+  }
+  _remotePhaseDone = (net.peers.size === 0) ? true : allDone;
+  // PREP_READY: similar aggregation.
+  let allReady = true;
+  for (const [pid] of net.peers) {
+    if (!_prepReadyByPeer.get(pid)) { allReady = false; break; }
+  }
+  _prepReadyRemote = (net.peers.size === 0) ? false : allReady;
 }
 
-// MAP_VOTE handshake — both players vote on a node; advances when they agree.
-// nodeId stored, broadcast, and reset on entering the map / advancing.
+// MAP_VOTE handshake — every player votes on a node; advances when they all
+// agree. Per-peer votes live in `_remoteMapVoteByPeer`.
 let _localMapVote = null;
 let _remoteMapVote = null;
+let _remoteMapVoteByPeer = new Map();
 let _mapVoteFlash = 0; // brief celebration when the vote completes
 // REST_VOTE / EVENT_VOTE — same idea, but on the choice made at a rest node
 // (heal / upgrade / fortify) or event (0 / 1 / 2). The resolved choice is
@@ -934,7 +1005,8 @@ let _mapVoteFlash = 0; // brief celebration when the vote completes
 // agree. Draft, events, shop, upgrade, itemReward are per-player picks
 // whose results are synced via DECK_* broadcasts below instead.
 let _localRestVote = null;   // 'heal' | 'upgrade' | 'fortify'
-let _remoteRestVote = null;
+let _remoteRestVote = null;  // aggregate: first non-null vote (legacy UI)
+let _remoteRestVoteByPeer = new Map();
 // Floor-name banner: animated chapter break on floor advance.
 let _floorBanner = null; // { floor, name, t0 }
 // Queues the banner so it fires when the map state is entered, not at the
@@ -1208,6 +1280,61 @@ function _isNetMp() {
   return net.role !== 'solo' && net.peers.size > 0;
 }
 
+// Clear all per-peer lobby caches. Run after `net.disconnect()` / session
+// teardown so stale peerIds / chars / ready flags don't leak into the next
+// lobby attempt.
+function _resetPeerLobbyState() {
+  _peerToIndex.clear();
+  _remoteCharIds.clear();
+  _remoteReadyByPeer.clear();
+  _myPlayerIndex = 0;
+}
+
+// ── 3–4 player peer-index helpers ─────────────────────────────────────────
+// Host owns the authoritative `peerId → playerIndex` assignment. It picks the
+// lowest free index (1, 2, 3) for each connecting client and broadcasts the
+// full map on every change via PEER_INDEX_ASSIGN. Both sides then use the
+// same map to route CHAR_SELECTED / PLAYER_DOWNED / PLAYER_HP / … to the
+// correct `players.list[i]` entry.
+function _hostAssignPeerIndex(peerId) {
+  if (net.role !== 'host') return;
+  if (_peerToIndex.has(peerId)) return;
+  const used = new Set([0, ..._peerToIndex.values()]);
+  for (let i = 1; i <= 3; i++) {
+    if (!used.has(i)) { _peerToIndex.set(peerId, i); break; }
+  }
+}
+function _hostBroadcastPeerIndices() {
+  if (net.role !== 'host' || net.peers.size === 0) return;
+  const indices = {};
+  for (const [pid, idx] of _peerToIndex) indices[pid] = idx;
+  try { net.sendReliable('evt', { type: 'PEER_INDEX_ASSIGN', indices }); } catch {}
+}
+// Look up which players.list[] slot a peerId owns. Returns -1 if unknown
+// (happens briefly while PEER_INDEX_ASSIGN is still in flight).
+function _indexForPeer(peerId) {
+  if (!peerId) return -1;
+  const idx = _peerToIndex.get(peerId);
+  return (typeof idx === 'number') ? idx : -1;
+}
+// Resolve the `players.list` entry owned by a given peerId. Array position
+// and `playerIndex` can diverge in 3–4P setups (host-assigned slots are not
+// always contiguous after rejoins), so search by `playerIndex` + the
+// `_remotePeerId` tag, not raw array index.
+function _remotePlayerFor(peerId) {
+  if (peerId) {
+    for (const p of players.list) if (p && p._remotePeerId === peerId) return p;
+  }
+  const idx = _indexForPeer(peerId);
+  if (idx >= 0) {
+    for (const p of players.list) if (p && p.playerIndex === idx && p._isRemote) return p;
+  }
+  // Fallback: first remote player in the list (preserves 2P behaviour when
+  // PEER_INDEX_ASSIGN hasn't arrived yet).
+  for (const p of players.list) if (p && p._isRemote) return p;
+  return null;
+}
+
 // Rest-choice voting. Both sides cast a vote; when the votes match, the
 // action is applied on both sides (each heals its own player / sets its
 // own fortify flag / enters its own upgrade flow). Fixes the original
@@ -1229,10 +1356,19 @@ function _checkRestVoteResolution() {
     }
     return;
   }
-  if (!_localRestVote || !_remoteRestVote) return;
-  if (_localRestVote !== _remoteRestVote) return;
+  // 3–4P: every peer must have voted AND every vote (including ours) must
+  // match. The rest choice applies to the whole party, so we don't want to
+  // resolve on the first matching pair.
+  if (!_localRestVote) return;
+  for (const [pid] of net.peers) {
+    const v = _remoteRestVoteByPeer.get(pid);
+    if (!v) return;              // still waiting on this peer
+    if (v !== _localRestVote) return;  // disagreement — wait for a change
+  }
   const action = _localRestVote;
-  _localRestVote = null; _remoteRestVote = null;
+  _localRestVote = null;
+  _remoteRestVote = null;
+  _remoteRestVoteByPeer.clear();
   _applyRestAction(action);
 }
 function _applyRestAction(action) {
@@ -1252,29 +1388,28 @@ function _applyRestAction(action) {
   }
 }
 
-// Deck-sync broadcasts. Draft / event / shop / upgrade screens are
-// per-player picks, but the deckManager is a SHARED collection across
-// both players, so any local mutation has to be mirrored on the peer
-// so their hand / prep screen / shop display match reality.
-function _broadcastDeckAdd(cardId) {
-  if (!_isNetMp() || !cardId) return;
-  net.sendReliable('evt', { type: 'DECK_CARD_ADDED', cardId });
-}
-function _broadcastDeckRemove(cardId) {
-  if (!_isNetMp() || !cardId) return;
-  net.sendReliable('evt', { type: 'DECK_CARD_REMOVED', cardId });
-}
-// Upgrades are per-player — no broadcast. Only the player who picked
-// the upgrade gets the effect on their side. The card collection stays
-// shared (add/remove are synced), but the upgrades map is personal.
+// Deck state is PER-PLAYER. Draft / shop / discard / upgrade picks only
+// mutate the local player's deckManager — peers manage their own deck.
+// These stubs remain as no-ops so older callers keep working even though
+// no wire traffic is sent.
+function _broadcastDeckAdd(_cardId) { /* per-player: no-op */ }
+function _broadcastDeckRemove(_cardId) { /* per-player: no-op */ }
 
 // Called whenever a vote arrives or is cast locally. If both votes match the
 // SAME node id, the host computes the room contents (shop cards / event
 // type) and broadcasts MAP_NODE_CHOSEN so both clients transition together.
 function _checkMapVoteResolution() {
-  if (!_localMapVote || !_remoteMapVote) return;
-  if (_localMapVote !== _remoteMapVote) return;
+  if (!_localMapVote) return;
   if (gameState !== 'map') return;
+  // 3–4P: every connected peer must have voted AND every vote must match
+  // ours. One dissenter keeps the party on the map screen.
+  if (net.peers.size > 0) {
+    for (const [pid] of net.peers) {
+      const v = _remoteMapVoteByPeer.get(pid);
+      if (!v) return;                  // still waiting on this peer
+      if (v !== _localMapVote) return; // disagreement
+    }
+  }
   // We agree! Only the host fires the actual transition + content roll.
   if (net.role === 'host' && net.peers.size > 0) {
     const node = runManager.nodeMap[_localMapVote];
@@ -1341,6 +1476,7 @@ function _resolveMapNodeAsHost(node) {
   // Reset votes for the next map screen
   _localMapVote = null;
   _remoteMapVote = null;
+  _remoteMapVoteByPeer.clear();
 }
 
 // ── Profile overlay (Ctrl+P) ─────────────────────────────────────────
@@ -2004,8 +2140,12 @@ function startNewRun(explicitSeed) {
   player.haloColor = PLAYER_HALO_COLORS[0];
   // Co-op mode (downed-instead-of-die): true for local 2P AND remote multiplayer
   player._coopMode = !!localCoop || (net.role !== 'solo' && net.peers.size > 0);
-  // Stable ID for snapshot reconciliation: host is always p0, client is p1
-  player.playerIndex = net.role === 'client' ? 1 : 0;
+  // Stable ID for snapshot reconciliation: host is always p0, clients get
+  // their host-assigned slot (1, 2, or 3) in 3–4 player sessions. Falls back
+  // to 1 if PEER_INDEX_ASSIGN hasn't arrived yet — matches old 2P behaviour.
+  if (net.role === 'host') player.playerIndex = 0;
+  else if (net.role === 'client') player.playerIndex = (_myPlayerIndex > 0) ? _myPlayerIndex : 1;
+  else player.playerIndex = 0;
   player.id = 'p' + player.playerIndex;
   // Coop input scheme: P1 → arrows + mouse + '/' dodge. Solo → both schemes + space dodge.
   player._inputScheme = localCoop ? 'arrows' : 'both';
@@ -2022,17 +2162,61 @@ function startNewRun(explicitSeed) {
     p2._dodgeKey    = ' '; // player2View maps consumeKey(' ') → 'e'
     players.add(p2);
   } else if (net.role !== 'solo' && net.peers.size > 0) {
-    // Remote co-op: create a placeholder entity for the remote peer.
-    // Its position will be driven by incoming snapshots; we never run updateLogic on it.
-    const remoteCharDef = Characters[_remoteCharId] || Characters['blade'];
-    const rp = makePlayer(remoteCharDef, 500, 360);
-    rp.charId       = _remoteCharId || 'blade';
-    rp.playerIndex  = net.role === 'host' ? 1 : 0;
-    rp.id           = 'p' + rp.playerIndex;
-    rp.haloColor    = PLAYER_HALO_COLORS[1];
-    rp._isRemote    = true;
-    rp._coopMode    = true;
-    players.add(rp);
+    // Remote co-op: create one placeholder per connected peer so 3-4 player
+    // sessions have a slot each. Positions are driven by incoming snapshots;
+    // we never run updateLogic on them.
+    //
+    // Slot assignment:
+    //   - On the host, peers have indices from _peerToIndex (1..3).
+    //   - On a client, the host is always slot 0; other clients use their
+    //     host-assigned slot. If PEER_INDEX_ASSIGN hasn't arrived yet we
+    //     fall back to insertion order (still stable within 2P).
+    const myIdx = player.playerIndex;
+    const used  = new Set([myIdx]);
+    let fallbackIdx = 0;
+    const _nextFree = () => {
+      while (used.has(fallbackIdx)) fallbackIdx++;
+      const v = fallbackIdx;
+      used.add(v);
+      return v;
+    };
+    // Build an ordered list so placeholder creation is deterministic:
+    // peerIds with known indices first, then anything else in peers-map order.
+    const seen = new Set();
+    const ordered = [];
+    for (const [pid] of net.peers) {
+      ordered.push({ peerId: pid, idx: _peerToIndex.has(pid) ? _peerToIndex.get(pid) : null });
+      seen.add(pid);
+    }
+    for (const rp of ordered) {
+      // Client viewing the host: the host owns slot 0 regardless of what its
+      // peerId maps to in _peerToIndex (which tracks only clients).
+      let assignedIdx;
+      if (net.role === 'client' && !_peerToIndex.has(rp.peerId)) {
+        // Assume the non-self peer that has no index is the host.
+        assignedIdx = used.has(0) ? _nextFree() : 0;
+        used.add(assignedIdx);
+      } else if (rp.idx === null) {
+        assignedIdx = _nextFree();
+      } else {
+        assignedIdx = rp.idx;
+        used.add(assignedIdx);
+      }
+      const charId = _remoteCharIds.get(rp.peerId) || _remoteCharId || 'blade';
+      const remoteCharDef = Characters[charId] || Characters['blade'];
+      // Spread starting spawns so placeholders don't all overlap at 500,360.
+      const spawnX = 500 + (assignedIdx % 2) * 40;
+      const spawnY = 360 + Math.floor(assignedIdx / 2) * 40;
+      const ph = makePlayer(remoteCharDef, spawnX, spawnY);
+      ph.charId       = charId;
+      ph.playerIndex  = assignedIdx;
+      ph.id           = 'p' + assignedIdx;
+      ph.haloColor    = PLAYER_HALO_COLORS[assignedIdx % PLAYER_HALO_COLORS.length];
+      ph._isRemote    = true;
+      ph._coopMode    = true;
+      ph._remotePeerId = rp.peerId;
+      players.add(ph);
+    }
   }
   window._players = players;
 
@@ -2081,10 +2265,14 @@ function startNewRun(explicitSeed) {
   // isn't blocked by stale state carried over from a prior run / lobby.
   _localPhaseDone = true;
   _remotePhaseDone = true;
+  _remotePhaseDoneByPeer.clear();
   _prepReadyLocal = false;
   _prepReadyRemote = false;
+  _prepReadyByPeer.clear();
   _localMapVote = null;
   _remoteMapVote = null;
+  _remoteMapVoteByPeer.clear();
+  _remoteRestVoteByPeer.clear();
   _prevSyncState = null;
   // Force HP broadcast on first frame of the new run.
   _lastHpBroadcast = { hp: -1, maxHp: -1, alive: null, downed: null };
@@ -2856,10 +3044,11 @@ function _syncNetPhase() {
   if (gameState === 'prep' || gameState === 'playing') {
     _localPhaseDone = false;
     _remotePhaseDone = false;
+    _remotePhaseDoneByPeer.clear();
   }
-  // Entering prep clears OUR ready flag for this round. _prepReadyRemote is
-  // event-driven and is reset only by _startCombatNow — that prevents losing
-  // a peer's PREP_READY that arrived before we transitioned in.
+  // Entering prep clears OUR ready flag for this round. Per-peer ready
+  // state is event-driven and only cleared in _startCombatNow — that
+  // prevents losing a peer's PREP_READY that arrived before we transitioned.
   if (gameState === 'prep' && _prevSyncState !== 'prep') {
     _prepReadyLocal = false;
   }
@@ -2867,6 +3056,7 @@ function _syncNetPhase() {
   if (gameState === 'map' && _prevSyncState !== 'map') {
     _localMapVote = null;
     _remoteMapVote = null;
+    _remoteMapVoteByPeer.clear();
     if (_pendingFloorBanner) {
       _showFloorBanner(_pendingFloorBanner);
       _pendingFloorBanner = 0;
@@ -2877,6 +3067,7 @@ function _syncNetPhase() {
   if (gameState === 'rest' && _prevSyncState !== 'rest') {
     _localRestVote = null;
     _remoteRestVote = null;
+    _remoteRestVoteByPeer.clear();
   }
   _prevSyncState = gameState;
 }
@@ -2890,10 +3081,15 @@ function update(logicDt, realDt) {
   _broadcastLocalAp();
   // Poll Xbox / standard gamepads each frame so they feed key & mouse state.
   // Per-slot enable comes from MetaProgress (toggled in char select).
+  // `inMenu` switches P1's B button from dodge to 'escape' (back) in non-
+  // gameplay states so menu navigation doesn't require finding the tiny
+  // Back/Select button on an Xbox pad.
+  const _menuStates = ['intro','charSelect','lobby','map','prep','draft','itemReward','shop','upgrade','event','rest','discard','stats','paused'];
   input.pollGamepads({
     enabledP1: meta.isGamepadEnabled(0),
     enabledP2: meta.isGamepadEnabled(1),
     localCoop,
+    inMenu: _menuStates.indexOf(gameState) !== -1,
   });
 
   // RTT heartbeat — host pings client every 2 s; receiver replies with PONG.
@@ -2972,13 +3168,13 @@ function update(logicDt, realDt) {
             // Reset any lingering remote state from a prior Remote Play visit
             if (net.role !== 'solo') net.disconnect();
             net.role = 'solo';
-            _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+            _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
             localCoop = false; audio.init(); audio.playBGM('menu'); gameState = 'charSelect';
           }
           else if (b.action === 'mode_local') {
             if (net.role !== 'solo') net.disconnect();
             net.role = 'solo';
-            _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+            _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
             localCoop = true; audio.init(); audio.playBGM('menu'); gameState = 'charSelect';
           }
           else if (b.action === 'mode_remote') { localCoop = false; audio.init(); audio.playBGM('menu'); lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; gameState = 'lobby';
@@ -3126,6 +3322,10 @@ function update(logicDt, realDt) {
       }
       if (result === 'start' && selectedCharId) {
         if (net.role === 'host' && net.peers.size > 0) {
+          // Re-broadcast peer indices right before GAME_STARTED so clients
+          // that joined late (or that missed the earlier broadcast) pick the
+          // correct slot when startNewRun() runs on their side.
+          _hostBroadcastPeerIndices();
           net.sendReliable('evt', { type: 'GAME_STARTED', seed: lobby.seed, charId: selectedCharId, difficulty: selectedDifficulty });
         }
         startNewRun();
@@ -3150,7 +3350,7 @@ function update(logicDt, realDt) {
             net.disconnect();
           }
           net.role = 'solo';
-          _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+          _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
           _charSelectQuitConfirm = false;
           gameState = 'intro'; selectedCharId = null; audio.playBGM('menu');
         }
@@ -3219,7 +3419,7 @@ function update(logicDt, realDt) {
           net.disconnect();
         }
         net.role = 'solo';
-        _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+        _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
         gameState = 'charSelect'; input.clearFrame(); return;
       }
       // Backing out of hosting/joining returns to the lobby menu AND tears
@@ -3228,7 +3428,7 @@ function update(logicDt, realDt) {
         if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_escape_submode' }); } catch {} }
         net.disconnect();
         net.role = 'solo';
-        _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+        _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
       }
       lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = '';
       input.clearFrame(); return;
@@ -3273,7 +3473,7 @@ function update(logicDt, realDt) {
               net.disconnect();
             }
             net.role = 'solo';
-            _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+            _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
             gameState = 'charSelect';
             break;
           }
@@ -3303,7 +3503,7 @@ function update(logicDt, realDt) {
             // Tell the peer we're leaving so they drop out of the lobby too
             // rather than waiting on a ghost host.
             if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_back' }); } catch {} }
-            lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; _lobbyPeers = []; _remoteReady = false; _clientReady = false; net.disconnect(); net.role = 'solo'; break;
+            lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState(); net.disconnect(); net.role = 'solo'; break;
           }
           if (b.action === 'join_confirm' && lobbyJoinCode.length === 6) {
             net.role = 'client';
@@ -3477,7 +3677,7 @@ function update(logicDt, realDt) {
             if (net.role !== 'solo' && net.peers.size > 0) {
               try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'restart' }); } catch {}
               net.disconnect(); net.role = 'solo';
-              _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+              _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
             }
             gameState = 'charSelect'; selectedCharId = null; audio.silenceMusic(); audio.playBGM('menu');
           }
@@ -3490,7 +3690,7 @@ function update(logicDt, realDt) {
               if (net.role !== 'solo' && net.peers.size > 0) {
                 try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'quit' }); } catch {}
                 net.disconnect(); net.role = 'solo';
-                _lobbyPeers = []; _remoteReady = false; _clientReady = false;
+                _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
               }
               gameState = 'intro'; selectedCharId = null; audio.silenceMusic(); audio.playBGM('menu');
             }
@@ -3499,6 +3699,8 @@ function update(logicDt, realDt) {
           else if (b.action === 'quit_cancel') { pauseQuitConfirm = false; }
           else if (b.action === 'vol_down') { const v = Math.max(0, audio.getMasterVolume() - 0.1); audio.setMasterVolume(v); meta.setMasterVolume(v); }
           else if (b.action === 'vol_up')   { const v = Math.min(1, audio.getMasterVolume() + 0.1); audio.setMasterVolume(v); meta.setMasterVolume(v); }
+          else if (b.action === 'toggle_pad_p1') { meta.setGamepadEnabled(0, !meta.isGamepadEnabled(0)); }
+          else if (b.action === 'toggle_pad_p2') { meta.setGamepadEnabled(1, !meta.isGamepadEnabled(1)); }
           break;
         }
       }
@@ -4342,7 +4544,7 @@ function handleCharSelectClick(mx, my) {
       if (b.action === 'toggleCoop') { localCoop = !localCoop; return 'toggleCoop'; }
       if (b.action === 'toggleGamepadP1') { meta.setGamepadEnabled(0, !meta.isGamepadEnabled(0)); return 'toggleGamepadP1'; }
       if (b.action === 'toggleGamepadP2') { meta.setGamepadEnabled(1, !meta.isGamepadEnabled(1)); return 'toggleGamepadP2'; }
-      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; _lobbyPeers = []; _remoteReady = false; _clientReady = false; _remoteDisconnected = false; gameState = 'lobby';
+      if (b.action === 'lobby') { lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = 'Checking network…'; _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState(); _remoteDisconnected = false; gameState = 'lobby';
             // RH2: warm Trystero CDN + WebRTC permissions immediately so the
             // banner shows real status rather than waiting until host-click.
             net.preflight().then(ok => {
@@ -4826,6 +5028,7 @@ function _startCombatNow() {
   // Reset the next-round handshake — fresh decision phase coming after this fight
   _prepReadyLocal = false;
   _prepReadyRemote = false;
+  _prepReadyByPeer.clear();
 }
 
 function _drawDownedIndicator(ctx, p) {
@@ -5394,22 +5597,29 @@ function render() {
       charSelectBoxes.push({ x: mbX, y: mbY, w: mbW, h: mbH, action: 'mainMenu' });
 
       // ── REMOTE MULTIPLAYER button — to the right of MAIN MENU ──
+      // Hidden when already inside a remote lobby: the button would just be a
+      // no-op (we're already connected) and takes up slot the TUTORIAL button
+      // should slide into.
+      const _alreadyInRemote = net.role !== 'solo';
       const lbW = 200, lbH = 38, lbX = mbX + mbW + 10, lbY = mbY;
-      ctx2.fillStyle = '#10202a';
-      ctx2.beginPath();
-      ctx2.roundRect(lbX, lbY, lbW, lbH, 7);
-      ctx2.fill();
-      ctx2.strokeStyle = '#44ddcc';
-      ctx2.lineWidth = 1.5;
-      ctx2.stroke();
-      ctx2.fillStyle = '#88eedd';
-      ctx2.font = 'bold 13px monospace';
-      ctx2.textAlign = 'center';
-      ctx2.fillText('🌐  REMOTE LOBBY', lbX + lbW / 2, lbY + 24);
-      charSelectBoxes.push({ x: lbX, y: lbY, w: lbW, h: lbH, action: 'lobby' });
+      if (!_alreadyInRemote) {
+        ctx2.fillStyle = '#10202a';
+        ctx2.beginPath();
+        ctx2.roundRect(lbX, lbY, lbW, lbH, 7);
+        ctx2.fill();
+        ctx2.strokeStyle = '#44ddcc';
+        ctx2.lineWidth = 1.5;
+        ctx2.stroke();
+        ctx2.fillStyle = '#88eedd';
+        ctx2.font = 'bold 13px monospace';
+        ctx2.textAlign = 'center';
+        ctx2.fillText('🌐  REMOTE LOBBY', lbX + lbW / 2, lbY + 24);
+        charSelectBoxes.push({ x: lbX, y: lbY, w: lbW, h: lbH, action: 'lobby' });
+      }
 
-      // ── TUTORIAL button — to the right of REMOTE LOBBY ──
-      const tbW = 160, tbH = 38, tbX = lbX + lbW + 10, tbY = lbY;
+      // ── TUTORIAL button — slides left to fill the REMOTE LOBBY gap when hidden ──
+      const _tbLeftAnchor = _alreadyInRemote ? (mbX + mbW + 10) : (lbX + lbW + 10);
+      const tbW = 160, tbH = 38, tbX = _tbLeftAnchor, tbY = lbY;
       ctx2.fillStyle = '#1a2418';
       ctx2.beginPath();
       ctx2.roundRect(tbX, tbY, tbW, tbH, 7);
@@ -5549,11 +5759,18 @@ function render() {
       ctx.lineWidth = isSelected ? 4 : 2;
       ctx.stroke();
 
-      // RH2 multiplayer: show the partner's pick ring + READY ribbon on the
-      // appropriate character cards so the local player has clear feedback
-      // about what their partner is choosing.
+      // RH2 multiplayer: show every remote peer's pick ring + READY ribbon on
+      // the appropriate character cards so the local player has clear feedback
+      // about what the partners are choosing. In 3–4P setups multiple peers
+      // can even share the same character, so gather all matches here.
       const isMP = net.role !== 'solo' && net.peers.size > 0;
-      const isRemotePick = isMP && _remoteCharId === ch.id;
+      const _remoteMatchingPeers = [];
+      if (isMP) {
+        for (const [pid, cid] of _remoteCharIds) {
+          if (cid === ch.id) _remoteMatchingPeers.push(pid);
+        }
+      }
+      const isRemotePick = _remoteMatchingPeers.length > 0;
       if (isRemotePick) {
         const _t = performance.now() / 1000;
         const _pulse = 0.55 + 0.35 * Math.sin(_t * 3.4);
@@ -5566,11 +5783,14 @@ function render() {
         ctx.roundRect(x - 6, startY - 6, CARD_W + 12, CARD_H + 12, 18);
         ctx.stroke();
         ctx.restore();
-        // "P2" badge top-left
+        // "PICK" badge top-left — list every peer that chose this char
         ctx.fillStyle = '#ff9944';
         ctx.font = 'bold 14px monospace';
         ctx.textAlign = 'left';
-        ctx.fillText('P2 PICK', x + 12, startY - 12);
+        const labels = _remoteMatchingPeers
+          .map(pid => 'P' + ((_peerToIndex.get(pid) || 1) + 1))
+          .join(' / ');
+        ctx.fillText(labels + ' PICK', x + 12, startY - 12);
       }
       // READY ribbon overlays. The local-ready flag is `_clientReady` on the
       // client side; the host has no in-charSelect "ready" — they go straight
@@ -5579,8 +5799,15 @@ function render() {
       if (isMP && isSelected && localReady) {
         _drawReadyRibbon(ctx, x + CARD_W - 10, startY + 18, '#44ff88', 'YOU READY');
       }
-      if (isRemotePick && _remoteReady) {
-        _drawReadyRibbon(ctx, x + CARD_W - 10, startY + 42, '#ff9944', 'P2 READY');
+      if (isRemotePick) {
+        let _ribbonY = startY + 42;
+        for (const pid of _remoteMatchingPeers) {
+          if (_remoteReadyByPeer.get(pid)) {
+            const label = 'P' + ((_peerToIndex.get(pid) || 1) + 1) + ' READY';
+            _drawReadyRibbon(ctx, x + CARD_W - 10, _ribbonY, '#ff9944', label);
+            _ribbonY += 22;
+          }
+        }
       }
 
       if (!unlocked) {
@@ -5752,23 +5979,39 @@ function render() {
         if (canReady) charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'ready' });
         // Show P2 ready status below button for host view (skip for client)
       } else {
-        // Host button — START RUN (only clickable when multiplayer peer is ready or solo)
-        const waitingForP2 = net.role === 'host' && net.peers.size > 0 && !_remoteReady;
+        // Host button — START RUN. In 3–4P setups ALL remote peers must be
+        // ready before the host can start; otherwise a late-ready player
+        // misses the GAME_STARTED broadcast window.
+        let peersReady = 0, peersTotal = 0;
+        if (net.role === 'host' && net.peers.size > 0) {
+          for (const [pid] of net.peers) {
+            peersTotal++;
+            if (_remoteReadyByPeer.get(pid)) peersReady++;
+          }
+        }
+        const allRemotesReady = peersTotal === 0 || peersReady === peersTotal;
+        const waitingForP2 = net.role === 'host' && net.peers.size > 0 && !allRemotesReady;
         ctx2.fillStyle = waitingForP2 ? '#1a1a22' : '#225533';
         ctx2.beginPath(); ctx2.roundRect(startBtnX, btnY, startBtnW, startBtnH, 8); ctx2.fill();
         ctx2.strokeStyle = waitingForP2 ? '#554466' : '#44ff88'; ctx2.lineWidth = 2; ctx2.stroke();
         ctx2.fillStyle = waitingForP2 ? '#886699' : '#44ff88';
         ctx2.font = waitingForP2 ? 'bold 14px monospace' : 'bold 18px monospace';
-        ctx2.fillText(waitingForP2 ? 'WAITING FOR P2…' : 'START RUN', startBtnX + startBtnW / 2, btnY + 29);
+        const waitLabel = peersTotal > 1
+          ? `WAITING ${peersReady}/${peersTotal}…`
+          : 'WAITING FOR P2…';
+        ctx2.fillText(waitingForP2 ? waitLabel : 'START RUN', startBtnX + startBtnW / 2, btnY + 29);
         // Only register the click box when actually startable
         if (!waitingForP2) {
           charSelectBoxes.push({ x: startBtnX, y: btnY, w: startBtnW, h: startBtnH, action: 'start' });
         }
-        // P2 status indicator below button
+        // Peer ready tally below the button
         if (net.role === 'host' && net.peers.size > 0) {
-          ctx2.fillStyle = _remoteReady ? '#44ff88' : '#887799';
+          ctx2.fillStyle = allRemotesReady ? '#44ff88' : '#887799';
           ctx2.font = '12px monospace';
-          ctx2.fillText(_remoteReady ? 'P2: READY ✓' : 'P2: PICKING…', startBtnX + startBtnW / 2, btnY + startBtnH + 16);
+          const status = allRemotesReady
+            ? `ALL ${peersTotal} READY ✓`
+            : `${peersReady}/${peersTotal} READY — still picking…`;
+          ctx2.fillText(status, startBtnX + startBtnW / 2, btnY + startBtnH + 16);
         }
       }
     } else {
@@ -6190,11 +6433,17 @@ function render() {
       const t = performance.now() / 1000;
       const pulse = 0.7 + 0.3 * Math.sin(t * 5);
 
-      // Vote rings on the map nodes themselves
+      // Vote rings on the map nodes themselves — one per peer (up to 4 total)
       _drawMapVoteRing(ctx, _localMapVote, localCol, 'YOU', 0, pulse);
-      _drawMapVoteRing(ctx, _remoteMapVote, remoteCol, 'P2',  1, pulse);
+      let _ringSlot = 1;
+      for (const [pid, vote] of _remoteMapVoteByPeer) {
+        const idx = _peerToIndex.get(pid);
+        const label = 'P' + (((idx ?? _ringSlot) + 1));
+        _drawMapVoteRing(ctx, vote, remoteCol, label, _ringSlot, pulse);
+        _ringSlot++;
+      }
 
-      // Brief celebration flash when both votes match (resolves to MAP_NODE_CHOSEN)
+      // Brief celebration flash when every vote matches (resolves to MAP_NODE_CHOSEN)
       if (_mapVoteFlash > 0) {
         ctx.save();
         ctx.globalAlpha = Math.min(1, _mapVoteFlash * 2);
@@ -6204,26 +6453,35 @@ function render() {
         _mapVoteFlash = Math.max(0, _mapVoteFlash - 1 / 60);
       }
 
-      // Status line — clearly explains that both players must agree
+      // Status line — tallied across every connected peer for 3–4P support.
+      let _votesIn = _localMapVote ? 1 : 0;
+      let _totalVoters = 1;
+      let _allAgree = !!_localMapVote;
+      for (const [pid] of net.peers) {
+        _totalVoters++;
+        const v = _remoteMapVoteByPeer.get(pid);
+        if (v) _votesIn++;
+        if (!v || v !== _localMapVote) _allAgree = false;
+      }
       let label = null, color = '#aa88ff';
       const phaseWait = !_remotePhaseDone || !_localPhaseDone;
       if (phaseWait) {
         label = (net.role === 'host' || _localPhaseDone)
-          ? '⌛  WAITING FOR PARTNER TO FINISH PICKING THEIR ITEMS'
-          : '⌛  PICK YOUR ITEMS — PARTNER IS ALREADY DONE';
+          ? '⌛  WAITING FOR ALLIES TO FINISH PICKING THEIR ITEMS'
+          : '⌛  PICK YOUR ITEMS — ALLIES ARE ALREADY DONE';
         color = '#ffaa44';
-      } else if (!_localMapVote && !_remoteMapVote) {
-        label = '🗺   CLICK A NODE TO VOTE — BOTH PLAYERS MUST AGREE';
-      } else if (_localMapVote && !_remoteMapVote) {
-        label = '⌛  YOU VOTED — WAITING FOR PARTNER';
-      } else if (!_localMapVote && _remoteMapVote) {
-        label = '⚠  PARTNER VOTED — CLICK YOUR CHOICE';
-        color = '#ff9944';
-      } else if (_localMapVote === _remoteMapVote) {
+      } else if (_votesIn === 0) {
+        label = '🗺   CLICK A NODE TO VOTE — EVERY PLAYER MUST AGREE';
+      } else if (_allAgree) {
         label = '✓  AGREED — ADVANCING';
         color = '#44ff88';
+      } else if (!_localMapVote) {
+        label = '⚠  ALLIES VOTED — CLICK YOUR CHOICE';
+        color = '#ff9944';
+      } else if (_votesIn < _totalVoters) {
+        label = `⌛  ${_votesIn}/${_totalVoters} VOTED — WAITING FOR ALLIES`;
       } else {
-        label = '✗  DISAGREEMENT — CLICK AGAIN TO MATCH PARTNER';
+        label = '✗  DISAGREEMENT — CLICK AGAIN TO MATCH THE PARTY';
         color = '#ff6644';
       }
       if (label) {
@@ -6256,15 +6514,17 @@ function render() {
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 11px monospace';
     ctx.fillText(`${player.hp}/${player.maxHp} HP`, 18 + hpW + 8, 46);
-    // RH2: in 2P co-op, show P2's HP bar to the right of P1's
-    if (players.count > 1) {
-      const p2 = players.list[1];
-      const p2X = 18 + hpW + 90;
-      const p2Ch = Characters[p2._charId || selectedCharId];
+    // RH2: in multi-player co-op (local 2P or remote 2/3/4P), show every
+    // ally's HP bar stacked to the right of P1's.
+    for (let _pi = 1; _pi < players.count; _pi++) {
+      const p2 = players.list[_pi];
+      if (!p2) continue;
+      const p2X = 18 + hpW + 90 + (_pi - 1) * (hpW + 90);
+      const p2Ch = Characters[p2._charId || p2.charId || selectedCharId];
       ctx.fillStyle = p2Ch ? p2Ch.color : '#ff9944';
       ctx.font = 'bold 14px monospace';
       ctx.textAlign = 'left';
-      ctx.fillText(`P2 ${p2Ch?.name || ''}`, p2X, 28);
+      ctx.fillText(`P${(p2.playerIndex || _pi) + 1} ${p2Ch?.name || ''}`, p2X, 28);
       ctx.fillStyle = '#331111';
       ctx.fillRect(p2X, 34, hpW, hpH);
       const p2col = p2.hp > 0 ? '#ee3333' : '#553333';
@@ -6554,8 +6814,11 @@ function render() {
   if (gameState === 'playing') {
     combat.drawRangeIndicator(renderer.ctx, player, deckManager.hand, CardDefinitions, selectedCardSlot);
     if (players.count > 1) {
+      // Only the LOCAL co-op P2 (at list[1]) has a range indicator drawn here;
+      // remote players' card picks are private and their range wouldn't line
+      // up with our reticle anyway.
       const p2 = players.list[1];
-      if (p2 && p2.alive) {
+      if (p2 && p2.alive && !p2._isRemote) {
         combat.drawRangeIndicator(renderer.ctx, p2, deckManager.hand, CardDefinitions, selectedCardSlotP2);
         // Draw P2 reticle (auto-aim crosshair) so the player can see what's targeted
         const p2v = input._p2View;
@@ -6717,7 +6980,8 @@ function render() {
       // Height grows with content
       let panelH = 8;
       if (currentBiome) panelH += 18;
-      if (hasP2) panelH += 22 + 18; // P2 HP row + P2 AP row
+      // Each ally contributes one HP row + one AP row
+      if (hasP2) panelH += Math.max(0, players.count - 1) * (22 + 18);
       if (hasReso) panelH += 18;
       panelH += 4;
       const panelX = 8;
@@ -6757,10 +7021,14 @@ function render() {
         yCursor += 22;
       };
 
-      if (hasP2) {
-        const p2 = players.list[1];
-        drawHpRow('P2', p2, p2.haloColor || '#ff7744');
-        // P2 AP pip row
+      // Every ally past P1 gets their own HP/AP row. 3–4P remote co-op
+      // stacks P2/P3/P4 in order.
+      for (let _ai = 1; _ai < players.count; _ai++) {
+        const p2 = players.list[_ai];
+        if (!p2) continue;
+        const label = 'P' + ((p2.playerIndex || _ai) + 1);
+        drawHpRow(label, p2, p2.haloColor || '#ff7744');
+        // AP pip row for this ally
         ctx.fillStyle = '#4488ff';
         ctx.font = 'bold 11px monospace';
         ctx.fillText('AP', 14, yCursor + 11);
@@ -6779,12 +7047,6 @@ function render() {
         ctx.font = '10px monospace';
         ctx.fillText(p2.budget.toFixed(1) + '/' + mb, apX + mb * (segW + segGap) + 4, yCursor + 12);
         yCursor += 18;
-        // NOTE: the "P2 ▸ <card>" line used to live here, but
-        // `selectedCardSlotP2` only tracks the LOCAL 2P-coop partner's
-        // selection, not a remote peer's — so in networked MP it would
-        // display a card the teammate isn't actually holding. The
-        // teammate's HP / AP / downed status above is enough situational
-        // awareness; their card choice is private.
       }
 
       if (hasReso) {
@@ -7916,16 +8178,74 @@ function drawPauseMenu() {
 
   // Controls overlay mode
   if (pauseShowControls) {
-    const cW = Math.min(620, canvas.width - 60);
-    const controlLines = [
-      { text: 'CONTROLS & MECHANICS', col: '#ffdd44', font: 'bold 20px monospace' },
-      { text: '', col: '', font: '' },
-      { text: 'WASD / Arrow Keys  —  Move', col: '#ddd', font: '15px monospace' },
-      { text: 'SPACE  —  Dodge toward cursor  (no AP cost)', col: '#ddd', font: '15px monospace' },
-      { text: 'LEFT CLICK  —  Use selected card', col: '#ddd', font: '15px monospace' },
-      { text: 'RIGHT CLICK / 1–4  —  Cycle / select card slot', col: '#ddd', font: '15px monospace' },
-      { text: 'ESC  —  Pause menu', col: '#ddd', font: '15px monospace' },
-      { text: '', col: '', font: '' },
+    pauseMenuBoxes = [];
+
+    const p1Pad = meta.isGamepadEnabled(0);
+    const p2Pad = meta.isGamepadEnabled(1);
+
+    // Sized for two control-scheme columns + tempo/mechanics text + toggles.
+    const cW = Math.min(720, canvas.width - 60);
+    const cH = Math.min(canvas.height - 40, localCoop ? 560 : 500);
+    const cpx = (canvas.width - cW) / 2;
+    const cpy = (canvas.height - cH) / 2;
+
+    ctx.fillStyle = '#0a0a16';
+    ctx.beginPath();
+    ctx.roundRect(cpx, cpy, cW, cH, 14);
+    ctx.fill();
+    ctx.strokeStyle = '#44aaff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Title
+    ctx.fillStyle = '#ffdd44';
+    ctx.font = 'bold 20px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('CONTROLS & MECHANICS', canvas.width / 2, cpy + 30);
+
+    // ── Gamepad toggle row (P1 always; P2 only in local co-op) ──
+    const toggleY = cpy + 48;
+    const toggleH = 28;
+    const toggleW = localCoop ? 180 : 240;
+    const toggleGap = 14;
+    const toggleTotalW = localCoop ? (toggleW * 2 + toggleGap) : toggleW;
+    const toggleStartX = (canvas.width - toggleTotalW) / 2;
+
+    function _drawPadToggle(label, on, x, action) {
+      ctx.fillStyle = on ? '#123022' : '#1a1a28';
+      ctx.beginPath();
+      ctx.roundRect(x, toggleY, toggleW, toggleH, 6);
+      ctx.fill();
+      ctx.strokeStyle = on ? '#44ddaa' : '#5566aa';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = on ? '#aaffd0' : '#bbccdd';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText((on ? '🎮 ' : '⌨ ') + label + ' — ' + (on ? 'GAMEPAD' : 'KEYBOARD'),
+                   x + toggleW / 2, toggleY + 18);
+      pauseMenuBoxes.push({ x, y: toggleY, w: toggleW, h: toggleH, action });
+    }
+    _drawPadToggle(localCoop ? 'P1' : 'YOU', p1Pad, toggleStartX, 'toggle_pad_p1');
+    if (localCoop) {
+      _drawPadToggle('P2', p2Pad, toggleStartX + toggleW + toggleGap, 'toggle_pad_p2');
+    }
+
+    // ── Control scheme columns (P1 / P2 if coop) ──
+    const colsY = toggleY + toggleH + 18;
+    const colsH = 120;
+    const innerPad = 24;
+    const colGap = 16;
+    const colCount = localCoop ? 2 : 1;
+    const colW = (cW - innerPad * 2 - colGap * (colCount - 1)) / colCount;
+    _drawSchemeColumn(ctx, cpx + innerPad, colsY, colW, colsH, localCoop ? 'P1' : '', p1Pad, false);
+    if (localCoop) {
+      _drawSchemeColumn(ctx, cpx + innerPad + colW + colGap, colsY, colW, colsH, 'P2', p2Pad, true);
+    }
+
+    // ── Tempo + mechanics reference (same copy as before) ──
+    const refY = colsY + colsH + 14;
+    const refLines = [
       { text: 'THE TEMPO BAR', col: '#ffaa44', font: 'bold 16px monospace' },
       { text: 'COLD  (<30 Tempo)  = 0.7× damage.  Ice cards deal 3× here!', col: '#4a9eff', font: '13px monospace' },
       { text: 'FLOWING  (30–70)  = 1.0× damage, balanced.', col: '#44dd88', font: '13px monospace' },
@@ -7936,28 +8256,17 @@ function drawPauseMenu() {
       { text: 'Perfect Dodge  —  dodge just as an attack lands → slow-mo + tempo', col: '#ddd', font: '13px monospace' },
       { text: 'Combo  —  hit same enemy repeatedly for 1.4× damage at 3+ hits', col: '#ddd', font: '13px monospace' },
     ];
-    const lineH = 22;
-    const cH = Math.min(canvas.height - 40, 80 + controlLines.length * lineH + 70);
-    const cpx = (canvas.width - cW) / 2;
-    const cpy = (canvas.height - cH) / 2;
-    ctx.fillStyle = '#0a0a16';
-    ctx.beginPath();
-    ctx.roundRect(cpx, cpy, cW, cH, 14);
-    ctx.fill();
-    ctx.strokeStyle = '#44aaff';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    for (let i = 0; i < controlLines.length; i++) {
-      const cl = controlLines[i];
+    const refLineH = 20;
+    for (let i = 0; i < refLines.length; i++) {
+      const cl = refLines[i];
       if (!cl.text) continue;
       ctx.fillStyle = cl.col;
       ctx.font = cl.font;
       ctx.textAlign = 'center';
-      ctx.fillText(cl.text, canvas.width / 2, cpy + 36 + i * lineH);
+      ctx.fillText(cl.text, canvas.width / 2, refY + i * refLineH);
     }
 
-    pauseMenuBoxes = [];
+    // ── Back button ──
     const closeBtnW = 180, closeBtnH = 42;
     const closeBtnX = (canvas.width - closeBtnW) / 2;
     const closeBtnY = cpy + cH - closeBtnH - 12;
