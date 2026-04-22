@@ -378,4 +378,44 @@ function drawHelpers(ctx, player, tempo) {
     ctx.textAlign = 'center';
     ctx.fillText('SPACE', player.x, player.y + player.r + 14);
   }
+
+  // ── P1 / P2 tag (co-op only) ────────────────────────────────────
+  // Small pill above each player's head so in the chaos of a fight you can
+  // tell at a glance which blob is yours. Halo color matches the HUD / HP
+  // bar / revive arrow already in use for that player.
+  const _players = (typeof window !== 'undefined') ? window._players : null;
+  if (_players && _players.count > 1 && typeof player.playerIndex === 'number') {
+    const label = 'P' + (player.playerIndex + 1);
+    const badgeW = 22, badgeH = 14;
+    const badgeX = player.x - badgeW / 2;
+    const badgeY = player.y - player.r - 20;
+    const bg = player.haloColor || '#44ddff';
+    ctx.save();
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = bg;
+    if (ctx.roundRect) {
+      ctx.beginPath();
+      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+      ctx.fill();
+    } else {
+      ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+    }
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.lineWidth = 1;
+    if (ctx.roundRect) {
+      ctx.beginPath();
+      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+      ctx.stroke();
+    } else {
+      ctx.strokeRect(badgeX, badgeY, badgeW, badgeH);
+    }
+    ctx.fillStyle = '#0a0a0f';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, player.x, badgeY + badgeH / 2 + 1);
+    ctx.textBaseline = 'alphabetic';
+    ctx.restore();
+  }
 }

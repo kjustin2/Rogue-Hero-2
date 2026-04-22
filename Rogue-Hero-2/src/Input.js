@@ -247,12 +247,13 @@ export class InputManager {
         // Menu-only: D-pad drives a focus cursor so users who never touch the
         // right stick can still step between buttons. Emits arrow keys — the
         // per-screen handlers in main.js translate those into focused-button
-        // nudges via `_gpMenuNudge`.
+        // nudges via `_gpMenuNudge`. Standard Gamepad button indices are
+        // 12=up, 13=down, 14=left, 15=right (NOT clockwise order).
         if (inMenu) {
           if (btns[12] && !prevBtns[12]) this.justPressed.add('arrowup');
-          if (btns[13] && !prevBtns[13]) this.justPressed.add('arrowright');
-          if (btns[14] && !prevBtns[14]) this.justPressed.add('arrowdown');
-          if (btns[15] && !prevBtns[15]) this.justPressed.add('arrowleft');
+          if (btns[13] && !prevBtns[13]) this.justPressed.add('arrowdown');
+          if (btns[14] && !prevBtns[14]) this.justPressed.add('arrowleft');
+          if (btns[15] && !prevBtns[15]) this.justPressed.add('arrowright');
         }
       }
 

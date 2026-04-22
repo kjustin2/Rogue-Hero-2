@@ -258,8 +258,14 @@ export class RoomManager {
     this._gridCache = canvas;
   }
 
-  draw(ctx) {
+  // Visual refresh #7: parallax the floor grid against foreground shake so
+  // heavy hits punch harder. Renderer.beginShakeScope() has already translated
+  // the whole canvas by (shakeX, shakeY); drawing the grid at the inverse of
+  // 0.6× that offset cancels most of the translation, leaving the grid to
+  // move at 0.4× the foreground. parallaxShakeX/Y default to 0 so callers
+  // that don't pass shake (map/menus) get unchanged behavior.
+  draw(ctx, parallaxShakeX = 0, parallaxShakeY = 0) {
     if (!this._gridCache) this._buildGridCache();
-    ctx.drawImage(this._gridCache, 0, 0);
+    ctx.drawImage(this._gridCache, -parallaxShakeX * 0.6, -parallaxShakeY * 0.6);
   }
 }

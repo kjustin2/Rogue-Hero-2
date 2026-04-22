@@ -793,6 +793,33 @@ export class UI {
       ctx.stroke();
       ctx.setLineDash([]);
 
+      // Visual #5: "ready to cast" pulse — when the card is affordable AND at
+      // least one alive enemy sits inside its range, pulse the slot border
+      // alpha at ~3 Hz. Purely a legibility cue that reduces the "why isn't
+      // my card firing" confusion without a tutorial popup. Squared-distance
+      // comparison + early-break keeps it cheap even at high enemy counts.
+      if (cardId && def && canAfford && this.battleMode && this.player && this.enemies && typeof def.range === 'number' && def.range > 0) {
+        const px = this.player.x, py = this.player.y;
+        let inRange = false;
+        for (const e of this.enemies) {
+          if (!e.alive || e._dying) continue;
+          const threshold = def.range + (e.r || 0);
+          const dx = e.x - px, dy = e.y - py;
+          if (dx * dx + dy * dy < threshold * threshold) { inRange = true; break; }
+        }
+        if (inRange) {
+          const pulseA = 0.35 + 0.35 * Math.sin(performance.now() / 1000 * 2 * Math.PI * 3);
+          ctx.save();
+          ctx.globalAlpha = pulseA;
+          ctx.strokeStyle = def.color || '#88ffaa';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.roundRect(x - 1, y - 1, cardDrawW + 2, CARD_H + 2, RADIUS + 1);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
       // Wide card indicator
       if (sw > 1) {
         ctx.fillStyle = 'rgba(255,200,0,0.12)';

@@ -915,6 +915,21 @@ let prevStateBeforePause = null;
 let pauseQuitConfirm = false;
 let pauseShowControls = false;
 
+// Gamepad menu focus — tracks the last gameState so menu handlers can tell
+// they've just been entered and snap the virtual cursor onto a sensible
+// default (e.g. the current map node) rather than starting wherever the
+// cursor last was. Updated at the tail of update() each frame.
+let _prevMenuGameState = null;
+// Deferred-snap flag: `clickSpheres` isn't populated until drawMap() runs,
+// which is AFTER update() on the first map frame. Flag stays true until a
+// snap actually lands so the gamepad cursor centers on the next node even
+// when the map geometry wasn't ready on entry.
+let _mapSnapPending = false;
+// Same story for prep: `ui.handBoxes` / `ui.prepBoxes` are populated in
+// drawPrepScreen(), which runs post-update. Latch on entry and retry the
+// snap until the first collection card is known.
+let _prepSnapPending = false;
+
 // Intro screen state
 let introResetConfirm = false;
 let introBoxes = [];
@@ -1961,6 +1976,7 @@ events.on('OVERLOADED', ({ x, y }) => {
 events.on('CRASH_TEXT', ({ dmg }) => {
   particles.spawnCrashText(dmg);
   particles.spawnCrashFlash();
+  particles.spawnCrashSliver('#ff5500');  // #20: eye-level horizon sliver
   // Trigger crash runes
   for (const s of sigils) {
     if (s.def && s.def.sigilTrigger === 'crash' && !s.triggered) {
@@ -2083,6 +2099,7 @@ events.on('COLD_CRASH', ({ radius, freezeDur }) => {
   player.dodgeTimer = 0.5;
   player.dodgeCooldown = Math.max(player.dodgeCooldown, 0.5);
   particles.spawnColdCrashFlash();
+  particles.spawnCrashSliver('#44ccff');  // #20: cyan sliver for cold crash
   particles.spawnRing && particles.spawnRing(player.x, player.y, radius, '#66ccff');
   particles.spawnDamageNumber(player.x, player.y - 40, 'COLD CRASH!');
   renderer.triggerCA();
@@ -2547,9 +2564,14 @@ function spawnEnemies(node) {
 function getAvailableCards() {
   const owned = deckManager.collection;
   const unlockedTier = meta.getUnlockedTier();
+  // Pact cards scale their effect by ally count, so in solo they're inert or
+  // outright useless. Hide them from draft/shop unless at least one ally is
+  // present (local co-op P2 or a remote peer).
+  const isMP = !!(players && players.count > 1);
   return Object.keys(CardDefinitions).filter(id => {
     if (owned.includes(id)) return false;
     const def = CardDefinitions[id];
+    if (def.pact && !isMP) return false;
     // Bonus cards require bonus card unlock OR mastery unlock
     if (def.bonusCard) {
       if (meta.isBonusCardUnlocked(id)) return true;
@@ -2600,7 +2622,7 @@ function pickDraft(idx) {
   tryAddCard(cardId, () => {
     // After draft — offer item reward every other room, upgrade every 3 rooms
     if (roomsCleared % 2 === 0) {
-      itemChoices = itemManager.generateChoices(3, selectedCharId);
+      itemChoices = itemManager.generateChoices(3, selectedCharId, players.count > 1);
       if (itemChoices.length > 0) { gameState = 'itemReward'; ui.resetItemReward(); return; }
     }
     if (roomsCleared > 0 && roomsCleared % 3 === 0) {
@@ -2895,7 +2917,7 @@ function handleEvent(choiceIdx) {
       case 1: // Trade 1 HP → relic
         if (player.hp > 1) {
           player.hp--;
-          const choices = itemManager.generateChoices(1, selectedCharId);
+          const choices = itemManager.generateChoices(1, selectedCharId, players.count > 1);
           if (choices.length > 0) {
             itemManager.add(choices[0], player, tempo);
             runStats.itemsCollected++;
@@ -2923,7 +2945,7 @@ function handleEvent(choiceIdx) {
       case 0: // Trade 1 HP → random relic
         if (player.hp > 1) {
           player.hp--;
-          const choices = itemManager.generateChoices(1, selectedCharId);
+          const choices = itemManager.generateChoices(1, selectedCharId, players.count > 1);
           if (choices.length > 0) {
             itemManager.add(choices[0], player, tempo);
             runStats.itemsCollected++;
@@ -3088,6 +3110,12 @@ function _syncNetPhase() {
 
 function update(logicDt, realDt) {
   runStats.elapsedTime += realDt;
+  // Detect screen transitions so menu handlers can snap the gamepad cursor
+  // onto a sensible default on first frame. We snapshot the previous state
+  // here before any handler runs, and refresh the tracker so next frame's
+  // check sees this frame's resolved state.
+  const _justEnteredMenu = _prevMenuGameState !== gameState;
+  _prevMenuGameState = gameState;
   // MUST run before any early-return handlers so transitions like
   // itemReward → map correctly fire PHASE_DONE.
   _syncNetPhase();
@@ -3606,6 +3634,32 @@ function update(logicDt, realDt) {
 
   // ── MAP ──
   if (gameState === 'map') {
+    // On first frame after entering map, snap the cursor to the closest
+    // reachable node so the D-pad starts pointed at a real target. Without
+    // this, a gamepad user arriving from combat has the cursor wherever the
+    // last click landed, and the first press can wrap to an unexpected node.
+    // `clickSpheres` isn't built until drawMap() runs post-update on frame
+    // one, so we latch the intent and retry until getReachableBoxes() fills.
+    if (_justEnteredMenu) _mapSnapPending = true;
+    if (_mapSnapPending) {
+      const _mapBoxes = runManager.getReachableBoxes();
+      if (_mapBoxes.length > 0) {
+        const mx = input.mouse.x, my = input.mouse.y;
+        // Respect a mouse user already hovering a reachable node — only snap
+        // when the cursor is idle elsewhere on screen.
+        const overAny = _mapBoxes.some(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
+        if (!overAny) {
+          let best = _mapBoxes[0], bestD = Infinity;
+          for (const b of _mapBoxes) {
+            const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+            const d = (cx - mx) * (cx - mx) + (cy - my) * (cy - my);
+            if (d < bestD) { bestD = d; best = b; }
+          }
+          _gpSnapCursorToBox([best]);
+        }
+        _mapSnapPending = false;
+      }
+    }
     // D-pad / arrow nav across the currently-reachable map nodes. The A-button
     // always-on path sets mouse.justClicked, so after the nudge lands on a
     // sphere the existing consumeClick branch below handles the selection.
@@ -3897,7 +3951,11 @@ function update(logicDt, realDt) {
 
   // ── ITEM REWARD ──
   if (gameState === 'itemReward') {
-    if (_gpHandleMenuNav(ui.itemBoxes)) { input.clearFrame(); return; }
+    // Include the Skip button so down from the card row reaches it, matching
+    // the shop/upgrade nav. handleItemClick still routes clicks by mouse pos.
+    const _itemNav = (ui.itemBoxes || []).slice();
+    if (ui.skipItemBox) _itemNav.push(ui.skipItemBox);
+    if (_gpHandleMenuNav(_itemNav)) { input.clearFrame(); return; }
     if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { gameState = 'map'; }
     if (input.consumeClick()) {
       const itemId = ui.handleItemClick(input.mouse.x, input.mouse.y);
@@ -3958,6 +4016,31 @@ function update(logicDt, realDt) {
 
   // ── PREP ──
   if (gameState === 'prep') {
+    // D-pad nav — unify the hand slots (top), the deck grid (middle), and
+    // the START COMBAT button (bottom-right) into a single nav array so the
+    // gamepad can walk between all three zones. Tagging each box with a
+    // `_kind` field keeps downstream code readable but isn't required by
+    // _gpHandleMenuNav itself (it only reads x/y/w/h).
+    const _prepNav = [];
+    if (ui.handBoxes) for (const b of ui.handBoxes) _prepNav.push(b);
+    if (ui.prepBoxes) for (const b of ui.prepBoxes) _prepNav.push(b);
+    if (ui.prepFightBox) _prepNav.push(ui.prepFightBox);
+    // On first frame after entering prep, snap the cursor to the first
+    // collection card — it's the intuitive starting focus (hand is mostly
+    // empty early, FIGHT button sits off in the corner). Collection boxes
+    // aren't built until drawPrepScreen() runs after update, so we latch and
+    // retry until they exist.
+    if (_justEnteredMenu) _prepSnapPending = true;
+    if (_prepSnapPending && ui.prepBoxes && ui.prepBoxes.length > 0) {
+      // Only snap if the cursor isn't already on a nav box (mouse users may
+      // already be pointing at something — don't steal their focus).
+      const mx = input.mouse.x, my = input.mouse.y;
+      const overAny = _prepNav.some(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
+      if (!overAny) _gpSnapCursorToBox([ui.prepBoxes[0]]);
+      _prepSnapPending = false;
+    }
+    if (_gpHandleMenuNav(_prepNav)) { input.clearFrame(); return; }
+
     // Multiplayer flow: each press of Enter / FIGHT toggles "ready" for the LOCAL
     // player. Only when BOTH have readied does combat actually start (host then
     // broadcasts BATTLE_START). Solo skips the handshake entirely.
@@ -4702,6 +4785,26 @@ function _gpMenuNudge(boxes, dir) {
     return true;
   }
   return false;
+}
+
+// Snap the virtual cursor onto a target box (or nothing if no boxes). Used
+// when entering a menu so the D-pad starts from a predictable location
+// rather than wherever the cursor was on the previous screen. Prefers the
+// box the caller flags as `preferred` (e.g. the current map node, or the
+// currently-selected hero); otherwise picks the first box.
+function _gpSnapCursorToBox(boxes, preferredMatch) {
+  if (!boxes || boxes.length === 0) return false;
+  let target = null;
+  if (preferredMatch) {
+    for (const b of boxes) {
+      if (preferredMatch(b)) { target = b; break; }
+    }
+  }
+  if (!target) target = boxes[0];
+  input.mouse.x = target.x + target.w / 2;
+  input.mouse.y = target.y + target.h / 2;
+  if (input._syncDomCursor) input._syncDomCursor();
+  return true;
 }
 
 // Consume a directional D-pad/arrow press and nudge the cursor. Returns
@@ -6961,7 +7064,9 @@ function render() {
   // ── COMBAT / PREP / DRAFT / PAUSED render the room ──
   const now = performance.now();
   renderer.beginShakeScope();
-  room.draw(renderer.ctx);
+  // Pass the shake offsets so the floor grid parallaxes at 0.4× — makes
+  // heavy hits feel punchier without any extra draw calls. (Visual #7)
+  room.draw(renderer.ctx, renderer.shakeOffsetX, renderer.shakeOffsetY);
 
   // (torch-light removed — per-frame createRadialGradient was expensive and unwanted)
 

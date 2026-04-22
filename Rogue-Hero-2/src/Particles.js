@@ -278,6 +278,18 @@ export class ParticleSystem {
           ctx.globalAlpha = Math.max(0, (1 - t) * 0.7);
           ctx.fillStyle = '#44aaff';
           ctx.fillRect(0, 0, canvasW, canvasH);
+        } else if (s.type === 'crashSliver') {
+          // Full-width horizontal sliver at eye level — alpha ramps smoothly
+          // so it punches at the start and fades fast enough to not linger.
+          const a = Math.max(0, 1 - t);
+          ctx.globalAlpha = a;
+          ctx.fillStyle = s.color;
+          const eyeY = canvasH * 0.46 - 1; // slightly above center reads as "horizon"
+          ctx.fillRect(0, eyeY, canvasW, 3);
+          // Subtle bleed above/below the core stripe
+          ctx.globalAlpha = a * 0.35;
+          ctx.fillRect(0, eyeY - 3, canvasW, 1);
+          ctx.fillRect(0, eyeY + 4, canvasW, 1);
         }
       }
       ctx.globalAlpha = 1.0;
@@ -341,38 +353,56 @@ export class ParticleSystem {
 
   spawnDamageNumber(x, y, amount) {
     const isText = typeof amount === 'string';
-    // Visual variants based on magnitude — reads better at a glance.
-    let size = 16, color = '#ffffff', text = String(amount), pulse = false, weight = 'bold';
-    if (isText) {
-      color = '#88ffaa';
-      size = 14;
-      // text labels (e.g. "+3 HP", "DOWN!", "REVIVING") keep their color
-    } else if (amount >= 30) {
-      // Big hit: large pulsing red
-      size = 26;
-      color = '#ff5544';
-      text = 'HUGE ' + amount + '!';
-      pulse = true;
-    } else if (amount >= 15) {
-      size = 20;
-      color = '#ffaa66';
-    } else if (amount >= 8) {
-      size = 17;
-      color = '#ffd699';
-    } else {
-      // Small hit: muted
-      size = 14;
-      color = '#cccccc';
-      text = '+' + amount;
+    // Visual #8: cluster rapid numeric damage numbers into a single growing
+    // total. Only folds into an existing cluster if it's numeric, recent
+    // (<80 ms since spawn), close (<14 px center distance) — matching the
+    // design note. Non-numeric labels (REVIVING, +3 HP) are never folded.
+    if (!isText) {
+      const nowMs = performance.now();
+      for (let i = this.texts.length - 1; i >= 0; i--) {
+        const t = this.texts[i];
+        if (!t._numeric) continue;
+        if (nowMs - t._spawnMs > 80) break; // texts are appended in time order
+        const dx = t.x - x, dy = t.y - y;
+        if (dx * dx + dy * dy <= 14 * 14) {
+          t._amount += amount;
+          const newSizeInfo = this._damageNumberStyle(t._amount);
+          t.text = newSizeInfo.text;
+          t.color = newSizeInfo.clustered ? '#ffff88' : newSizeInfo.color;
+          t.size = newSizeInfo.size + 2;   // bump slightly to signal cluster
+          t.pulse = newSizeInfo.pulse || t._amount >= 15;
+          t.life = t.maxLife; // refresh so the combined number reads fully
+          return;
+        }
+      }
     }
+    const styleInfo = isText
+      ? { size: 14, color: '#88ffaa', text: String(amount), pulse: false }
+      : this._damageNumberStyle(amount);
     this.texts.push({
       x: x + (Math.random() * 24 - 12),
       y: y - 10,
       vx: (Math.random() - 0.5) * 40,
       vy: -80,
-      text, color, size, pulse, weight,
-      life: 0.9, maxLife: 0.9
+      text: styleInfo.text,
+      color: styleInfo.color,
+      size: styleInfo.size,
+      pulse: styleInfo.pulse,
+      weight: 'bold',
+      life: 0.9, maxLife: 0.9,
+      _numeric: !isText,
+      _amount: isText ? 0 : amount,
+      _spawnMs: performance.now(),
     });
+  }
+
+  // Shared style lookup so the clustering path and the initial-spawn path
+  // agree on size/color buckets. Returns { size, color, text, pulse }.
+  _damageNumberStyle(amount) {
+    if (amount >= 30) return { size: 26, color: '#ff5544', text: 'HUGE ' + amount + '!', pulse: true, clustered: amount >= 40 };
+    if (amount >= 15) return { size: 20, color: '#ffaa66', text: String(amount), pulse: false };
+    if (amount >= 8)  return { size: 17, color: '#ffd699', text: String(amount), pulse: false };
+    return                 { size: 14, color: '#cccccc', text: '+' + amount, pulse: false };
   }
 
   // Damage type colored numbers
@@ -455,6 +485,14 @@ export class ParticleSystem {
 
   spawnColdCrashFlash() {
     this.screenEffects.push({ type: 'coldCrashFlash', life: 0.35, maxLife: 0.35 });
+  }
+
+  // Visual #20: a 3px horizontal bar across the canvas at eye level — fires
+  // alongside the full-screen crash flash. The sliver is what the eye locks
+  // onto, turning a split-second crash into an unmissable "something just
+  // happened" beat. color = '#44aaff' for cold, '#ff5500' for accidental.
+  spawnCrashSliver(color) {
+    this.screenEffects.push({ type: 'crashSliver', life: 0.12, maxLife: 0.12, color: color || '#ff5500' });
   }
 
   spawnOverloaded(x, y) {

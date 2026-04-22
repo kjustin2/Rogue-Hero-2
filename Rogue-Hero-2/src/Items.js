@@ -214,11 +214,14 @@ export class ItemManager {
 
   // Generate random item choices for post-combat reward.
   // charId filters the pool: char-specific relics only appear for that character.
-  generateChoices(count = 3, charId = null) {
+  // isMultiplayer gates Pact relics — their effects require allies, so offering
+  // them in a solo run is dead weight. Pass `players.count > 1` from main.js.
+  generateChoices(count = 3, charId = null, isMultiplayer = false) {
     const pool = Object.keys(ItemDefinitions).filter(id => {
       if (this.equipped.includes(id)) return false;
       const def = ItemDefinitions[id];
       if (def.charSpecific) return def.charSpecific === charId;
+      if (def.pactRelic && !isMultiplayer) return false;
       return true;
     });
     // RISK-05: Fisher-Yates shuffle avoids biased distribution from sort

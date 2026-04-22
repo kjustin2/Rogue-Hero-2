@@ -109,6 +109,7 @@ export class RunManager {
     this.layers[0][0].resolved = true;
     this.currentNodeId = this.layers[0][0].id;
     this._mapGridCache = null; // PERF-02: invalidate cache on new floor
+    this.clickSpheres = null;  // drop stale positions from the prior floor so gamepad cursor-snap doesn't briefly land on last-floor node geometry
     console.log(`[Map] Generated ${this.maxLayers}-layer map for Floor ${this.floor} (seed: ${this.seed})`);
   }
 
