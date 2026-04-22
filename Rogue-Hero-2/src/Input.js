@@ -184,8 +184,17 @@ export class InputManager {
     const inMenu = !!(opts && opts.inMenu);
     if (!this._gpState) this._gpState = [null, null, null, null];
     const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
+    // Logical-to-physical pad mapping. Normally P1 = physical pad 0, P2 = pad 1.
+    // Single-pad fallback: if only P2's slot is enabled and physical pad 1 is
+    // absent, route physical pad 0 to P2 so a lone controller still works.
+    const padForSlot = [pads && pads[0] ? pads[0] : null, pads && pads[1] ? pads[1] : null];
+    const remapPadToP2 =
+      enabledP2 && !enabledP1 &&
+      (!padForSlot[1] || !padForSlot[1].connected) &&
+      padForSlot[0] && padForSlot[0].connected;
+    if (remapPadToP2) padForSlot[1] = padForSlot[0];
     for (let i = 0; i < 4; i++) {
-      const pad = pads && pads[i];
+      const pad = i < 2 ? padForSlot[i] : (pads && pads[i]);
       const prev = this._gpState[i];
       if (!pad || !pad.connected) {
         if (prev) this._gpState[i] = { connected: false, lx: 0, ly: 0, btns: [] };
@@ -207,12 +216,19 @@ export class InputManager {
       // Cursor + A button ALWAYS work for pad 0 so menus are navigable even
       // before the player has clicked the gamepad toggle on. (P2's A maps to
       // 'q' which is in-game; gate it behind enabled to avoid keyboard fights.)
-      if (isP1 && this.canvas) {
+      // When remapPadToP2 is active, physical pad 0 is driving logical P2 —
+      // skip the P1 always-on block so the same button press doesn't also
+      // click P1's mouse or drive P1's aim cursor.
+      if (isP1 && this.canvas && !remapPadToP2) {
         const mag2 = rx * rx + ry * ry;
         if (mag2 > 0.04) {
-          const speed = 12;
+          const speed = 18;
           this.mouse.x = Math.max(0, Math.min(this.canvas.width,  this.mouse.x + rx * speed));
           this.mouse.y = Math.max(0, Math.min(this.canvas.height, this.mouse.y + ry * speed));
+          // Visible DOM cursor follows the gamepad. Without this sync the
+          // crosshair stays wherever the OS mouse last was, so the player has
+          // no way to tell where their clicks will land.
+          this._syncDomCursor();
         }
         if (btns[0] && !prevBtns[0]) {
           this.mouse.justClicked = true;
@@ -228,6 +244,16 @@ export class InputManager {
         // the tiny Select/Back button on Xbox pads. Suppress the dodge-space
         // emit below since we're not in gameplay.
         if (inMenu && btns[1] && !prevBtns[1]) this.justPressed.add('escape');
+        // Menu-only: D-pad drives a focus cursor so users who never touch the
+        // right stick can still step between buttons. Emits arrow keys — the
+        // per-screen handlers in main.js translate those into focused-button
+        // nudges via `_gpMenuNudge`.
+        if (inMenu) {
+          if (btns[12] && !prevBtns[12]) this.justPressed.add('arrowup');
+          if (btns[13] && !prevBtns[13]) this.justPressed.add('arrowright');
+          if (btns[14] && !prevBtns[14]) this.justPressed.add('arrowdown');
+          if (btns[15] && !prevBtns[15]) this.justPressed.add('arrowleft');
+        }
       }
 
       // Everything else (movement, dodge, card slot keys, in-game P2 fire)
@@ -279,18 +305,27 @@ export class InputManager {
       if (btns[14] && !prevBtns[14]) this.justPressed.add(cardKeys[3]);
       if (btns[15] && !prevBtns[15]) this.justPressed.add(cardKeys[1]);
 
-      // Right stick on P1's pad → move the mouse cursor for aim (in-game).
-      // Menu cursor movement is already handled in the always-on block above;
-      // this duplicate covers in-game aim — same code, same speed.
-      if (isP1 && this.canvas) {
-        const mag2 = rx * rx + ry * ry;
-        if (mag2 > 0.04) {
-          const speed = 12; // px/frame at full deflection
-          this.mouse.x = Math.max(0, Math.min(this.canvas.width,  this.mouse.x + rx * speed));
-          this.mouse.y = Math.max(0, Math.min(this.canvas.height, this.mouse.y + ry * speed));
-        }
-      }
+      // In-game P1 aim uses the same right-stick → mouse translation handled
+      // by the always-on block above. Keeping a second copy here caused the
+      // cursor to move at double speed whenever the pad was enabled.
     }
+  }
+
+  // Position the DOM crosshair at the current `this.mouse.x/y`. Called when
+  // non-mouse input (gamepad stick) moved the virtual cursor — the native
+  // `mousemove` listener in main.js only fires for real pointer motion, so
+  // without this call the crosshair stays frozen at its last OS position.
+  _syncDomCursor() {
+    if (typeof window === 'undefined') return;
+    const el = window._gameCursorDiv;
+    if (!el || !this.canvas) return;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const sx = rect.width / this.canvas.width;
+    const sy = rect.height / this.canvas.height;
+    const cx = this.mouse.x * sx + rect.left;
+    const cy = this.mouse.y * sy + rect.top;
+    el.style.transform = `translate(${cx}px, ${cy}px)`;
   }
 
   // True if the slot's pad is physically connected (regardless of enable flag).

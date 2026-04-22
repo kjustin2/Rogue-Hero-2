@@ -361,6 +361,14 @@ net.on('evt', (msg, senderPeerId) => {
     // consumption lines up — otherwise enemy HP (and the elite-modifier
     // rolls) diverge and kills stop syncing.
     if (typeof msg.difficulty === 'number') selectedDifficulty = msg.difficulty;
+    // If the client was still in the lobby screen when GAME_STARTED raced in
+    // (host sent START_LOBBY + GAME_STARTED on the same DataChannel frame),
+    // clear the lobby UI state so nothing lingers behind the run.
+    lobbyMode = 'menu';
+    lobbyJoinCode = '';
+    lobbyStatusMsg = '';
+    _clientReady = false;
+    _remoteReady = false;
     startNewRun(msg.seed);
     // Tell host which character we chose
     net.sendReliable('evt', { type: 'CHAR_SELECTED', charId: selectedCharId });
@@ -1495,6 +1503,12 @@ let _profileFrameAccum = 0;
 const _rttSamples = [];
 let _rttAvg = 0;
 let _rttPingTimer = 0;
+// ── Gamepad aim-assist state (P1 only) ────────────────────────────────
+// `_gpAimTargetId` is the enemy id currently locked to; null = manual aim.
+// `_gpAimBtns` is the previous frame's button snapshot, used to edge-trigger
+// LT/RT target cycling without stealing from the global justPressed set.
+let _gpAimTargetId = null;
+let _gpAimBtns = [];
 function _pushRtt(ms) {
   _rttSamples.push(ms);
   if (_rttSamples.length > 5) _rttSamples.shift();
@@ -3084,13 +3098,64 @@ function update(logicDt, realDt) {
   // `inMenu` switches P1's B button from dodge to 'escape' (back) in non-
   // gameplay states so menu navigation doesn't require finding the tiny
   // Back/Select button on an Xbox pad.
-  const _menuStates = ['intro','charSelect','lobby','map','prep','draft','itemReward','shop','upgrade','event','rest','discard','stats','paused'];
+  const _menuStates = ['intro','charSelect','lobby','map','prep','draft','itemReward','shop','upgrade','event','rest','discard','stats','paused','tutorial','cosmeticShop','cosmeticPanel','victory'];
   input.pollGamepads({
     enabledP1: meta.isGamepadEnabled(0),
     enabledP2: meta.isGamepadEnabled(1),
     localCoop,
     inMenu: _menuStates.indexOf(gameState) !== -1,
   });
+
+  // Gamepad auto-aim for P1 while in combat. When the right stick is idle we
+  // drift the cursor toward the locked target; moving the stick returns to
+  // manual aim immediately. RT (btn 7) cycles to the next nearest enemy, LT
+  // (btn 6) cycles to the previous one. This mirrors the P2 auto-aim idea
+  // (see Input.updateP2Reticle) without replacing the cursor-driven aim.
+  if (gameState === 'playing' && meta.isGamepadEnabled(0) && input.isGamepadConnected(0) && player && player.alive) {
+    const gp = input.getGamepadState(0);
+    const btns = gp.btns || [];
+    const pBtns = _gpAimBtns;
+    const rMag2 = gp.rx * gp.rx + gp.ry * gp.ry;
+    const manual = rMag2 > 0.04;
+    if (manual) {
+      _gpAimTargetId = null;   // manual stick overrides any lock
+    } else {
+      // Cycle target on RT / LT edge — buttons come in on the current frame
+      // via _gpAimBtns so we can edge-trigger without consuming justPressed.
+      const cycleNext = btns[7] && !pBtns[7];
+      const cyclePrev = btns[6] && !pBtns[6];
+      const alive = [];
+      for (const e of enemies) if (e.alive && !e._dying) alive.push(e);
+      if (alive.length > 0) {
+        // Sort by distance from the player so "next" means "next-further".
+        alive.sort((a, b) => {
+          const da = (a.x - player.x) * (a.x - player.x) + (a.y - player.y) * (a.y - player.y);
+          const db = (b.x - player.x) * (b.x - player.x) + (b.y - player.y) * (b.y - player.y);
+          return da - db;
+        });
+        let curIdx = alive.findIndex(e => e.id === _gpAimTargetId);
+        if (cycleNext) curIdx = (curIdx < 0 ? 0 : (curIdx + 1) % alive.length);
+        else if (cyclePrev) curIdx = (curIdx <= 0 ? alive.length - 1 : curIdx - 1);
+        else if (curIdx < 0) curIdx = 0;   // default to nearest
+        const target = alive[curIdx];
+        _gpAimTargetId = target && target.id;
+        if (target) {
+          const lerp = Math.min(1, realDt * 10);
+          input.mouse.x += (target.x - input.mouse.x) * lerp;
+          input.mouse.y += (target.y - input.mouse.y) * lerp;
+          if (realDt > 0) input._syncDomCursor();
+        }
+      } else {
+        _gpAimTargetId = null;
+      }
+    }
+    // Always snapshot buttons so an edge trigger that happened during manual
+    // aim isn't replayed the frame the stick is released.
+    _gpAimBtns = btns.slice();
+  } else {
+    _gpAimTargetId = null;
+    _gpAimBtns = [];
+  }
 
   // RTT heartbeat — host pings client every 2 s; receiver replies with PONG.
   // Solo / no-peer skips entirely.
@@ -3155,6 +3220,9 @@ function update(logicDt, realDt) {
 
   // ── INTRO ──
   if (gameState === 'intro') {
+    // D-pad focus nudge (gamepad menu nav). Must run before consumeClick so
+    // the user can tap D-pad to move onto a button, then A to click.
+    if (_gpHandleMenuNav(introBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('enter')) {
       audio.init();
       audio.playBGM('menu');
@@ -3213,6 +3281,7 @@ function update(logicDt, realDt) {
       input.clearFrame();
       return;
     }
+    if (_gpHandleMenuNav(ui.cosmeticShopBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) { gameState = 'charSelect'; }
     if (input.consumeClick()) {
       const mx = input.mouse.x, my = input.mouse.y;
@@ -3239,6 +3308,7 @@ function update(logicDt, realDt) {
 
   // ── COSMETIC PANEL ──
   if (gameState === 'cosmeticPanel') {
+    if (_gpHandleMenuNav(ui.cosmeticPanelBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) { gameState = 'charSelect'; }
     if (input.consumeClick()) {
       const mx = input.mouse.x, my = input.mouse.y;
@@ -3271,6 +3341,7 @@ function update(logicDt, realDt) {
 
   // ── CHARACTER SELECT ──
   if (gameState === 'charSelect') {
+    if (!_hsDisconnectPopup && _gpHandleMenuNav(charSelectBoxes)) { input.clearFrame(); return; }
     // Disconnect modal takes precedence — intercepts all charSelect input
     // until dismissed so the player doesn't accidentally click through.
     if (_hsDisconnectPopup) {
@@ -3391,6 +3462,7 @@ function update(logicDt, realDt) {
 
   // ── LOBBY (remote co-op) ──
   if (gameState === 'lobby') {
+    if (!_hsDisconnectPopup && _gpHandleMenuNav(lobbyBoxes)) { input.clearFrame(); return; }
     // Disconnect modal takes precedence so the player sees the notice
     // before the lobby screen resets underneath it.
     if (_hsDisconnectPopup) {
@@ -3659,6 +3731,7 @@ function update(logicDt, realDt) {
 
   // ── PAUSED ──
   if (gameState === 'paused') {
+    if (_gpHandleMenuNav(pauseMenuBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) {
       if (pauseQuitConfirm) { pauseQuitConfirm = false; }
       else { gameState = prevStateBeforePause || 'playing'; }
@@ -3711,6 +3784,7 @@ function update(logicDt, realDt) {
 
   // ── REST ──
   if (gameState === 'rest') {
+    if (_gpHandleMenuNav(restChoiceBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) { gameState = 'map'; input.clearFrame(); return; }
     if (input.consumeClick()) {
       const mx = input.mouse.x, my = input.mouse.y;
@@ -3727,6 +3801,7 @@ function update(logicDt, realDt) {
 
   // ── EVENT ──
   if (gameState === 'event') {
+    if (_gpHandleMenuNav(ui.eventBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) { gameState = 'map'; input.clearFrame(); return; }
     for (let i = 0; i < 3; i++) {
       if (input.consumeKey((i + 1).toString())) { handleEvent(i); break; }
@@ -3741,6 +3816,7 @@ function update(logicDt, realDt) {
 
   // ── SHOP ──
   if (gameState === 'shop') {
+    if (_gpHandleMenuNav(ui.shopBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape') || input.consumeKey('enter')) { gameState = 'map'; input.clearFrame(); return; }
     if (input.consumeClick()) {
       const cardId = ui.handleShopClick(input.mouse.x, input.mouse.y);
@@ -3770,6 +3846,7 @@ function update(logicDt, realDt) {
 
   // ── DISCARD ──
   if (gameState === 'discard') {
+    if (_gpHandleMenuNav(ui.discardBoxes)) { input.clearFrame(); return; }
     if (input.consumeClick()) {
       const discardId = ui.handleDiscardClick(input.mouse.x, input.mouse.y);
       if (discardId && discardPendingCardId) {
@@ -3804,6 +3881,7 @@ function update(logicDt, realDt) {
 
   // ── ITEM REWARD ──
   if (gameState === 'itemReward') {
+    if (_gpHandleMenuNav(ui.itemBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { gameState = 'map'; }
     if (input.consumeClick()) {
       const itemId = ui.handleItemClick(input.mouse.x, input.mouse.y);
@@ -3826,6 +3904,7 @@ function update(logicDt, realDt) {
 
   // ── UPGRADE ──
   if (gameState === 'upgrade') {
+    if (_gpHandleMenuNav(ui.upgradeBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { gameState = 'map'; }
     if (input.consumeClick()) {
       const cardId = ui.handleUpgradeClick(input.mouse.x, input.mouse.y);
@@ -3844,6 +3923,7 @@ function update(logicDt, realDt) {
 
   // ── DRAFT ──
   if (gameState === 'draft') {
+    if (_gpHandleMenuNav(draftBoxes)) { input.clearFrame(); return; }
     for (let i = 0; i < draftChoices.length; i++) {
       if (input.consumeKey((i + 1).toString())) { pickDraft(i); break; }
     }
@@ -4522,6 +4602,65 @@ function update(logicDt, realDt) {
 }
 
 // ── Click handlers ──────────────────────────────────────────────
+// D-pad focus-nudge. Warps the virtual cursor to the nearest box in the
+// given direction from the current cursor position, then syncs the DOM
+// cursor. The next A-button click is handled by the normal consumeClick
+// path, so every menu that drives its own `*Boxes` array gets keyboard-free
+// navigation with no per-menu state. Returns true if a box was picked.
+function _gpMenuNudge(boxes, dir) {
+  if (!boxes || boxes.length === 0) return false;
+  const mx = input.mouse.x, my = input.mouse.y;
+  let best = null, bestScore = Infinity;
+  for (const b of boxes) {
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    let ax, perp;
+    if      (dir === 'right') { ax = cx - mx; perp = Math.abs(cy - my); }
+    else if (dir === 'left')  { ax = mx - cx; perp = Math.abs(cy - my); }
+    else if (dir === 'down')  { ax = cy - my; perp = Math.abs(cx - mx); }
+    else if (dir === 'up')    { ax = my - cy; perp = Math.abs(cx - mx); }
+    else return false;
+    if (ax <= 6) continue;           // not meaningfully in that direction
+    const score = ax + perp * 2;     // penalize off-axis picks
+    if (score < bestScore) { bestScore = score; best = b; }
+  }
+  if (best) {
+    input.mouse.x = best.x + best.w / 2;
+    input.mouse.y = best.y + best.h / 2;
+    if (input._syncDomCursor) input._syncDomCursor();
+    return true;
+  }
+  // Wrap-around: if nothing is further in the given direction, pick the
+  // opposite-edge box so looping with the D-pad always finds something.
+  let fallback = null, fbScore = Infinity;
+  for (const b of boxes) {
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    let s;
+    if      (dir === 'right') s =  cx + Math.abs(cy - my) * 2;
+    else if (dir === 'left')  s = -cx + Math.abs(cy - my) * 2;
+    else if (dir === 'down')  s =  cy + Math.abs(cx - mx) * 2;
+    else                      s = -cy + Math.abs(cx - mx) * 2;
+    if (s < fbScore) { fbScore = s; fallback = b; }
+  }
+  if (fallback) {
+    input.mouse.x = fallback.x + fallback.w / 2;
+    input.mouse.y = fallback.y + fallback.h / 2;
+    if (input._syncDomCursor) input._syncDomCursor();
+    return true;
+  }
+  return false;
+}
+
+// Consume a directional D-pad/arrow press and nudge the cursor. Returns
+// true when any direction fired so callers can `return` without falling
+// through to other key consumers in the same handler.
+function _gpHandleMenuNav(boxes) {
+  if (input.consumeKey('arrowright')) { _gpMenuNudge(boxes, 'right'); return true; }
+  if (input.consumeKey('arrowleft'))  { _gpMenuNudge(boxes, 'left');  return true; }
+  if (input.consumeKey('arrowdown'))  { _gpMenuNudge(boxes, 'down');  return true; }
+  if (input.consumeKey('arrowup'))    { _gpMenuNudge(boxes, 'up');    return true; }
+  return false;
+}
+
 let charSelectBoxes = [];
 
 function handleCharSelectClick(mx, my) {
@@ -4842,15 +4981,18 @@ function _drawSchemeColumn(ctx, x, y, w, h, label, usePad, isP2) {
 
   let lines;
   if (usePad) {
+    // Kept to 8 lines so the panel geometry in _drawControlsOverlay doesn't
+    // have to re-flow. Kept under ~32 chars so the coop-narrow inner column
+    // (≈275 px at 13 px monospace) still fits them without clipping.
     lines = [
       'Move ………… left stick',
-      'Aim cursor … right stick',
-      'Attack / Select … A',
-      'Dodge ……… B',
-      'Next card … Y     Prev card … X',
-      'Slot 1 … LB       Slot 4 … RB',
-      'D-pad …… cards 1 / 2 / 3 / 4',
-      'Start = Enter    Back = Esc',
+      'Aim ………… right stick',
+      'Auto-aim when stick idle',
+      'Target cycle  LT prev / RT next',
+      'Attack … A     Dodge … B',
+      'Cards  LB=1  X=prev  Y=next  RB=4',
+      'D-pad: cards in run, nav in menus',
+      'Start = Enter     Back = B / Esc',
     ];
   } else if (isP2) {
     // Must match Input.js player2View + main.js localCoop branch:
@@ -5600,7 +5742,12 @@ function render() {
       // Hidden when already inside a remote lobby: the button would just be a
       // no-op (we're already connected) and takes up slot the TUTORIAL button
       // should slide into.
-      const _alreadyInRemote = net.role !== 'solo';
+      // Host/client/any-peer-connected all count as "already inside a remote
+      // lobby" — both sides then see the REMOTE LOBBY button disappear. The
+      // peer-count guard catches the edge case where a role cleanup lagged
+      // behind a disconnect; without it a host who just torn down their
+      // session would briefly see the button return.
+      const _alreadyInRemote = net.role !== 'solo' || (net.peers && net.peers.size > 0);
       const lbW = 200, lbH = 38, lbX = mbX + mbW + 10, lbY = mbY;
       if (!_alreadyInRemote) {
         ctx2.fillStyle = '#10202a';
