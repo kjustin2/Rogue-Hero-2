@@ -118,15 +118,29 @@ export class Player extends Entity {
           this.perfectDodgeWindow = basePerfWindow * windowMult;
           this.perfectDodgeTriggered = false;
 
-          const dmx = input.mouse.x - this.x, dmy = input.mouse.y - this.y;
-          const dist = Math.sqrt(dmx * dmx + dmy * dmy);
-          if (dist > 5) {
-            this.vx = (dmx / dist) * spd * 2.5;
-            this.vy = (dmy / dist) * spd * 2.5;
-          } else if (this.vx !== 0 || this.vy !== 0) {
+          // Gamepad-controlled players dodge in their movement direction —
+          // aiming with the right stick is a separate intent from rolling out
+          // of danger, and dodging toward an auto-aim target often rolls the
+          // player INTO the attack they were trying to escape.
+          // Keyboard + mouse players keep cursor-first dodge: the mouse is
+          // their aim AND their directional intent in the same motion.
+          const preferMovement = !!this._gamepadControlled;
+          const hasMovement = this.vx !== 0 || this.vy !== 0;
+          if (preferMovement && hasMovement) {
             const len = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
             this.vx = (this.vx / len) * spd * 2.5;
             this.vy = (this.vy / len) * spd * 2.5;
+          } else {
+            const dmx = input.mouse.x - this.x, dmy = input.mouse.y - this.y;
+            const dist = Math.sqrt(dmx * dmx + dmy * dmy);
+            if (dist > 5) {
+              this.vx = (dmx / dist) * spd * 2.5;
+              this.vy = (dmy / dist) * spd * 2.5;
+            } else if (hasMovement) {
+              const len = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+              this.vx = (this.vx / len) * spd * 2.5;
+              this.vy = (this.vy / len) * spd * 2.5;
+            }
           }
           events.emit('DODGE');
           events.emit('PLAY_SOUND', 'dodge');

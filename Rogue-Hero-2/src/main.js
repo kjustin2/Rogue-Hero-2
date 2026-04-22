@@ -3106,6 +3106,14 @@ function update(logicDt, realDt) {
     inMenu: _menuStates.indexOf(gameState) !== -1,
   });
 
+  // Per-player gamepad flag — lets player.js pick dodge direction from current
+  // movement (feels right on stick) instead of toward the cursor (mouse-style).
+  if (player) player._gamepadControlled = input.isGamepadActive(0);
+  if (players && players.count > 1) {
+    const _p2 = players.list[1];
+    if (_p2 && !_p2._isRemote) _p2._gamepadControlled = input.isGamepadActive(1);
+  }
+
   // Gamepad auto-aim for P1 while in combat. When the right stick is idle we
   // drift the cursor toward the locked target; moving the stick returns to
   // manual aim immediately. RT (btn 7) cycles to the next nearest enemy, LT
@@ -3598,6 +3606,10 @@ function update(logicDt, realDt) {
 
   // ── MAP ──
   if (gameState === 'map') {
+    // D-pad / arrow nav across the currently-reachable map nodes. The A-button
+    // always-on path sets mouse.justClicked, so after the nudge lands on a
+    // sphere the existing consumeClick branch below handles the selection.
+    if (_gpHandleMenuNav(runManager.getReachableBoxes())) { input.clearFrame(); return; }
     if (input.consumeKey('i') || input.consumeKey('I')) {
       ui.showInventory = !ui.showInventory;
     }
@@ -3816,7 +3828,11 @@ function update(logicDt, realDt) {
 
   // ── SHOP ──
   if (gameState === 'shop') {
-    if (_gpHandleMenuNav(ui.shopBoxes)) { input.clearFrame(); return; }
+    // Include the Leave Shop button in the nav set so down from the card row
+    // reaches it. handleShopClick still routes clicks by mouse position.
+    const _shopNav = (ui.shopBoxes || []).slice();
+    if (ui.leaveShopBox) _shopNav.push(ui.leaveShopBox);
+    if (_gpHandleMenuNav(_shopNav)) { input.clearFrame(); return; }
     if (input.consumeKey('escape') || input.consumeKey('enter')) { gameState = 'map'; input.clearFrame(); return; }
     if (input.consumeClick()) {
       const cardId = ui.handleShopClick(input.mouse.x, input.mouse.y);
@@ -3904,7 +3920,11 @@ function update(logicDt, realDt) {
 
   // ── UPGRADE ──
   if (gameState === 'upgrade') {
-    if (_gpHandleMenuNav(ui.upgradeBoxes)) { input.clearFrame(); return; }
+    // Include the Skip Upgrade button in the nav set so down from the card row
+    // reaches it. handleUpgradeClick still routes clicks by mouse position.
+    const _upgNav = (ui.upgradeBoxes || []).slice();
+    if (ui.skipUpgradeBox) _upgNav.push(ui.skipUpgradeBox);
+    if (_gpHandleMenuNav(_upgNav)) { input.clearFrame(); return; }
     if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { gameState = 'map'; }
     if (input.consumeClick()) {
       const cardId = ui.handleUpgradeClick(input.mouse.x, input.mouse.y);
@@ -3992,6 +4012,12 @@ function update(logicDt, realDt) {
   if (input.consumeRightClick()) {
     selectedCardSlot = (selectedCardSlot + 1) % 4;
   }
+  // Gamepad shoulder / face-button cycling — X/LB = prev, Y/RB = next.
+  // Input.js emits p1/p2 pseudo-keys so each player's selected slot advances.
+  if (input.consumeKey('p1cardprev')) selectedCardSlot = (selectedCardSlot + 3) % 4;
+  if (input.consumeKey('p1cardnext')) selectedCardSlot = (selectedCardSlot + 1) % 4;
+  if (input.consumeKey('p2cardprev')) selectedCardSlotP2 = (selectedCardSlotP2 + 3) % 4;
+  if (input.consumeKey('p2cardnext')) selectedCardSlotP2 = (selectedCardSlotP2 + 1) % 4;
   // P1 number keys: solo uses 1-4; co-op uses 7/8/9/0 (right-side cluster)
   if (localCoop) {
     const p1Keys = ['7', '8', '9', '0'];
@@ -4610,40 +4636,68 @@ function update(logicDt, realDt) {
 function _gpMenuNudge(boxes, dir) {
   if (!boxes || boxes.length === 0) return false;
   const mx = input.mouse.x, my = input.mouse.y;
+  const horizontal = (dir === 'left' || dir === 'right');
+
+  // Two candidates per pass: a "same-band" pick (same row for horizontal nav,
+  // same column for vertical) and a general best pick. Same-band wins when
+  // present — prevents left/right on char-select from jumping to the row of
+  // toggle buttons above/below instead of the adjacent hero, and keeps up/down
+  // inside a column of stacked options.
   let best = null, bestScore = Infinity;
+  let bestBand = null, bandAx = Infinity;
   for (const b of boxes) {
     const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
-    let ax, perp;
-    if      (dir === 'right') { ax = cx - mx; perp = Math.abs(cy - my); }
-    else if (dir === 'left')  { ax = mx - cx; perp = Math.abs(cy - my); }
-    else if (dir === 'down')  { ax = cy - my; perp = Math.abs(cx - mx); }
-    else if (dir === 'up')    { ax = my - cy; perp = Math.abs(cx - mx); }
-    else return false;
-    if (ax <= 6) continue;           // not meaningfully in that direction
-    const score = ax + perp * 2;     // penalize off-axis picks
+    let ax, perp, inBand;
+    if (horizontal) {
+      inBand = my >= b.y - 4 && my <= b.y + b.h + 4;
+      perp = Math.abs(cy - my);
+      ax = (dir === 'right') ? (cx - mx) : (mx - cx);
+    } else {
+      inBand = mx >= b.x - 4 && mx <= b.x + b.w + 4;
+      perp = Math.abs(cx - mx);
+      ax = (dir === 'down') ? (cy - my) : (my - cy);
+    }
+    if (ax <= 6) continue;
+    const score = ax + perp * 2;
     if (score < bestScore) { bestScore = score; best = b; }
+    if (inBand && ax < bandAx) { bandAx = ax; bestBand = b; }
   }
-  if (best) {
-    input.mouse.x = best.x + best.w / 2;
-    input.mouse.y = best.y + best.h / 2;
+  const chosen = bestBand || best;
+  if (chosen) {
+    input.mouse.x = chosen.x + chosen.w / 2;
+    input.mouse.y = chosen.y + chosen.h / 2;
     if (input._syncDomCursor) input._syncDomCursor();
     return true;
   }
   // Wrap-around: if nothing is further in the given direction, pick the
   // opposite-edge box so looping with the D-pad always finds something.
+  // Same same-band preference applies so wrapping stays on the current row.
   let fallback = null, fbScore = Infinity;
+  let fallbackBand = null, fbBand = Infinity;
   for (const b of boxes) {
     const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+    const inBand = horizontal
+      ? (my >= b.y - 4 && my <= b.y + b.h + 4)
+      : (mx >= b.x - 4 && mx <= b.x + b.w + 4);
     let s;
     if      (dir === 'right') s =  cx + Math.abs(cy - my) * 2;
     else if (dir === 'left')  s = -cx + Math.abs(cy - my) * 2;
     else if (dir === 'down')  s =  cy + Math.abs(cx - mx) * 2;
     else                      s = -cy + Math.abs(cx - mx) * 2;
     if (s < fbScore) { fbScore = s; fallback = b; }
+    if (inBand) {
+      let sb;
+      if      (dir === 'right') sb =  cx;
+      else if (dir === 'left')  sb = -cx;
+      else if (dir === 'down')  sb =  cy;
+      else                      sb = -cy;
+      if (sb < fbBand) { fbBand = sb; fallbackBand = b; }
+    }
   }
-  if (fallback) {
-    input.mouse.x = fallback.x + fallback.w / 2;
-    input.mouse.y = fallback.y + fallback.h / 2;
+  const fb = fallbackBand || fallback;
+  if (fb) {
+    input.mouse.x = fb.x + fb.w / 2;
+    input.mouse.y = fb.y + fb.h / 2;
     if (input._syncDomCursor) input._syncDomCursor();
     return true;
   }
@@ -4989,9 +5043,9 @@ function _drawSchemeColumn(ctx, x, y, w, h, label, usePad, isP2) {
       'Aim ………… right stick',
       'Auto-aim when stick idle',
       'Target cycle  LT prev / RT next',
-      'Attack … A     Dodge … B',
-      'Cards  LB=1  X=prev  Y=next  RB=4',
-      'D-pad: cards in run, nav in menus',
+      'Attack … A     Dodge … B (in move dir)',
+      'Cards  LB/X = prev   RB/Y = next',
+      'D-pad: direct card slot / menu nav',
       'Start = Enter     Back = B / Esc',
     ];
   } else if (isP2) {

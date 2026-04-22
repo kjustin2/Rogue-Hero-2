@@ -216,10 +216,10 @@ export class InputManager {
       // Cursor + A button ALWAYS work for pad 0 so menus are navigable even
       // before the player has clicked the gamepad toggle on. (P2's A maps to
       // 'q' which is in-game; gate it behind enabled to avoid keyboard fights.)
-      // When remapPadToP2 is active, physical pad 0 is driving logical P2 —
-      // skip the P1 always-on block so the same button press doesn't also
-      // click P1's mouse or drive P1's aim cursor.
-      if (isP1 && this.canvas && !remapPadToP2) {
+      // When remapPadToP2 is active, physical pad 0 is driving logical P2 in
+      // gameplay — but menus only have ONE cursor and we still want the user's
+      // lone pad to navigate, so the gate keeps this block alive when inMenu.
+      if (isP1 && this.canvas && (inMenu || !remapPadToP2)) {
         const mag2 = rx * rx + ry * ry;
         if (mag2 > 0.04) {
           const speed = 18;
@@ -285,20 +285,17 @@ export class InputManager {
       if (btns[1] && !prevBtns[1] && !(isP1 && inMenu)) {
         this.justPressed.add(dodgeKey);
       }
-      // X (idx 2): cycle PREVIOUS card slot (right-click on P1; key on P2).
-      if (btns[2] && !prevBtns[2]) {
-        if (isP1) this.mouse.justRightClicked = true;
-        else this.justPressed.add(cardKeys[0]);
-      }
-      // Y (idx 3): cycle NEXT card slot — main "scroll cards" button.
-      if (btns[3] && !prevBtns[3]) {
-        if (isP1) this.mouse.justRightClicked = true;
-        else this.justPressed.add(cardKeys[1]);
-      }
-      // LB (idx 4): jump to card slot 1
-      if (btns[4] && !prevBtns[4]) this.justPressed.add(cardKeys[0]);
-      // RB (idx 5): jump to card slot 4
-      if (btns[5] && !prevBtns[5]) this.justPressed.add(cardKeys[3]);
+      // Shoulder + face-button card cycling — X/LB cycle to the previous slot,
+      // Y/RB cycle to the next. Both players use the same pair of pseudo-keys
+      // (p1cardprev/p1cardnext/p2cardprev/p2cardnext) consumed in main.js so
+      // the active selectedCardSlot for the right player advances. D-pad below
+      // keeps direct slot-select for muscle-memory users.
+      const prevKey = isP1 ? 'p1cardprev' : 'p2cardprev';
+      const nextKey = isP1 ? 'p1cardnext' : 'p2cardnext';
+      if (btns[2] && !prevBtns[2]) this.justPressed.add(prevKey);
+      if (btns[3] && !prevBtns[3]) this.justPressed.add(nextKey);
+      if (btns[4] && !prevBtns[4]) this.justPressed.add(prevKey);
+      if (btns[5] && !prevBtns[5]) this.justPressed.add(nextKey);
       // D-pad (idx 12-15): direct slot select Up=1, Right=2, Down=3, Left=4
       if (btns[12] && !prevBtns[12]) this.justPressed.add(cardKeys[0]);
       if (btns[13] && !prevBtns[13]) this.justPressed.add(cardKeys[2]);
@@ -334,6 +331,14 @@ export class InputManager {
     return !!(g && g.connected);
   }
 
+  // True if the slot's pad is connected AND the player has toggled it on —
+  // i.e. the pad is currently driving that logical player. main.js uses this
+  // to route the dodge direction toward movement (gamepad) vs cursor (mouse).
+  isGamepadActive(slot) {
+    const g = this._gpState && this._gpState[slot];
+    return !!(g && g.connected && g.enabled !== false);
+  }
+
   // Live state for the sanity-test UI: { connected, enabled, btns, lx, ly, rx, ry }
   getGamepadState(slot) {
     const g = this._gpState && this._gpState[slot];
@@ -360,11 +365,12 @@ export class InputManager {
       _aimX: 0, _aimY: 0,
       mouse: { x: 0, y: 0, leftDown: false, rightDown: false, justClicked: false, justRightClicked: false },
       isDown(key) {
-        // P2 owns WASD only — never arrows
-        if (key === 'a') return self.keys.has('a');
-        if (key === 'd') return self.keys.has('d');
-        if (key === 'w') return self.keys.has('w');
-        if (key === 's') return self.keys.has('s');
+        // P2 owns WASD only — never arrows. Delegate to self.isDown so the
+        // gamepad left-stick on pad 1 (or pad 0 in the P2-only remap) drives
+        // movement the same way keyboard WASD does. Previously we read
+        // `self.keys` directly, which ignored the stick and left a pad-only P2
+        // stuck in place during combat.
+        if (key === 'a' || key === 'd' || key === 'w' || key === 's') return self.isDown(key);
         // Block arrow lookups so player.js movement check never reads P1's keys
         return false;
       },

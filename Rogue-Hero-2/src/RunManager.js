@@ -152,6 +152,23 @@ export class RunManager {
     return null;
   }
 
+  // RH2 gamepad: axis-aligned boxes around each currently-reachable node,
+  // suitable for feeding to the generic menu-nudge helper so the D-pad can
+  // walk the map between `curr.next` options. Empty before the first draw.
+  getReachableBoxes() {
+    if (!this.clickSpheres || !this.currentNodeId) return [];
+    const curr = this.nodeMap[this.currentNodeId];
+    if (!curr) return [];
+    const validTargets = curr.next;
+    const boxes = [];
+    for (const s of this.clickSpheres) {
+      if (validTargets.includes(s.id)) {
+        boxes.push({ x: s.x - s.r, y: s.y - s.r, w: s.r * 2, h: s.r * 2, nodeId: s.id });
+      }
+    }
+    return boxes;
+  }
+
   // Returns the screen-space position of a known node id (or null).
   getNodePosition(nodeId) {
     if (!this.clickSpheres) return null;
