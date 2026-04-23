@@ -194,7 +194,7 @@ export class Net {
 
   _cfMakePeer(peerId) {
     const pc = new RTCPeerConnection(RTC_CONFIG);
-    const peer = { pc, snapDc: null, evtDc: null, iceBuf: [] };
+    const peer = { pc, snapDc: null, evtDc: null, iceBuf: [], _discTimer: 0 };
     this.peers.set(peerId, peer);
 
     pc.onicecandidate = (evt) => {
@@ -207,16 +207,27 @@ export class Net {
       const s = pc.connectionState;
       console.log(`[Net] peer ${peerId} → ${s}`);
       if (s === 'connected') {
+        if (peer._discTimer) { clearTimeout(peer._discTimer); peer._discTimer = 0; }
         this._dispatch('peer', { kind: 'join', peerId }, peerId);
         this._dispatch('status', { kind: 'peer', msg: `Peer connected (${this.peers.size} total)` });
       } else if (s === 'failed' || s === 'closed') {
-        // 'disconnected' is transient (brief network hiccup) — WebRTC may
-        // auto-recover in <5s. Only fatal states prune the peer.
+        if (peer._discTimer) { clearTimeout(peer._discTimer); peer._discTimer = 0; }
         this._cfRemovePeer(peerId);
       } else if (s === 'disconnected') {
-        // Tell the UI so a status banner appears, but keep the peer record
-        // so we can recover if ICE heals itself.
+        // Transient: ICE may heal in a few seconds. Keep the peer record,
+        // but arm a fallback timer so a peer that went away silently (tab
+        // closed, crashed, sleeping laptop) is removed within a bounded
+        // window — otherwise main.js never sees a 'leave' until the ~30 s
+        // ICE timeout transitions us to 'failed'.
         this._dispatch('status', { kind: 'peer-error', msg: `Peer ${peerId} link unstable — attempting recovery` });
+        if (peer._discTimer) clearTimeout(peer._discTimer);
+        peer._discTimer = setTimeout(() => {
+          peer._discTimer = 0;
+          if (pc.connectionState === 'disconnected') {
+            console.log(`[Net] peer ${peerId} stuck disconnected — forcing leave`);
+            this._cfRemovePeer(peerId);
+          }
+        }, 8000);
       }
     };
 
@@ -235,6 +246,22 @@ export class Net {
   }
 
   // We are the initiator: create offer + data channels.
+  // Wire close/error handlers on a DataChannel so a remote-initiated close
+  // (the peer called pc.close() or their tab disappeared) evicts the peer
+  // immediately instead of waiting for connectionState to limp through
+  // 'disconnected' → 'failed' (can take 30+ s on some networks).
+  _cfWireDcLifecycle(dc, peerId) {
+    const onGone = (why) => {
+      console.log(`[Net] peer ${peerId} evt channel ${why} — evicting`);
+      this._cfRemovePeer(peerId);
+    };
+    dc.onclose = () => onGone('closed');
+    dc.onerror = () => onGone('errored');
+    // Some WebRTC implementations surface a remote close only via
+    // onclosing; dispatch the same eviction to cover that path too.
+    if ('onclosing' in dc) dc.onclosing = () => onGone('closing');
+  }
+
   async _cfInitiatePeer(peerId) {
     const peer = this._cfMakePeer(peerId);
     // snap: unordered/lossy for positions; evt: ordered/reliable for game events
@@ -243,6 +270,7 @@ export class Net {
     peer.snapDc.binaryType = 'arraybuffer';
     peer.snapDc.onmessage = (e) => this._onSnapMessage(e, peerId);
     peer.evtDc.onmessage  = (e) => this._dispatch('evt',  JSON.parse(e.data), peerId);
+    this._cfWireDcLifecycle(peer.evtDc, peerId);
     const offer = await peer.pc.createOffer();
     await peer.pc.setLocalDescription(offer);
     this._cfSignalSend(peerId, { type: 'offer', sdp: peer.pc.localDescription });
@@ -260,6 +288,7 @@ export class Net {
       } else if (dc.label === 'evt') {
         peer.evtDc = dc;
         dc.onmessage = (e) => this._dispatch('evt', JSON.parse(e.data), peerId);
+        this._cfWireDcLifecycle(dc, peerId);
       }
     };
   }
@@ -294,9 +323,38 @@ export class Net {
   _cfRemovePeer(peerId) {
     const peer = this.peers.get(peerId);
     if (!peer) return;
-    try { peer.pc.close(); } catch {}
+    if (peer._discTimer) { clearTimeout(peer._discTimer); peer._discTimer = 0; }
+    // Delete from the map BEFORE closing — pc.close() can trigger a
+    // synchronous 'closed' transition on onconnectionstatechange which
+    // would re-enter _cfRemovePeer for the same peerId. Deleting first
+    // makes the re-entry a fast no-op via the `if (!peer) return` guard.
     this.peers.delete(peerId);
+    try { peer.pc.close(); } catch {}
     this._dispatch('peer', { kind: 'leave', peerId }, peerId);
+  }
+
+  // Flush pending reliable events, then tear down. Callers about to leave
+  // (menu back-out, tab unload, game over → menu) must use this instead of
+  // a synchronous sendReliable + disconnect, otherwise pc.close() drops the
+  // in-flight message before it reaches the wire and the other side has to
+  // wait for the 8 s 'disconnected' fallback (or 30 s ICE timeout) to notice.
+  // Resolves after the DataChannel send buffers drain or the 500 ms cap hits.
+  async gracefulDisconnect(timeoutMs = 500) {
+    if (!this.connected || this.role === 'solo') { this.disconnect(); return; }
+    const start = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    await new Promise((resolve) => {
+      const tick = () => {
+        let pending = 0;
+        for (const peer of this.peers.values()) {
+          pending += (peer.evtDc?.bufferedAmount || 0);
+        }
+        if (pending === 0 || now() - start >= timeoutMs) resolve();
+        else setTimeout(tick, 25);
+      };
+      tick();
+    });
+    this.disconnect();
   }
 
   _cfSignalSend(toPeerId, data) {

@@ -231,6 +231,7 @@ net.on('peer', (msg) => {
     _peerToIndex.delete(msg.peerId);
     _remoteCharIds.delete(msg.peerId);
     _remoteReadyByPeer.delete(msg.peerId);
+    _lastPongByPeer.delete(msg.peerId);
     if (net.role === 'host') _hostBroadcastPeerIndices();
     const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard'].includes(gameState);
     if (inRun) {
@@ -264,30 +265,25 @@ net.on('peer', (msg) => {
       // Audio cue + screen shake so the disconnect is impossible to miss
       events.emit('PLAY_SOUND', 'crash');
       events.emit('SCREEN_SHAKE', { duration: 0.5, intensity: 0.6 });
-    } else if (gameState === 'charSelect') {
+    } else if (gameState === 'charSelect' || gameState === 'lobby') {
+      // Unified pre-run teardown — any peer leaving during lobby/charSelect
+      // ends the remote session for the remaining side. The popup owns
+      // transition back to intro on user dismissal, and the 30 s
+      // auto-dismiss timer guarantees we don't strand the user.
       _remoteReady = false;
       _clientReady = false;
-      lobbyStatusMsg = 'Remote player disconnected';
       _hsDisconnectPopup = true;
-      _hsDisconnectReason = 'lost connection';
-      // Tear down the session immediately — player needs to acknowledge
-      // and return to the menu before any further co-op flow can happen.
+      _hsDisconnectReason = net.role === 'client' ? 'host disconnected' : 'left the session';
+      _hsDisconnectAutoCloseAt = performance.now() + 30000;
+      lobbyStatusMsg = net.role === 'client'
+        ? 'Host disconnected'
+        : 'Remote lobby ended — a player left';
       try { net.disconnect(); } catch {}
       net.role = 'solo';
       _lobbyPeers = [];
+      if (gameState === 'lobby') lobbyMode = 'menu';
       players.list = players.list.filter(p => !p._isRemote);
       if (player) player._coopMode = false;
-    } else if (gameState === 'lobby') {
-      if (net.role === 'client') {
-        lobbyMode = 'joining';
-        lobbyStatusMsg = 'Host disconnected — enter a new code';
-        net.role = 'solo';
-        _hsDisconnectPopup = true;
-        _hsDisconnectReason = 'host disconnected';
-      } else {
-        lobbyStatusMsg = 'A player disconnected';
-        _remoteReady = false;
-      }
     }
   }
 });
@@ -559,10 +555,17 @@ net.on('evt', (msg, senderPeerId) => {
   } else if (type === 'PING') {
     // Echo back with the original t so the sender can compute RTT
     net.sendReliable('evt', { type: 'PONG', t: msg.t });
+    // Client-side liveness: remember the host is alive. Watched in the
+    // main update loop so a vanished host doesn't leave the client stuck
+    // on the READY button forever.
+    if (net.role === 'client') _lastHostPingAt = performance.now();
 
   } else if (type === 'PONG') {
     const t = msg.t || p.t;
     if (typeof t === 'number') _pushRtt(performance.now() - t);
+    // Mark peer as alive for the PONG watchdog. senderPeerId is the peer
+    // that sent this PONG back to us.
+    if (senderPeerId) _lastPongByPeer.set(senderPeerId, performance.now());
 
   } else if (type === 'PHASE_DONE') {
     // Peer finished their post-combat decision phase. In 3–4P the map only
@@ -852,18 +855,17 @@ net.on('evt', (msg, senderPeerId) => {
     events.emit('PLAY_SOUND', 'crash');
     events.emit('SCREEN_SHAKE', { duration: 0.5, intensity: 0.6 });
     if (!inRun) {
-      // In lobby / charSelect: show a blocking popup instead of silently
-      // dumping the remaining player back to the main menu — they need to
-      // actually see that the other player left.
+      // Lobby / charSelect: show a blocking popup AND arm the auto-close
+      // timer so the user always lands back on the main menu even if they
+      // walked away from the screen.
       lobbyMode = 'menu';
       lobbyStatusMsg = 'Remote player left the session';
       _remoteReady = false; _clientReady = false;
       if (gameState === 'charSelect' || gameState === 'lobby') {
         _hsDisconnectPopup = true;
         _hsDisconnectReason = 'left the session';
+        _hsDisconnectAutoCloseAt = performance.now() + 30000;
       }
-      // Stay on current screen until the player dismisses the popup; the
-      // modal owns the "return to intro" transition so they see the notice.
     }
     // In-run: the existing "REMOTE PLAYER DISCONNECTED" banner renders for
     // the next ~12 s and the player continues solo — matches the behaviour
@@ -972,6 +974,11 @@ let _remoteDisconnectTimer = 0;  // seconds until banner auto-hides
 let _hsDisconnectPopup = false;
 let _hsDisconnectReason = ''; // short human label ("left session" / "lost connection")
 let _hsDisconnectBoxes = [];  // modal OK button hit region
+// Auto-dismiss deadline (ms-since-origin). When the popup comes up during
+// lobby/charSelect the user should always land back on the main menu — if
+// they walked away or the tab lost focus, this timer flips it back to
+// intro automatically. Dismissal by click/keypress cancels the timer.
+let _hsDisconnectAutoCloseAt = 0;
 let _charSelectQuitConfirm = false; // MP: second click on Main Menu actually leaves
 let _lobbyPeers = [];            // host: [{ peerId, name }] peers currently in lobby
 // PHASE_DONE handshake — gate map advance until EVERY player has finished
@@ -1066,6 +1073,7 @@ function _dismissHsDisconnect() {
   _hsDisconnectPopup = false;
   _hsDisconnectReason = '';
   _hsDisconnectBoxes.length = 0;
+  _hsDisconnectAutoCloseAt = 0;
   // Tear down any lingering connection and return to the main menu.
   try { net.disconnect(); } catch {}
   net.role = 'solo';
@@ -1087,7 +1095,7 @@ function _drawHsDisconnectPopup(ctx) {
   ctx.save();
   ctx.fillStyle = 'rgba(0,0,0,0.78)';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const pw = 520, ph = 240;
+  const pw = 540, ph = 260;
   const px = (canvas.width - pw) / 2, py = (canvas.height - ph) / 2;
   ctx.shadowColor = '#ff6644';
   ctx.shadowBlur = 28 * pulse;
@@ -1098,19 +1106,22 @@ function _drawHsDisconnectPopup(ctx) {
   ctx.fillStyle = '#ffaa88';
   ctx.font = 'bold 22px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText('⚠  PARTNER DISCONNECTED  ⚠', canvas.width / 2, py + 56);
+  ctx.fillText('⚠  REMOTE LOBBY ENDED  ⚠', canvas.width / 2, py + 56);
   ctx.fillStyle = '#ffd0bb';
-  ctx.font = '14px monospace';
-  ctx.fillText(`Your partner ${_hsDisconnectReason || 'disconnected'}.`, canvas.width / 2, py + 96);
-  ctx.fillText('The co-op session has ended.', canvas.width / 2, py + 118);
-  const btnW = 200, btnH = 46;
+  ctx.font = '15px monospace';
+  ctx.fillText(`The other player ${_hsDisconnectReason || 'disconnected'}.`, canvas.width / 2, py + 100);
+  ctx.fillText('The co-op session has ended.', canvas.width / 2, py + 124);
+  ctx.fillStyle = '#aa8877';
+  ctx.font = '12px monospace';
+  ctx.fillText('Press OK (or Enter) to return to the main menu.', canvas.width / 2, py + 154);
+  const btnW = 220, btnH = 48;
   const bx = canvas.width / 2 - btnW / 2;
   const by = py + ph - 70;
   ctx.fillStyle = '#2a1a16';
   ctx.beginPath(); ctx.roundRect(bx, by, btnW, btnH, 8); ctx.fill();
   ctx.strokeStyle = '#ff8866'; ctx.lineWidth = 2; ctx.stroke();
-  ctx.fillStyle = '#ffcc99'; ctx.font = 'bold 15px monospace';
-  ctx.fillText('RETURN TO MENU', canvas.width / 2, by + 29);
+  ctx.fillStyle = '#ffcc99'; ctx.font = 'bold 16px monospace';
+  ctx.fillText('OK — RETURN TO MENU', canvas.width / 2, by + 30);
   ctx.restore();
   _hsDisconnectBoxes.length = 0;
   _hsDisconnectBoxes.push({ x: bx, y: by, w: btnW, h: btnH });
@@ -1512,12 +1523,31 @@ let _profileFrames = 0;
 let _profileFrameAccum = 0;
 
 // ── Network RTT measurement ──────────────────────────────────────────
-// Host sends PING every 2 s; receiver echoes immediately. Rolling avg of
-// last 5 samples. Used by the network health icon and (optionally) to
-// adapt remote-entity interpolation.
+// Host sends PING every 2 s during runs, every 1 s during lobby/charSelect.
+// Receiver echoes immediately. Rolling avg of last 5 samples for the RTT
+// indicator; the PONG watchdog uses the same stream for liveness.
 const _rttSamples = [];
 let _rttAvg = 0;
 let _rttPingTimer = 0;
+// PONG watchdog — host-side. Peers that stop responding (tab closed, crash,
+// network cut) leave their RTCPeerConnection stuck in 'connected' or
+// 'disconnected' for many seconds before WebRTC notices. Track the last
+// time each peer replied; if the gap exceeds PONG_TIMEOUT_MS the peer is
+// force-evicted so the charSelect/lobby UI doesn't stay stuck on
+// "WAITING FOR P2…".
+const _lastPongByPeer = new Map();
+const PONG_TIMEOUT_MS = 5000; // 5 missed 1 s pre-run pings = evict
+let _pongCheckAccum = 0;
+// Client-side: track when the host last pinged us. If the host goes away
+// the client can sit on the charSelect READY button forever waiting for
+// GAME_STARTED. This timer detects that and tears the session down.
+let _lastHostPingAt = 0;
+const CLIENT_HOST_TIMEOUT_MS = 6000;
+// Lobby-state watchdog: the peak peer count we've seen since entering
+// lobby/charSelect. Used to detect "had a peer, now have zero" without
+// needing the peer-leave event to have fired — if something ate the
+// event, this still catches the transition and raises the popup.
+let _lobbyPeakPeerCount = 0;
 // ── Gamepad aim-assist state (P1 only) ────────────────────────────────
 // `_gpAimTargetId` is the enemy id currently locked to; null = manual aim.
 // `_gpAimBtns` is the previous frame's button snapshot, used to edge-trigger
@@ -2316,6 +2346,7 @@ function startNewRun(explicitSeed) {
   _hsDisconnectPopup = false;
   _hsDisconnectReason = '';
   _hsDisconnectBoxes.length = 0;
+  _hsDisconnectAutoCloseAt = 0;
   _charSelectQuitConfirm = false;
 
   runManager.generateMap();
@@ -3193,14 +3224,122 @@ function update(logicDt, realDt) {
     _gpAimBtns = [];
   }
 
-  // RTT heartbeat — host pings client every 2 s; receiver replies with PONG.
+  // RTT heartbeat + liveness probe. Host pings every 1 s during pre-run
+  // (lobby/charSelect) so a vanished peer is evicted within ~5 s; every
+  // 2 s during runs to save bandwidth. Receiver always echoes with PONG.
   // Solo / no-peer skips entirely.
+  const _prerun = gameState === 'lobby' || gameState === 'charSelect';
   if (net.role === 'host' && net.peers.size > 0) {
     _rttPingTimer -= realDt;
     if (_rttPingTimer <= 0) {
-      _rttPingTimer = 2.0;
-      net.sendReliable('evt', { type: 'PING', t: performance.now() });
+      _rttPingTimer = _prerun ? 1.0 : 2.0;
+      // Seed the last-pong map for peers we haven't heard from yet so a
+      // peer that joined mid-charSelect isn't immediately evicted on the
+      // first watchdog tick before any PONG could possibly have arrived.
+      const nowMs = performance.now();
+      for (const [pid] of net.peers) {
+        if (!_lastPongByPeer.has(pid)) _lastPongByPeer.set(pid, nowMs);
+      }
+      net.sendReliable('evt', { type: 'PING', t: nowMs });
     }
+    // Watchdog: check every ~500ms for peers that have gone silent. This
+    // is the backstop for all the ways a peer can disappear without the
+    // WebRTC stack ever telling us: tab crash, sleeping laptop, process
+    // killed, OS-level network drop. Without it the host can stay on
+    // "WAITING FOR P2…" indefinitely.
+    _pongCheckAccum += realDt;
+    if (_pongCheckAccum >= 0.5) {
+      _pongCheckAccum = 0;
+      const nowMs = performance.now();
+      const deadPeers = [];
+      for (const [pid, peer] of net.peers) {
+        // Fast path: if the evt DataChannel is already closed, the peer is
+        // gone right now — don't wait on the PONG timer. This catches the
+        // common cases (remote called pc.close(), remote tab disappeared)
+        // in ~0 ms instead of 7 s.
+        const dcState = peer?.evtDc?.readyState;
+        if (dcState === 'closed' || dcState === 'closing') {
+          deadPeers.push(pid);
+          continue;
+        }
+        const last = _lastPongByPeer.get(pid);
+        if (last != null && nowMs - last > PONG_TIMEOUT_MS) deadPeers.push(pid);
+      }
+      for (const pid of deadPeers) {
+        console.log(`[Net] watchdog evicting peer ${pid}`);
+        _lastPongByPeer.delete(pid);
+        // Synthesize a peer-leave event through the Net instance so the
+        // existing 'peer leave' handler runs and cleans up UI state.
+        try { net._cfRemovePeer?.(pid); } catch {}
+        // Trystero path (no _cfRemovePeer) or cases where the peer entry
+        // is already gone but we still need the handler to fire.
+        if (net.peers.has(pid)) {
+          net.peers.delete(pid);
+          net._dispatch?.('peer', { kind: 'leave', peerId: pid }, pid);
+        }
+      }
+    }
+  } else {
+    // Reset watchdog state whenever we're not actively hosting so a future
+    // host cycle starts fresh.
+    if (_lastPongByPeer.size > 0) _lastPongByPeer.clear();
+    _pongCheckAccum = 0;
+  }
+  // Client-side liveness: the host pings us on a steady cadence (1 s
+  // pre-run, 2 s in-run). If no PING arrives for CLIENT_HOST_TIMEOUT_MS we
+  // assume the host vanished and synthesize a peer-leave so the existing
+  // handler tears the session down. Mirrors the host-side watchdog so
+  // the "stuck at hero select" state can't persist on either side.
+  if (net.role === 'client' && net.peers.size > 0) {
+    // Seed on first frame we're a client with peers so a brand-new session
+    // doesn't immediately time out before the first PING round-trip.
+    if (_lastHostPingAt === 0) _lastHostPingAt = performance.now();
+    if (performance.now() - _lastHostPingAt > CLIENT_HOST_TIMEOUT_MS) {
+      console.log('[Net] client-side watchdog: host silent — tearing session down');
+      _lastHostPingAt = 0;
+      for (const [pid] of [...net.peers]) {
+        try { net._cfRemovePeer?.(pid); } catch {}
+        if (net.peers.has(pid)) {
+          net.peers.delete(pid);
+          net._dispatch?.('peer', { kind: 'leave', peerId: pid }, pid);
+        }
+      }
+    }
+  } else {
+    _lastHostPingAt = 0;
+  }
+  // Pre-run lobby-state watchdog. Belt-and-suspenders fallback: if we're
+  // at lobby or charSelect with a remote role but no peers remain, and
+  // the popup hasn't been raised yet, raise it here. Covers any edge case
+  // where the peer-leave event was lost, fired on a different gameState,
+  // or didn't run for any reason. Also tracks peer-count drops for peers
+  // that joined and left inside a single event tick (we remember the
+  // peak peer count so a transient 1→0 is treated as someone leaving).
+  if (gameState === 'lobby' || gameState === 'charSelect') {
+    const curPeers = net.peers.size;
+    if (curPeers > _lobbyPeakPeerCount) _lobbyPeakPeerCount = curPeers;
+    const hadPeer = _lobbyPeakPeerCount > 0;
+    const noPeersNow = curPeers === 0;
+    const stillRemoteRole = net.role !== 'solo';
+    if (hadPeer && noPeersNow && stillRemoteRole && !_hsDisconnectPopup) {
+      console.log(`[Lobby] watchdog firing: peak=${_lobbyPeakPeerCount} cur=${curPeers} role=${net.role} gameState=${gameState} — raising popup`);
+      _remoteReady = false;
+      _clientReady = false;
+      _hsDisconnectPopup = true;
+      _hsDisconnectReason = net.role === 'client' ? 'host disconnected' : 'left the session';
+      _hsDisconnectAutoCloseAt = performance.now() + 30000;
+      lobbyStatusMsg = net.role === 'client'
+        ? 'Host disconnected'
+        : 'Remote lobby ended — a player left';
+      try { net.disconnect(); } catch {}
+      net.role = 'solo';
+      _lobbyPeers = [];
+      if (gameState === 'lobby') lobbyMode = 'menu';
+      players.list = players.list.filter(p => !p._isRemote);
+      if (player) player._coopMode = false;
+    }
+  } else {
+    _lobbyPeakPeerCount = 0;
   }
   // Network debug HUD toggle (Ctrl+N) and 1Hz rate computation
   if ((input.keys.has('control') || input.keys.has('meta')) && input.consumeKey('n')) {
@@ -3381,6 +3520,13 @@ function update(logicDt, realDt) {
     // Disconnect modal takes precedence — intercepts all charSelect input
     // until dismissed so the player doesn't accidentally click through.
     if (_hsDisconnectPopup) {
+      // Auto-close: if the user walked away, return them to the main menu
+      // after 5 s so the "stuck at hero select" state can't persist.
+      if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
+        _dismissHsDisconnect();
+        input.clearFrame();
+        return;
+      }
       const click = input.consumeClick();
       const keyOk = input.consumeKey('enter') || input.consumeKey('escape') || input.consumeKey(' ');
       if (click) {
@@ -3453,8 +3599,12 @@ function update(logicDt, realDt) {
         } else {
           // Confirmed or solo: tear down any remote connection cleanly.
           if (net.role !== 'solo') {
-            if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'charSelect_back' }); } catch {} }
-            net.disconnect();
+            if (net.peers.size > 0) {
+              try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'charSelect_back' }); } catch {}
+              net.gracefulDisconnect();
+            } else {
+              net.disconnect();
+            }
           }
           net.role = 'solo';
           _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
@@ -3502,6 +3652,13 @@ function update(logicDt, realDt) {
     // Disconnect modal takes precedence so the player sees the notice
     // before the lobby screen resets underneath it.
     if (_hsDisconnectPopup) {
+      // Auto-close mirrors the charSelect handler — guarantee the user
+      // lands back on the main menu even without interaction.
+      if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
+        _dismissHsDisconnect();
+        input.clearFrame();
+        return;
+      }
       const click = input.consumeClick();
       const keyOk = input.consumeKey('enter') || input.consumeKey('escape') || input.consumeKey(' ');
       if (click) {
@@ -3523,8 +3680,12 @@ function update(logicDt, realDt) {
         // Fully tear down any in-flight connection so the next charSelect
         // screen shows the 2P CO-OP button (gated on net.role === 'solo').
         if (net.role !== 'solo') {
-          if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_escape' }); } catch {} }
-          net.disconnect();
+          if (net.peers.size > 0) {
+            try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_escape' }); } catch {}
+            net.gracefulDisconnect();
+          } else {
+            net.disconnect();
+          }
         }
         net.role = 'solo';
         _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
@@ -3533,8 +3694,12 @@ function update(logicDt, realDt) {
       // Backing out of hosting/joining returns to the lobby menu AND tears
       // down the half-connected session so the user can re-enter cleanly.
       if (net.role !== 'solo') {
-        if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_escape_submode' }); } catch {} }
-        net.disconnect();
+        if (net.peers.size > 0) {
+          try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_escape_submode' }); } catch {}
+          net.gracefulDisconnect();
+        } else {
+          net.disconnect();
+        }
         net.role = 'solo';
         _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
       }
@@ -3577,8 +3742,12 @@ function update(logicDt, realDt) {
             // `net.role !== 'solo'`, which hides the 2P CO-OP toggle on
             // the next char-select screen.
             if (net.role !== 'solo') {
-              if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'back' }); } catch {} }
-              net.disconnect();
+              if (net.peers.size > 0) {
+                try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'back' }); } catch {}
+                net.gracefulDisconnect();
+              } else {
+                net.disconnect();
+              }
             }
             net.role = 'solo';
             _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
@@ -3610,8 +3779,13 @@ function update(logicDt, realDt) {
           if (b.action === 'lobby_back') {
             // Tell the peer we're leaving so they drop out of the lobby too
             // rather than waiting on a ghost host.
-            if (net.peers.size > 0) { try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_back' }); } catch {} }
-            lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState(); net.disconnect(); net.role = 'solo'; break;
+            if (net.peers.size > 0) {
+              try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'lobby_back' }); } catch {}
+              net.gracefulDisconnect();
+            } else {
+              net.disconnect();
+            }
+            lobbyMode = 'menu'; lobbyJoinCode = ''; lobbyStatusMsg = ''; _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState(); net.role = 'solo'; break;
           }
           if (b.action === 'join_confirm' && lobbyJoinCode.length === 6) {
             net.role = 'client';
@@ -3815,7 +3989,7 @@ function update(logicDt, realDt) {
             // game is still going.
             if (net.role !== 'solo' && net.peers.size > 0) {
               try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'restart' }); } catch {}
-              net.disconnect(); net.role = 'solo';
+              net.gracefulDisconnect(); net.role = 'solo';
               _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
             }
             gameState = 'charSelect'; selectedCharId = null; audio.silenceMusic(); audio.playBGM('menu');
@@ -3828,7 +4002,7 @@ function update(logicDt, realDt) {
               // notification instead of a silent "link lost" banner.
               if (net.role !== 'solo' && net.peers.size > 0) {
                 try { net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'quit' }); } catch {}
-                net.disconnect(); net.role = 'solo';
+                net.gracefulDisconnect(); net.role = 'solo';
                 _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
               }
               gameState = 'intro'; selectedCharId = null; audio.silenceMusic(); audio.playBGM('menu');
@@ -6406,6 +6580,11 @@ function render() {
       charSelectBoxes.push({ x: leaveX, y: byy, w: btnW, h: btnH, action: 'mainMenu' });
       charSelectBoxes.push({ x: cancelX, y: byy, w: btnW, h: btnH, action: 'quit_cancel_cs' });
     }
+    // Disconnect popup MUST draw inside this block because the state
+    // render ends with `return;` and the post-frame pass (which used to
+    // draw the popup) never runs while gameState is charSelect. Same
+    // applies to lobby below.
+    if (_hsDisconnectPopup) _drawHsDisconnectPopup(renderer.ctx);
     return;
   }
 
@@ -6722,6 +6901,10 @@ function render() {
       ctx.fillText('LEAVE ROOM', lvX + lvW / 2, lvY + 28);
       lobbyBoxes.push({ x: lvX, y: lvY, w: lvW, h: lvH, action: 'lobby_back' });
     }
+
+    // Disconnect popup — must draw here because the lobby render block
+    // returns before the post-frame passes (see charSelect above).
+    if (_hsDisconnectPopup) _drawHsDisconnectPopup(renderer.ctx);
 
     return;
   }
@@ -7555,9 +7738,10 @@ function render() {
   if (gameState === 'playing' || gameState === 'paused') renderer.drawCAFlash();
   // Hero-select / lobby disconnect popup — blocking modal so the remaining
   // player explicitly acknowledges the session ended before returning.
-  if (_hsDisconnectPopup && (gameState === 'charSelect' || gameState === 'lobby')) {
-    _drawHsDisconnectPopup(renderer.ctx);
-  }
+  // The popup also draws inside each of charSelect/lobby render blocks
+  // (which end with `return;` before this post-frame pass); this fallback
+  // covers any other state that happens to have the flag set.
+  if (_hsDisconnectPopup) _drawHsDisconnectPopup(renderer.ctx);
   // Disconnect banner — draws in EVERY state (charSelect / lobby / map / playing /
   // draft / shop / etc) so the remaining player always sees the session ended.
   if (_remoteDisconnected && _remoteDisconnectTimer > 0) {

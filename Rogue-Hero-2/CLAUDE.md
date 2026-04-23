@@ -25,14 +25,20 @@ Always run this after any edits. All 31 `src/**/*.js` files must pass (0 errors)
 
 ## Architecture Overview
 
-**Entry point:** `src/main.js` — instantiates all systems, wires them together, owns the game state machine, and drives the main update/render loop. It is ~2400 lines and intentionally monolithic for the game loop and render pipeline.
+**Entry point:** `src/main.js` — instantiates all systems, wires them together, owns the game state machine, and drives the main update/render loop. It is ~8800 lines and intentionally monolithic for the game loop and render pipeline.
 
 **Game state machine** (`gameState` string in `main.js`):
 ```
-intro → charSelect → map → prep → playing → draft → itemReward → shop → upgrade → event → rest → discard → stats
-                                  ↕ paused (overlay)
+intro → charSelect → [lobby] → map → prep → playing → draft → itemReward → shop → upgrade → event → rest → discard → stats
+                                      ↕ paused (overlay)    ↘ victory (win screen) → stats
+intro → tutorial ↺
+charSelect ⇄ cosmeticShop ⇄ cosmeticPanel
 ```
-Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest` state is the new rest node choice screen (heal vs burn a card). `discard` with `discardPendingCardId === '__BURN__'` removes a card without adding a replacement.
+- `lobby` is entered via the "remote co-op" mode button on the intro screen (WebRTC matchmaking).
+- `tutorial` is a standalone how-to-play screen reached from the intro menu.
+- `cosmeticShop` / `cosmeticPanel` are the loot-box store and per-character cosmetics equip screen.
+- `victory` is the win screen (plays briefly before stats). Solo death still flows directly to `stats`.
+- `rest` is the rest-node choice screen (heal vs burn a card). `discard` with `discardPendingCardId === '__BURN__'` removes a card without adding a replacement.
 
 **Core systems and their roles:**
 
@@ -42,10 +48,10 @@ Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest
 | `src/EventBus.js` | Singleton `events` pub/sub — **all cross-system communication flows through this** |
 | `src/tempo.js` | `TempoSystem` — 0–100 resource with auto-crash at both extremes |
 | `src/Combat.js` | `CombatManager` — card type dispatch, hitbox resolution, damage, post-dodge crit |
-| `src/Enemy.js` | Base `Enemy` class + 29 named subclasses (including 5 bosses) |
-| `src/player.js` | `Player` — movement, combo system, dodge, class passives |
-| `src/DeckManager.js` | `CardDefinitions` (~104 cards) + `DeckManager` (hand/deck/draw/upgrade state) |
-| `src/Items.js` | `ItemDefinitions` (27 relics: 21 general + 6 character-exclusive) + `ItemManager` (per-update effects, kill/death callbacks) |
+| `src/Enemy.js` | Base `Enemy` class + 30 named subclasses (6 bosses: Brawler/Conductor/Echo/Necromancer/Apex/Archivist) |
+| `src/player.js` | `Player` — movement, combo system, dodge, class passives, cosmetic rendering hooks |
+| `src/DeckManager.js` | `CardDefinitions` (~191 cards) + `DeckManager` (hand/deck/draw/upgrade state) |
+| `src/Items.js` | `ItemDefinitions` (33 relics: 21 general + 6 character-exclusive + 6 Pact) + `ItemManager` (per-update effects, kill/death callbacks) |
 | `src/RunManager.js` | Procedural map graph (seeded RNG, layered fight/elite/event/shop/rest/boss nodes) |
 | `src/room.js` | `RoomManager` — room layout variants (standard/pillars/arena/corridor), pillar collision |
 | `src/MetaProgress.js` | localStorage persistence: unlocks, leaderboard, mastery, volume |
@@ -53,14 +59,16 @@ Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest
 | `src/Projectile.js` | `ProjectileManager` — projectile pool, movement, collision |
 | `src/Particles.js` | `ParticleSystem` — visual-only effects, damage numbers, flashes |
 | `src/Renderer.js` | Canvas clear, screen shake scope, touch controls |
-| `src/ui.js` | `UI` — HUD (HP/AP/tempo bar/hand/minimap/relics), all menu screens |
+| `src/ui.js` | `UI` — HUD (HP/AP/tempo bar/hand/minimap/relics), all menu screens (including cosmetic shop/panel) |
 | `src/audio.js` | `AudioSynthesizer` — MP3 BGM pools + Web Audio API SFX |
+| `src/Cosmetics.js` | Loot-box cosmetics system: `CosmeticDefinitions`, `CosmeticById`, `BOX_TIERS` (bronze/silver/gold/prismatic + filtered shadowed/elemental/infernal/shapebox), `BOX_WEIGHTS`, `rollBox()`, canvas helpers (`drawPlayerShape`, `drawPlayerAura`, `drawKillEffect`, `getPrismaticColor`) |
+| `src/effects.js` | **Dead code** — defines an `Effects` object for legacy transient visuals (beat pulse, room clear sweep, state labels). Not imported anywhere; `Particles.js` + inline `effects[]` in `main.js` are the live systems. Kept in `check-syntax.js`'s 31-file count; safe to remove if tidying. |
 | `src/Input.js` | Keyboard + mouse + touch input, per-frame consume pattern |
 | `src/Entity.js` | Base class with `x, y, r, alive` |
 | `src/Players.js` | **RH2** — `Players` multi-player manager (add/reset/anyAlive/allDownedOrDead/goDown/updateRevives/resonanceMultiplier) + `makePlayer(charDef, x, y)` factory + `PLAYER_HALO_COLORS` |
 | `src/Biomes.js` | **RH2** — 6 biome defs (verdant/frostforge/cathedral/tide/voidline/clockwork) with palette/ambience/music/hazard/postFx + `pickBiomeForFloor(floor, rng)` |
 | `src/SpatialHash.js` | **RH2** — uniform-grid spatial hash for O(n+k) hitbox queries; `rebuild/query/forEachInCircle` |
-| `src/EnemiesRH2.js` | **RH2** — 8 new enemy classes (TetherWitch, MireToad, Bloomspawn, IronChoir, StaticHound, BossHollowKing, BossVaultEngine, BossAurora) |
+| `src/EnemiesRH2.js` | **RH2** — 8 new enemy classes (TetherWitch, MireToad, Bloomspawn, IronChoir, StaticHound + bosses HollowKing, VaultEngine, Aurora). Total bestiary across both files: ~38 classes, 9 bosses. |
 | `src/net/Net.js` | **RH2** — WebRTC DataChannel transport. Primary: Cloudflare Worker signaling (`CF_SIGNAL_URL`). Fallback: Trystero (torrent → nostr). Public API (`connect/sendUnreliable/sendReliable/on/disconnect`). Auto-detects ArrayBuffer vs JSON on snap channel |
 | `src/net/Snapshot.js` | **RH2** — delta encoder/decoder. Binary wire format (int16 quantized positions + u8 flags, ~12× smaller than JSON). `SNAP_TYPES = { POS, EVT, FULL }`. Both classes expose `reset()` for room transitions |
 | `src/net/Lobby.js` | **RH2** — room codes, ready checks, host migration; `LOBBY_STATES` enum |
@@ -105,9 +113,21 @@ Note: `dead` and `victory` do not exist as states — both end in `stats`. `rest
 
 **Pact cards & Pact relics:** new card flag `pact: true` with optional `pactCostPerAlly` (extra AP per nearby ally; effect scales). Six new Pact relics in `Items.js` (`pactRelic: true`): bond_of_embers, linked_steel, mirror_vow, fourfold_sigil, resonant_anchor, shared_burden.
 
-**Globals added in main.js for cross-system access:** `window._players` (Players manager — used by RH2 enemies to target/affect all players), `window._biome` (current Biome def — RoomManager will read this when biome palette wiring lands).
+**Globals added in main.js for cross-system access:** `window._itemDefs` (ItemDefinitions — circular-import workaround for `ui.js`), `window._cosmeticDefs` (CosmeticById), `window._charData` ({ Characters }), `window._players` (Players manager — used by RH2 enemies to target/affect all players), `window._biome` (current Biome def — RoomManager reads this for palette/hazards), `window._net` (Net instance), `window._equippedCosmetics` (resolved equip map for the active character, built by `buildEquippedCosmetics(eq)` on char select), `window._gameState` (current state string, mirrored for modules that can't see the local `gameState`), `window._discardCallback` (set by the discard flow to resume pending card-burn), `window._cardPulse` / `window._shopWarn*` (transient UI signals).
 
 **Music:** existing tracks in `music/` are reused; biome `music` field is informational until per-biome track assignment is done.
+
+---
+
+## Cosmetics & Loot Boxes
+
+`src/Cosmetics.js` defines ~160 cosmetics across 9 categories (`bodyColor`, `outlineColor`, `shape`, `trail`, `flash`, `deathBurst`, `aura`, `killEffect`, `title`) and 5 rarities (`common`, `uncommon`, `rare`, `legendary`, `superleg`). Loot-box tiers in `BOX_TIERS` include four generic boxes (bronze/silver/gold/prismatic) and four filtered-category boxes (shadowed/elemental/infernal/shapebox) — the filter narrows both the rarity weighting and the category pool.
+
+**Earn/spend loop.** `cosmetics.gold` is accrued per run; the `cosmeticShop` state spends gold on boxes via `rollBox(tierId, ownedSet, rng)` which returns `{ id, isDuplicate }`. Duplicates refund a small amount of gold — see `MetaProgress.openBox()` for the refund + `owned[]` append. `cosmeticPanel` lets the player equip owned cosmetics per character, stored in `cosmetics.equipped[charId][category]`.
+
+**Render pipeline.** When a character is selected, `buildEquippedCosmetics(eq)` resolves the equipped-ID map to an object of actual cosmetic defs (colors, values, canvas helpers) and stores it in `window._equippedCosmetics`. `player.js` and `main.js` read that global to override shape drawing (`drawPlayerShape`), aura (`drawPlayerAura`), kill effect (`drawKillEffect`), trail tint, hit flash, and death burst color. Prismatic cosmetics use `getPrismaticColor(t)` for a time-cycling hue.
+
+**Unlock gate.** `meta.cosmeticsUnlocked()` returns true once `totalRuns >= 1` — the shop/panel are hidden from fresh installs.
 
 ---
 
@@ -212,9 +232,9 @@ Master volume is persisted to `MetaProgress.state.masterVolume` and restored on 
 
 ## MetaProgress (localStorage)
 
-Key state fields: `unlockedCharacters`, `difficultyTiers`, `unlockedBonusCards`, `masteryUnlockedCards`, `charMastery` (run counts per char), `perCharacterStats`, `leaderboard`, `masterVolume`.
+Key state fields: `unlockedCharacters`, `difficultyTiers`, `unlockedBonusCards`, `masteryUnlockedCards`, `charMastery` (run counts per char), `perCharacterStats`, `leaderboard`, `masterVolume`, `gamepadP1Enabled` / `gamepadP2Enabled` (per-slot opt-in so a connected controller never silently steals input from the keyboard), `cosmetics` (`gold`, `owned[]`, `totalBoxesOpened`, `equipped[charId][category]`).
 
-`resetAll()` deep-clones `DEFAULT_STATE` so all fields including nested objects are reset cleanly.
+`resetAll()` deep-clones `DEFAULT_STATE` so all fields including nested objects are reset cleanly. `_ensureCosmetics()` lazily backfills the cosmetics subtree so old save files don't explode after an update.
 
 ---
 
