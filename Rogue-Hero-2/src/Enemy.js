@@ -1245,6 +1245,12 @@ export class Bomber extends Enemy {
     }
     events.emit('SCREEN_SHAKE', { duration: 0.25, intensity: 0.5 });
     events.emit('PLAY_SOUND', 'crash');
+    // MP: host-authoritative kill. Setting hp=0 is what HostSim's
+    // _broadcastEnemyHp watches for (alive toggles alone don't trigger a
+    // sync — the cache compares hp). Without this, host's bomber explodes
+    // locally but clients never learn the bomber died, leaving stale
+    // "alive on one side, dead on another" enemies until ROOM_CLEARED.
+    this.hp = 0;
     this.alive = false;
   }
 

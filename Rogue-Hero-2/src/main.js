@@ -313,6 +313,11 @@ net.on('peer', (msg) => {
           _prepReadyByPeer.clear();
           _remoteMapVoteByPeer.clear();
           _remoteRestVoteByPeer.clear();
+          // If the host was downed when the last ally vanished, no one can
+          // revive them and _coopMode just flipped to false (so the wipe
+          // detector ignores this player). Declare wipe immediately rather
+          // than leave them frozen at 0 HP behind the disconnect popup.
+          _wipeIfStuckDowned('host lost last ally');
         }
       } else {
         // With other allies still connected, just recompute aggregates so
@@ -1071,6 +1076,16 @@ net.on('evt', (msg, senderPeerId) => {
     // Host is authoritative for enemy attacks. When the host's enemy hits
     // our remote placeholder, they forward the damage here so we apply it
     // to our actual local player.
+    // 3–4P: sendReliable is a broadcast, so without filtering every client
+    // would apply damage meant for a single peer. Gate on targetPeerId /
+    // targetPlayerIndex when the host tagged the message; older untagged
+    // messages fall through to the original (2P-safe) behaviour.
+    const targetPeerId     = msg.targetPeerId     ?? p?.targetPeerId;
+    const targetPlayerIdx  = msg.targetPlayerIndex ?? p?.targetPlayerIndex;
+    if (targetPeerId && targetPeerId !== net.localPeerId) return;
+    if (typeof targetPlayerIdx === 'number' &&
+        typeof player?.playerIndex === 'number' &&
+        targetPlayerIdx !== player.playerIndex) return;
     const dmg = msg.damage || p?.damage || 0;
     if (dmg > 0 && player && player.alive) {
       // Apply difficulty multiplier locally (host uses their own; we use ours
@@ -1169,6 +1184,9 @@ net.on('evt', (msg, senderPeerId) => {
       _hsDisconnectMode = 'continueSolo';
       _hsDisconnectReason = 'left the session';
       _hsDisconnectAutoCloseAt = 0; // no auto-close — host chooses
+      // Same stranded-downed guard as the WebRTC-leave path: PEER_QUIT also
+      // demotes _coopMode to false, so a downed host needs the wipe.
+      _wipeIfStuckDowned('host received PEER_QUIT while downed');
     }
   }
 });
@@ -2303,7 +2321,18 @@ events.on('ENEMY_MELEE_HIT', ({ damage, source, target }) => {
       // Host's enemy hit the remote placeholder — forward to the owning peer
       // so they can apply the damage on their authoritative player instead.
       if (tgt._isRemote) {
-        net.sendReliable('evt', { type: 'PLAYER_HIT', damage, srcId: source?.id });
+        // 3–4P: sendReliable broadcasts to ALL peers, so a damage message
+        // addressed to peer C would previously also land on A and B who'd
+        // each tap their own player for damage (multiplying one enemy hit
+        // into N hits across the party). Tag the message with the target's
+        // peer id so non-matching peers can filter it out.
+        net.sendReliable('evt', {
+          type: 'PLAYER_HIT',
+          damage,
+          srcId: source?.id,
+          targetPeerId: tgt._remotePeerId,
+          targetPlayerIndex: tgt.playerIndex,
+        });
         // Still show a local hit flash for screen-shake feel.
         particles.spawnKillFlash('#ff2222');
         events.emit('HIT_STOP', 0.06);
@@ -3577,6 +3606,27 @@ function buildEquippedCosmetics(eq) {
 // or flags stall when the local player is on draft / itemReward / shop /
 // upgrade screens.
 // Broadcast the local player's HP to peers whenever it changes. Runs every
+// Wipe handler for the case where every co-op ally just disconnected while
+// the local player was still in the downed state. Without this, _coopMode
+// flips to false, the wipe detector skips (it requires _coopMode), and the
+// non-coop death detector also skips (player.alive is still true because
+// downed players never set alive=false). Result: the player is stuck at
+// hp=0 with no path to game-over. Triggers the same animation+stats flow
+// the regular wipe uses.
+function _wipeIfStuckDowned(reason) {
+  if (!player || !player.downed) return false;
+  if (playerDeathTimer > 0) return false;
+  const _live = ['playing', 'prep', 'paused'];
+  if (_live.indexOf(gameState) === -1) return false;
+  console.log('[Run] Stranded-downed wipe:', reason || 'peer disconnected while downed');
+  runStats.floor = runManager.floor;
+  runStats.finalDeck = [...deckManager.collection];
+  runStats.won = false;
+  checkRunUnlocks(false);
+  playerDeathTimer = 1.2;
+  return true;
+}
+
 // frame but only sends on a delta, so we're not flooding the reliable
 // channel — HP only changes on hit, heal, revive, rest, shop purchase, etc.
 let _lastHpBroadcast = { hp: -1, maxHp: -1, alive: null, downed: null };
@@ -4833,7 +4883,15 @@ function update(logicDt, realDt) {
       const cardId = deckManager.hand[selectedCardSlot];
       if (cardId) {
         const def = deckManager.getCardDef(cardId);
-        if (player.budget >= def.cost) {
+        // Downed players are restricted to the same cost ceiling P2 already
+        // honoured (see player.canPlayCardWhileDowned). Without this gate,
+        // P1 in co-op could keep spamming any card after going down — which
+        // both broke the design intent and confused the peer (who could
+        // see traps / orbs / damage spawn from the downed ally).
+        if (player.downed && !player.canPlayCardWhileDowned(def)) {
+          particles.spawnDamageNumber(player.x, player.y - 30, 'DOWNED!');
+          events.emit('PLAY_SOUND', 'miss');
+        } else if (player.budget >= def.cost) {
           combat.executeCard(player, def, input.mouse);
           runStats.cardsPlayed++;
           _registerCardPlayed(def, selectedCardSlot);
