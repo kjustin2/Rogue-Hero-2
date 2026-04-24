@@ -297,9 +297,22 @@ export class BossVaultEngine extends Enemy {
     if (this.staggerTimer > 0) { this.staggerTimer -= dt; return; }
     this.cycleTimer += dt;
     for (const wp of this.weakPoints) wp.angle += dt * 0.7;
+    // Radial shock on every 4 s cycle — SPAWN_GROUND_WAVE is directional and
+    // requires a card def; emitting one without a def threw inside the
+    // update loop and froze the game. Do the radial damage directly.
+    this._pulseFx = Math.max(0, (this._pulseFx || 0) - dt);
     if (this.cycleTimer > 4) {
       this.cycleTimer = 0;
-      events.emit('SPAWN_GROUND_WAVE', { x: this.x, y: this.y, dx: 0, dy: 0, radial: true, dmg: 2 });
+      this._pulseFx = 0.5;
+      const PULSE_RADIUS = 220;
+      const all = (window._players && window._players.list) || [player];
+      for (const p of all) {
+        if (!p || !p.alive) continue;
+        const dx = p.x - this.x, dy = p.y - this.y;
+        if (dx * dx + dy * dy < PULSE_RADIUS * PULSE_RADIUS) {
+          events.emit('ENEMY_MELEE_HIT', { damage: 2, source: this, target: p });
+        }
+      }
     }
     if (roomMap) { const c = roomMap.clamp(this.x, this.y, this.r); this.x = c.x; this.y = c.y; }
   }
@@ -313,6 +326,14 @@ export class BossVaultEngine extends Enemy {
       ctx.arc(wx, wy, 8, 0, Math.PI * 2);
       ctx.fillStyle = '#ffaa00';
       ctx.fill();
+    }
+    if (this._pulseFx > 0) {
+      const t = 1 - this._pulseFx / 0.5;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, 40 + t * 180, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(255,170,0,${(1 - t) * 0.8})`;
+      ctx.lineWidth = 3;
+      ctx.stroke();
     }
   }
 }

@@ -5,7 +5,8 @@
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node mp-smoke.mjs",
+    "test": "node mp-smoke.mjs && node mp-disconnect-test.mjs && node mp-4player-test.mjs",
+    "test:mp4": "node mp-4player-test.mjs",
     "serve": "python -m http.server 8000",
     "mp": "node mp-local.mjs",
     "syntax": "node check-syntax.js",

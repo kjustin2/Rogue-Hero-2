@@ -225,6 +225,15 @@ net.on('peer', (msg) => {
       lobbyStatusMsg = 'Connected to host — waiting for them to start…';
     }
   } else if (msg.kind === 'leave') {
+    // Resolve a human-readable label for this peer BEFORE we drop them from
+    // the lobby roster — so the partial-leave badge can name them.
+    const _leftLobbyEntry = _lobbyPeers.find(p => p.peerId === msg.peerId);
+    const _leftLabel = (() => {
+      if (_leftLobbyEntry?.name) return _leftLobbyEntry.name;
+      const idx = _peerToIndex.get(msg.peerId);
+      if (typeof idx === 'number') return 'Player ' + (idx + 1);
+      return 'A player';
+    })();
     _lobbyPeers = _lobbyPeers.filter(p => p.peerId !== msg.peerId);
     // Forget the departed peer's index/charId/ready so a later rejoin
     // doesn't inherit stale state.
@@ -233,7 +242,7 @@ net.on('peer', (msg) => {
     _remoteReadyByPeer.delete(msg.peerId);
     _lastPongByPeer.delete(msg.peerId);
     if (net.role === 'host') _hostBroadcastPeerIndices();
-    const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard'].includes(gameState);
+    const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard','upgrade','paused','victory'].includes(gameState);
     if (inRun) {
       _remoteDisconnected = true;
       _remoteDisconnectTimer = 12; // long enough for the user to actually read it
@@ -252,9 +261,10 @@ net.on('peer', (msg) => {
           // map generation, enemy state and RNG — a demotion to solo would
           // either strand us on a half-generated map (e.g. the map screen
           // before a node is committed) or desync vs. state we never owned.
-          // Tear the run down and route back to the main menu with the same
-          // blocking popup the lobby/char-select flows use.
+          // Route back to the main menu via the blocking popup so the user
+          // explicitly acknowledges the loss before being silently dropped.
           _hsDisconnectPopup = true;
+          _hsDisconnectMode = 'menu'; // single-button: client can't continue solo
           _hsDisconnectReason = 'host disconnected';
           _hsDisconnectAutoCloseAt = performance.now() + 30000;
           try { net.disconnect(); } catch {}
@@ -279,8 +289,17 @@ net.on('peer', (msg) => {
           audio.silenceMusic();
           audio.playBGM('menu');
         } else {
-          // Host lost its last remote ally — the host owns the sim, so we can
-          // continue solo. The 12 s banner above tells the user what happened.
+          // Host lost its last remote ally — the host owns the sim, so we
+          // CAN continue solo. Show a two-button popup so the host explicitly
+          // chooses [CONTINUE SOLO] or [RETURN TO MENU]. Without this popup
+          // the host previously got only the brief banner, which the user
+          // reported as "the host didn't receive anything so they didn't
+          // know a joined player even left".
+          _hsDisconnectPopup = true;
+          _hsDisconnectMode = 'continueSolo';
+          _hsDisconnectReason = `${_leftLabel} disconnected`;
+          // No auto-close: host stays paused on the popup until they choose.
+          _hsDisconnectAutoCloseAt = 0;
           if (player) player._coopMode = false;
           _remotePhaseDone = true;
           _localPhaseDone = true;
@@ -294,6 +313,9 @@ net.on('peer', (msg) => {
       } else {
         // With other allies still connected, just recompute aggregates so
         // gates open correctly if the departed peer was the last holdout.
+        // Surface a brief named badge so the remaining peers see WHO left
+        // rather than the roster silently shrinking.
+        _peerLeaveBadge = { label: _leftLabel, t0: performance.now() / 1000 };
         _recomputeRemoteAggregates();
       }
       // Audio cue + screen shake so the disconnect is impossible to miss
@@ -629,25 +651,49 @@ net.on('evt', (msg, senderPeerId) => {
           ? `floor mismatch (host: ${hostFloor}, us: ${runManager.floor | 0})`
           : `rooms-cleared mismatch (host: ${hostRooms}, us: ${roomsCleared | 0})`;
       // Two consecutive mismatched heartbeats (~6 s) → show the banner and
-      // ask the host to resend current state once, throttled to every 15 s.
+      // ask the host to send a SYNC_RESPONSE with enough state to actually
+      // recover. Throttled to every 6 s now (used to be 15 s) because the
+      // response is actionable — repeated requests will converge faster
+      // than waiting for the user to give up and quit.
       if (_syncMismatchCount >= 2) {
         _syncWarningVisible = true;
         const nowMs = performance.now();
-        if (nowMs - _syncRecoveryRequestedAt > 15000) {
+        if (nowMs - _syncRecoveryRequestedAt > 6000) {
           _syncRecoveryRequestedAt = nowMs;
-          console.warn('[Sync] mismatch detected:', _syncMismatchReason, '— requesting resync');
+          console.warn('[Sync] mismatch detected:', _syncMismatchReason, '— requesting SYNC_RESPONSE');
           net.sendReliable('evt', { type: 'SYNC_REQUEST', reason: _syncMismatchReason });
         }
       }
     }
 
   } else if (type === 'SYNC_REQUEST') {
-    // Host-side: a client flagged itself out of sync. Re-broadcast the
-    // current authoritative heartbeat immediately — gives the client a
-    // fresh reference before the 3 s cadence would otherwise fire. We
-    // don't try to replay history; the client just resyncs its warning
-    // banner once both sides agree on state again.
+    // Host-side: a client flagged itself out of sync. Send a richer
+    // SYNC_RESPONSE (state + the data the client needs to actually
+    // transition to that state — shopCards / eventType / nodeType etc).
+    // The old behaviour was to just re-send a heartbeat, which let the
+    // client KNOW about the mismatch but provided no recovery path.
     if (net.role === 'host' && net.peers.size > 0) {
+      const resp = {
+        type: 'SYNC_RESPONSE',
+        state: gameState,
+        floor: runManager.floor | 0,
+        roomsCleared: roomsCleared | 0,
+        rngState: runManager.getRngState(),
+      };
+      // Bundle state-specific payload so the client can re-enter the
+      // current screen without missing context (the original transition
+      // events — MAP_NODE_CHOSEN / ROOM_CLEARED — may have been lost or
+      // silently dropped on a brief WebRTC hiccup).
+      if (gameState === 'shop') {
+        resp.shopCards = shopCards;
+      } else if (gameState === 'event') {
+        resp.eventType = currentEventType;
+      } else if ((gameState === 'prep' || gameState === 'playing') && currentCombatNode) {
+        resp.combatNode = { type: currentCombatNode.type, id: currentCombatNode.id };
+      }
+      net.sendReliable('evt', resp);
+      // Also re-emit the last heartbeat so the legacy mismatch counter
+      // resets on clients that don't have the SYNC_RESPONSE handler yet.
       net.sendReliable('evt', {
         type: 'SYNC_HEARTBEAT',
         state: gameState,
@@ -655,6 +701,128 @@ net.on('evt', (msg, senderPeerId) => {
         roomsCleared: roomsCleared | 0,
         enemiesAlive: gameState === 'playing' ? enemies.reduce((a, e) => a + (e && e.alive ? 1 : 0), 0) : 0,
       });
+    }
+
+  } else if (type === 'SYNC_RESPONSE' && net.role === 'client') {
+    // Authoritative resync from the host. Apply whichever pieces fit so
+    // the client converges back onto the host's screen. This is the path
+    // that closes the "out of sync → can't reconnect" loop the user reported
+    // (specifically: post-fight draft → map transition where the client
+    // gets stranded on draft while the host moves on).
+    const targetState = msg.state;
+    const targetFloor = msg.floor | 0;
+    const targetRooms = msg.roomsCleared | 0;
+    const alreadyHere = (
+      targetState === gameState ||
+      (targetState === 'playing' && gameState === 'paused') ||
+      (gameState === 'playing' && targetState === 'paused')
+    );
+    // Snap RNG so any subsequent host-driven roll lines up regardless of
+    // what we did wrong before.
+    if (typeof msg.rngState === 'number') {
+      try { runManager.setRngState(msg.rngState); } catch {}
+    }
+    if (targetFloor !== (runManager.floor | 0)) {
+      runManager.floor = targetFloor;
+      runManager.generateMap();
+      currentBiome = pickBiomeForFloor(runManager.floor, runManager.getRng());
+      window._biome = currentBiome;
+      if (room) room.biome = currentBiome;
+    }
+    if (targetRooms > (roomsCleared | 0)) roomsCleared = targetRooms;
+    if (!alreadyHere) {
+      console.warn(`[Sync] forcing client transition: ${gameState} → ${targetState}`);
+      // Drop any in-progress per-screen state from the screen we were on
+      // so the host's screen doesn't inherit stale votes / draft picks.
+      _localMapVote = null;
+      _remoteMapVote = null;
+      _remoteMapVoteByPeer.clear();
+      _localRestVote = null;
+      _remoteRestVote = null;
+      _remoteRestVoteByPeer.clear();
+      // Apply the host's screen. Some states need a small bit of setup so
+      // the screen has something to render on the next frame.
+      if (targetState === 'map') {
+        gameState = 'map';
+        _fadeAlpha = 0.6; _fadeDir = -1;
+        audio.playBGM('map');
+      } else if (targetState === 'draft') {
+        // Try to regenerate draft choices so the client has something to
+        // pick (host may have already moved on by the next heartbeat).
+        try { generateDraft(); } catch {}
+        gameState = 'draft';
+        _draftRevealTimer = 0;
+        _draftRevealMax = draftChoices.length;
+        _fadeAlpha = 0.6; _fadeDir = -1;
+      } else if (targetState === 'rest') {
+        restChoiceBoxes = [];
+        gameState = 'rest';
+      } else if (targetState === 'event' && msg.eventType) {
+        currentEventType = msg.eventType;
+        gameState = 'event';
+      } else if (targetState === 'shop' && Array.isArray(msg.shopCards)) {
+        shopCards = msg.shopCards;
+        gameState = 'shop';
+      } else if (targetState === 'itemReward') {
+        // Item reward is per-player — generate a local choice if we have
+        // none, otherwise just enter the screen and let the player pick.
+        try {
+          itemChoices = itemManager.generateChoices(3, selectedCharId, players.count > 1);
+        } catch {}
+        gameState = 'itemReward';
+        if (ui.resetItemReward) ui.resetItemReward();
+      } else if (targetState === 'upgrade') {
+        try { upgradeChoices = deckManager.getUpgradeChoices(); } catch {}
+        gameState = 'upgrade';
+      } else if (targetState === 'prep' || targetState === 'playing') {
+        // Combat states need the spawn list. The client can't reconstruct
+        // enemies from the heartbeat alone, so we enter prep but flag it
+        // for the host to re-broadcast ENEMY_SPAWN_LIST. Host receives a
+        // RESYNC_COMBAT request below.
+        if (msg.combatNode) currentCombatNode = msg.combatNode;
+        net.sendReliable('evt', { type: 'RESYNC_COMBAT_REQUEST' });
+      } else {
+        // victory / discard / unknown: best-effort transition.
+        gameState = targetState;
+      }
+    }
+    // Reset the mismatch counter — any persistent drift will be re-detected
+    // by the next heartbeat comparison.
+    _syncMismatchCount = 0;
+    _syncMismatchReason = '';
+    _syncWarningVisible = false;
+
+  } else if (type === 'RESYNC_COMBAT_REQUEST' && net.role === 'host') {
+    // Client lost combat sync — re-broadcast ENEMY_SPAWN_LIST built from
+    // the host's current enemies + room state. Only meaningful while we're
+    // actually in combat. We reuse the same wire shape spawnEnemies emits
+    // so the existing client-side ENEMY_SPAWN_LIST handler can process it
+    // without a special "this is a resync" code path.
+    if ((gameState === 'prep' || gameState === 'playing') && currentCombatNode && room) {
+      const compact = [];
+      for (const e of enemies) {
+        if (!e || !e.alive) continue;
+        compact.push({
+          id: e.id, type: e.type,
+          x: Math.round(e.x), y: Math.round(e.y),
+          hp: e.hp, maxHp: e.maxHp,
+          elite: e.eliteMod || null,
+        });
+      }
+      try {
+        net.sendReliable('evt', {
+          type: 'ENEMY_SPAWN_LIST',
+          nodeType: currentCombatNode.type,
+          nodeId: currentCombatNode.id,
+          floor: runManager.floor,
+          variant: room.variant,
+          pillars: (room.pillars || []).map(pp => ({ x: pp.x, y: pp.y, w: pp.w, h: pp.h })),
+          enemies: compact,
+          rngState: runManager.getRngState(),
+        });
+      } catch (e) {
+        console.warn('[Sync] resync combat broadcast failed:', e?.message || e);
+      }
     }
 
   } else if (type === 'PHASE_DONE') {
@@ -954,6 +1122,7 @@ net.on('evt', (msg, senderPeerId) => {
       _remoteReady = false; _clientReady = false;
       if (gameState === 'charSelect' || gameState === 'lobby') {
         _hsDisconnectPopup = true;
+        _hsDisconnectMode = 'menu';
         _hsDisconnectReason = 'left the session';
         _hsDisconnectAutoCloseAt = performance.now() + 30000;
       }
@@ -961,6 +1130,7 @@ net.on('evt', (msg, senderPeerId) => {
       // Client can't continue a run the host was driving — bounce to the
       // main menu with the same blocking popup used by lobby/charSelect.
       _hsDisconnectPopup = true;
+      _hsDisconnectMode = 'menu';
       _hsDisconnectReason = 'host disconnected';
       _hsDisconnectAutoCloseAt = performance.now() + 30000;
       selectedCharId = null;
@@ -969,9 +1139,15 @@ net.on('evt', (msg, senderPeerId) => {
       gameState = 'intro';
       audio.silenceMusic();
       audio.playBGM('menu');
+    } else {
+      // Host in-run, client cleanly quit: pop the two-button modal so the
+      // host explicitly chooses to continue solo or return to menu. The
+      // 12 s banner still draws underneath as a continuous reminder.
+      _hsDisconnectPopup = true;
+      _hsDisconnectMode = 'continueSolo';
+      _hsDisconnectReason = 'left the session';
+      _hsDisconnectAutoCloseAt = 0; // no auto-close — host chooses
     }
-    // Host in-run: the existing "REMOTE PLAYER DISCONNECTED" banner
-    // renders for ~12 s and the host continues solo.
   }
 });
 let localCoop = false;             // toggled by F2 in char select
@@ -1085,12 +1261,22 @@ let _syncRecoveryRequestedAt = 0;   // throttle SYNC_REQUEST (ms epoch)
 // players actually notice they're alone before committing to a solo run.
 let _hsDisconnectPopup = false;
 let _hsDisconnectReason = ''; // short human label ("left session" / "lost connection")
-let _hsDisconnectBoxes = [];  // modal OK button hit region
+let _hsDisconnectBoxes = [];  // modal "return to menu" button hit region
+// Two-button mode: when the host loses its last remote ally during a run we
+// pop a popup that says "they left — continue solo or return to menu?". The
+// 'menu' default keeps the existing pre-run + client behaviour where dismiss
+// always returns to intro.
+let _hsDisconnectMode = 'menu';        // 'menu' | 'continueSolo'
+let _hsDisconnectContinueBoxes = [];   // mode='continueSolo': "continue solo" button hit region
 // Auto-dismiss deadline (ms-since-origin). When the popup comes up during
 // lobby/charSelect the user should always land back on the main menu — if
 // they walked away or the tab lost focus, this timer flips it back to
 // intro automatically. Dismissal by click/keypress cancels the timer.
 let _hsDisconnectAutoCloseAt = 0;
+// Brief 3-4P partial-leave notification: when one of N peers leaves but
+// other allies remain, the run continues, but we still want to surface
+// who left rather than silently shrinking the roster. Shown for ~5 s.
+let _peerLeaveBadge = null; // { label: string, t0: number }
 let _charSelectQuitConfirm = false; // MP: second click on Main Menu actually leaves
 let _lobbyPeers = [];            // host: [{ peerId, name }] peers currently in lobby
 // PHASE_DONE handshake — gate map advance until EVERY player has finished
@@ -1181,11 +1367,24 @@ function _showBossIntro(name) {
 // Hero-select / lobby disconnect popup. Blocks all input in those screens
 // so the remaining player sees the notice instead of being silently dropped
 // back to the main menu when their partner leaves.
-function _dismissHsDisconnect() {
+// Dismiss the disconnect popup. `choice` decides what to do next:
+//   'menu'        — tear down any leftover net state and return to intro.
+//   'continue'    — just hide the popup; caller stays in the current run as solo.
+//                   Only valid when _hsDisconnectMode === 'continueSolo'.
+function _dismissHsDisconnect(choice = 'menu') {
+  const wantContinue = (choice === 'continue' && _hsDisconnectMode === 'continueSolo');
   _hsDisconnectPopup = false;
   _hsDisconnectReason = '';
   _hsDisconnectBoxes.length = 0;
+  _hsDisconnectContinueBoxes.length = 0;
   _hsDisconnectAutoCloseAt = 0;
+  _hsDisconnectMode = 'menu';
+  if (wantContinue) {
+    // Host chose "continue solo": already demoted to net.role='solo' by the
+    // peer-leave handler, just unblock input. The "REMOTE PLAYER DISCONNECTED"
+    // banner will fade on its own.
+    return;
+  }
   // Tear down any lingering connection and return to the main menu.
   try { net.disconnect(); } catch {}
   net.role = 'solo';
@@ -1204,10 +1403,11 @@ function _dismissHsDisconnect() {
 function _drawHsDisconnectPopup(ctx) {
   const t = performance.now() / 1000;
   const pulse = 0.85 + 0.15 * Math.sin(t * 3);
+  const twoButton = (_hsDisconnectMode === 'continueSolo');
   ctx.save();
   ctx.fillStyle = 'rgba(0,0,0,0.78)';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const pw = 540, ph = 260;
+  const pw = 560, ph = twoButton ? 280 : 260;
   const px = (canvas.width - pw) / 2, py = (canvas.height - ph) / 2;
   ctx.shadowColor = '#ff6644';
   ctx.shadowBlur = 28 * pulse;
@@ -1218,25 +1418,152 @@ function _drawHsDisconnectPopup(ctx) {
   ctx.fillStyle = '#ffaa88';
   ctx.font = 'bold 22px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText('⚠  REMOTE LOBBY ENDED  ⚠', canvas.width / 2, py + 56);
+  const title = twoButton ? '⚠  REMOTE PLAYER DISCONNECTED  ⚠' : '⚠  REMOTE LOBBY ENDED  ⚠';
+  ctx.fillText(title, canvas.width / 2, py + 56);
   ctx.fillStyle = '#ffd0bb';
   ctx.font = '15px monospace';
   ctx.fillText(`The other player ${_hsDisconnectReason || 'disconnected'}.`, canvas.width / 2, py + 100);
-  ctx.fillText('The co-op session has ended.', canvas.width / 2, py + 124);
-  ctx.fillStyle = '#aa8877';
-  ctx.font = '12px monospace';
-  ctx.fillText('Press OK (or Enter) to return to the main menu.', canvas.width / 2, py + 154);
-  const btnW = 220, btnH = 48;
-  const bx = canvas.width / 2 - btnW / 2;
-  const by = py + ph - 70;
-  ctx.fillStyle = '#2a1a16';
-  ctx.beginPath(); ctx.roundRect(bx, by, btnW, btnH, 8); ctx.fill();
-  ctx.strokeStyle = '#ff8866'; ctx.lineWidth = 2; ctx.stroke();
-  ctx.fillStyle = '#ffcc99'; ctx.font = 'bold 16px monospace';
-  ctx.fillText('OK — RETURN TO MENU', canvas.width / 2, by + 30);
-  ctx.restore();
+  if (twoButton) {
+    ctx.fillText('You can keep playing solo or quit to the main menu.', canvas.width / 2, py + 124);
+    ctx.fillStyle = '#aa8877';
+    ctx.font = '12px monospace';
+    ctx.fillText('Press Enter to continue solo, or click "Return to Menu".', canvas.width / 2, py + 154);
+  } else {
+    ctx.fillText('The co-op session has ended.', canvas.width / 2, py + 124);
+    ctx.fillStyle = '#aa8877';
+    ctx.font = '12px monospace';
+    ctx.fillText('Press OK (or Enter) to return to the main menu.', canvas.width / 2, py + 154);
+  }
   _hsDisconnectBoxes.length = 0;
-  _hsDisconnectBoxes.push({ x: bx, y: by, w: btnW, h: btnH });
+  _hsDisconnectContinueBoxes.length = 0;
+  if (twoButton) {
+    // Two-button layout: [CONTINUE SOLO] (left, primary green) | [RETURN TO MENU] (right, red).
+    const btnW = 240, btnH = 48, gap = 16;
+    const totalW = btnW * 2 + gap;
+    const baseX = canvas.width / 2 - totalW / 2;
+    const by = py + ph - 70;
+    // Continue solo
+    const cx = baseX;
+    ctx.fillStyle = '#102818';
+    ctx.beginPath(); ctx.roundRect(cx, by, btnW, btnH, 8); ctx.fill();
+    ctx.strokeStyle = '#44ff88'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ccffd6'; ctx.font = 'bold 16px monospace';
+    ctx.fillText('CONTINUE SOLO', cx + btnW / 2, by + 30);
+    _hsDisconnectContinueBoxes.push({ x: cx, y: by, w: btnW, h: btnH });
+    // Return to menu
+    const mx = baseX + btnW + gap;
+    ctx.fillStyle = '#2a1a16';
+    ctx.beginPath(); ctx.roundRect(mx, by, btnW, btnH, 8); ctx.fill();
+    ctx.strokeStyle = '#ff8866'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ffcc99'; ctx.font = 'bold 16px monospace';
+    ctx.fillText('RETURN TO MENU', mx + btnW / 2, by + 30);
+    _hsDisconnectBoxes.push({ x: mx, y: by, w: btnW, h: btnH });
+  } else {
+    const btnW = 240, btnH = 48;
+    const bx = canvas.width / 2 - btnW / 2;
+    const by = py + ph - 70;
+    ctx.fillStyle = '#2a1a16';
+    ctx.beginPath(); ctx.roundRect(bx, by, btnW, btnH, 8); ctx.fill();
+    ctx.strokeStyle = '#ff8866'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ffcc99'; ctx.font = 'bold 16px monospace';
+    ctx.fillText('OK — RETURN TO MENU', canvas.width / 2, by + 30);
+    _hsDisconnectBoxes.push({ x: bx, y: by, w: btnW, h: btnH });
+  }
+  ctx.restore();
+}
+
+// Wrapped onto every render() call so the modal popup, "remote player
+// disconnected" banner, peer-leave notification, and out-of-sync warning
+// always paint on top regardless of which inner state-block early-returned.
+// Without this the disconnect popup was silently dropped on intro/map/draft/
+// shop/etc — the bug behind "they go back to main menu without seeing why".
+function _drawGlobalOverlays(ctx) {
+  // 1) The blocking modal popup. Render highest priority so it sits above
+  //    every other overlay.
+  if (_hsDisconnectPopup) _drawHsDisconnectPopup(ctx);
+  // 2) The 12-second "REMOTE PLAYER DISCONNECTED" banner. Drawn whether the
+  //    popup is up or not — the banner serves as a continuous reminder during
+  //    the post-popup grace window in case the user dismisses the popup but
+  //    keeps playing.
+  if (_remoteDisconnected && _remoteDisconnectTimer > 0) {
+    const fadeIn  = Math.min(1, (12 - _remoteDisconnectTimer) / 0.3);
+    const fadeOut = Math.min(1, _remoteDisconnectTimer / 2);
+    const k = Math.min(fadeIn, fadeOut);
+    const t = performance.now() / 1000;
+    const pulse = 0.85 + 0.15 * Math.sin(t * 4);
+    ctx.save();
+    ctx.globalAlpha = k * 0.97;
+    const bW = Math.min(720, canvas.width - 40), bH = 92, bX = canvas.width / 2 - bW / 2, bY = 90;
+    ctx.shadowColor = '#ff6644';
+    ctx.shadowBlur = 28 * pulse;
+    ctx.fillStyle = 'rgba(50,12,12,0.96)';
+    ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 14); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#ff6644'; ctx.lineWidth = 3; ctx.stroke();
+    ctx.globalAlpha = k;
+    ctx.fillStyle = '#ffaa88';
+    ctx.font = 'bold 24px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚠  REMOTE PLAYER DISCONNECTED  ⚠', canvas.width / 2, bY + 38);
+    ctx.fillStyle = '#ffd0bb';
+    ctx.font = 'bold 14px monospace';
+    ctx.fillText('Session is over. Continuing solo — return to lobby to play together again.', canvas.width / 2, bY + 66);
+    ctx.restore();
+  }
+  // 3) Brief 3-4P partial-leave notification. When one peer leaves but other
+  //    allies remain, the run keeps going — but we want a transient banner
+  //    so the host/clients aren't surprised by the shrinking roster.
+  if (_peerLeaveBadge) {
+    const age = performance.now() / 1000 - _peerLeaveBadge.t0;
+    const dur = 5.0;
+    if (age >= dur) {
+      _peerLeaveBadge = null;
+    } else {
+      const fadeIn  = Math.min(1, age / 0.25);
+      const fadeOut = Math.min(1, (dur - age) / 0.5);
+      const k = fadeIn * fadeOut;
+      ctx.save();
+      ctx.globalAlpha = k * 0.94;
+      const bW = Math.min(540, canvas.width - 40), bH = 56;
+      const bX = canvas.width / 2 - bW / 2, bY = 200;
+      ctx.shadowColor = '#ff9966';
+      ctx.shadowBlur = 16;
+      ctx.fillStyle = 'rgba(40,18,12,0.96)';
+      ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 10); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = '#ff9966'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.fillStyle = '#ffd0bb';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${_peerLeaveBadge.label} disconnected — continuing with remaining allies`, canvas.width / 2, bY + 34);
+      ctx.restore();
+    }
+  }
+  // 4) Out-of-sync warning banner — host and client disagree on run state
+  //    after multiple heartbeats. Previously this lived in the post-frame
+  //    pass and silently never painted on most early-returning states.
+  if (_syncWarningVisible && net.role === 'client' && net.peers.size > 0) {
+    const t = performance.now() / 1000;
+    const pulse = 0.8 + 0.2 * Math.sin(t * 3.5);
+    ctx.save();
+    const bW = Math.min(680, canvas.width - 40), bH = 72;
+    const bX = canvas.width / 2 - bW / 2, bY = 190;
+    ctx.globalAlpha = 0.94;
+    ctx.shadowColor = '#ffcc33';
+    ctx.shadowBlur = 22 * pulse;
+    ctx.fillStyle = 'rgba(42,32,8,0.94)';
+    ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 10); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ffe999';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚠  OUT OF SYNC WITH HOST  ⚠', canvas.width / 2, bY + 30);
+    ctx.fillStyle = '#ffeecc';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText(_syncMismatchReason || 'attempting to recover…', canvas.width / 2, bY + 54);
+    ctx.restore();
+  }
 }
 
 function _drawPartnerWaitingBadge(ctx, text) {
@@ -1257,6 +1584,52 @@ function _drawPartnerWaitingBadge(ctx, text) {
   ctx.textAlign = 'center';
   ctx.fillText(text, canvas.width / 2, y + 25);
   ctx.restore();
+}
+
+// Centralised disconnect-popup input handler. Consumes the click/key, picks
+// a dismiss path, and returns true while the popup is up so callers can
+// short-circuit further input handling. The popup blocks gameplay input —
+// the player must explicitly acknowledge that the session ended (or chose
+// to continue solo) before the run resumes. Auto-close timer is checked
+// here too so a walked-away user always lands somewhere sensible.
+function _handleHsDisconnectInput() {
+  if (!_hsDisconnectPopup) return false;
+  if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
+    _dismissHsDisconnect('menu');
+    return true;
+  }
+  const click = input.consumeClick();
+  const enter = input.consumeKey('enter') || input.consumeKey(' ');
+  const esc = input.consumeKey('escape');
+  const twoButton = (_hsDisconnectMode === 'continueSolo');
+  if (click) {
+    const mx = input.mouse.x, my = input.mouse.y;
+    for (const b of _hsDisconnectContinueBoxes) {
+      if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
+        _dismissHsDisconnect('continue');
+        return true;
+      }
+    }
+    for (const b of _hsDisconnectBoxes) {
+      if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) {
+        _dismissHsDisconnect('menu');
+        return true;
+      }
+    }
+    return true; // ate the click but didn't match a button — keep modal up
+  }
+  if (enter) {
+    // Enter == primary action. In two-button mode that's "continue solo";
+    // single-button mode it's the only action ("return to menu").
+    _dismissHsDisconnect(twoButton ? 'continue' : 'menu');
+    return true;
+  }
+  if (esc) {
+    // Escape always means "back out → return to menu" regardless of mode.
+    _dismissHsDisconnect('menu');
+    return true;
+  }
+  return true; // popup is up — block other input even if no action consumed
 }
 
 // Recently-played card "ghost" — fades on the right edge for ~1.2 s after
@@ -2463,7 +2836,10 @@ function startNewRun(explicitSeed) {
   _hsDisconnectPopup = false;
   _hsDisconnectReason = '';
   _hsDisconnectBoxes.length = 0;
+  _hsDisconnectContinueBoxes.length = 0;
+  _hsDisconnectMode = 'menu';
   _hsDisconnectAutoCloseAt = 0;
+  _peerLeaveBadge = null;
   _charSelectQuitConfirm = false;
 
   runManager.generateMap();
@@ -3464,6 +3840,7 @@ function update(logicDt, realDt) {
       _remoteReady = false;
       _clientReady = false;
       _hsDisconnectPopup = true;
+      _hsDisconnectMode = 'menu';
       _hsDisconnectReason = net.role === 'client' ? 'host disconnected' : 'left the session';
       _hsDisconnectAutoCloseAt = performance.now() + 30000;
       lobbyStatusMsg = net.role === 'client'
@@ -3531,35 +3908,24 @@ function update(logicDt, realDt) {
     return;
   }
 
+  // Disconnect popup intercepts ALL gameplay input. Centralised here so the
+  // popup behaves identically whether it was raised from intro / charSelect /
+  // lobby (the original sites) or from an in-run state (map / draft / playing
+  // / shop / etc) where the per-state input handlers used to never see it.
+  // This is what fixes "the others go back to main menu without seeing why" —
+  // the popup is now blocking on the intro screen we route them to instead
+  // of being silently consumed by the next click on the menu.
+  if (_hsDisconnectPopup) {
+    _handleHsDisconnectInput();
+    input.clearFrame();
+    return;
+  }
+
   // ── INTRO ──
   if (gameState === 'intro') {
-    // Disconnect modal blocks all intro input so a user bounced here from a
-    // remote-play drop explicitly acknowledges the notice before picking a
-    // mode. The catch-all at the end of the render pipeline draws the popup.
-    if (_hsDisconnectPopup) {
-      if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
-        _dismissHsDisconnect();
-        input.clearFrame();
-        return;
-      }
-      const click = input.consumeClick();
-      const keyOk = input.consumeKey('enter') || input.consumeKey('escape') || input.consumeKey(' ');
-      if (click) {
-        for (const b of _hsDisconnectBoxes) {
-          if (input.mouse.x >= b.x && input.mouse.x <= b.x + b.w &&
-              input.mouse.y >= b.y && input.mouse.y <= b.y + b.h) {
-            _dismissHsDisconnect();
-            break;
-          }
-        }
-      } else if (keyOk) {
-        _dismissHsDisconnect();
-      }
-      input.clearFrame();
-      return;
-    }
     // D-pad focus nudge (gamepad menu nav). Must run before consumeClick so
     // the user can tap D-pad to move onto a button, then A to click.
+    // (Disconnect popup is intercepted globally above the state dispatch.)
     if (_gpHandleMenuNav(introBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('enter')) {
       audio.init();
@@ -3679,33 +4045,9 @@ function update(logicDt, realDt) {
 
   // ── CHARACTER SELECT ──
   if (gameState === 'charSelect') {
-    if (!_hsDisconnectPopup && _gpHandleMenuNav(charSelectBoxes)) { input.clearFrame(); return; }
-    // Disconnect modal takes precedence — intercepts all charSelect input
-    // until dismissed so the player doesn't accidentally click through.
-    if (_hsDisconnectPopup) {
-      // Auto-close: if the user walked away, return them to the main menu
-      // after 5 s so the "stuck at hero select" state can't persist.
-      if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
-        _dismissHsDisconnect();
-        input.clearFrame();
-        return;
-      }
-      const click = input.consumeClick();
-      const keyOk = input.consumeKey('enter') || input.consumeKey('escape') || input.consumeKey(' ');
-      if (click) {
-        for (const b of _hsDisconnectBoxes) {
-          if (input.mouse.x >= b.x && input.mouse.x <= b.x + b.w &&
-              input.mouse.y >= b.y && input.mouse.y <= b.y + b.h) {
-            _dismissHsDisconnect();
-            break;
-          }
-        }
-      } else if (keyOk) {
-        _dismissHsDisconnect();
-      }
-      input.clearFrame();
-      return;
-    }
+    // Disconnect popup is handled by the global intercept above the state
+    // dispatch — the per-state branch is no longer needed.
+    if (_gpHandleMenuNav(charSelectBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) {
       // In remote MP, the first ESC opens the confirm modal so the other
       // player doesn't get silently stranded. Second ESC cancels the modal.
@@ -3811,33 +4153,8 @@ function update(logicDt, realDt) {
 
   // ── LOBBY (remote co-op) ──
   if (gameState === 'lobby') {
-    if (!_hsDisconnectPopup && _gpHandleMenuNav(lobbyBoxes)) { input.clearFrame(); return; }
-    // Disconnect modal takes precedence so the player sees the notice
-    // before the lobby screen resets underneath it.
-    if (_hsDisconnectPopup) {
-      // Auto-close mirrors the charSelect handler — guarantee the user
-      // lands back on the main menu even without interaction.
-      if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
-        _dismissHsDisconnect();
-        input.clearFrame();
-        return;
-      }
-      const click = input.consumeClick();
-      const keyOk = input.consumeKey('enter') || input.consumeKey('escape') || input.consumeKey(' ');
-      if (click) {
-        for (const b of _hsDisconnectBoxes) {
-          if (input.mouse.x >= b.x && input.mouse.x <= b.x + b.w &&
-              input.mouse.y >= b.y && input.mouse.y <= b.y + b.h) {
-            _dismissHsDisconnect();
-            break;
-          }
-        }
-      } else if (keyOk) {
-        _dismissHsDisconnect();
-      }
-      input.clearFrame();
-      return;
-    }
+    // Disconnect popup is intercepted globally above the state dispatch.
+    if (_gpHandleMenuNav(lobbyBoxes)) { input.clearFrame(); return; }
     if (input.consumeKey('escape')) {
       if (lobbyMode === 'menu') {
         // Fully tear down any in-flight connection so the next charSelect
@@ -5208,7 +5525,7 @@ function handleCharSelectClick(mx, my) {
 // ── TUTORIAL pages (RH2 #15) ─────────────────────────────────────────────
 const _TUTORIAL_PAGES = [
   { kind: 'intro', title: 'WELCOME TO ROGUE HERO 2',
-    body: ['Move with WASD or Arrow Keys.','Aim and attack with the mouse.','Press SPACE to dodge — perfect dodges crit.','Keys 1-4 select cards from your hand.','Build TEMPO with attacks; hot tempo hits harder.'] },
+    body: ['Move with WASD or Arrow Keys.','Aim and attack with the mouse.','Press SPACE to dodge toward your cursor (gamepad: B dodges in move direction).','Perfect dodges (just as an attack lands) crit.','Keys 1-4 select cards from your hand.','Build TEMPO with attacks; hot tempo hits harder.'] },
   { kind: 'attack', label: 'MELEE — ⚔', desc: 'Short-range swing. Cleaves enemies right in front of you.', anim: 'melee' },
   { kind: 'attack', label: 'PROJECTILE — ●', desc: 'Fires a single projectile toward the cursor. Mid range.', anim: 'projectile' },
   { kind: 'attack', label: 'BEAM — ═', desc: 'Instant straight line — pierces every enemy on the path.', anim: 'beam' },
@@ -5848,7 +6165,16 @@ function _drawOrbs(ctx) {
 }
 
 // ── RENDER ──────────────────────────────────────────────────────
+// Public render() wraps the inner draw pipeline so disconnect/sync overlays
+// always paint on top, even for state blocks that early-return (intro / map /
+// draft / shop / etc). Without the wrapper the modal popup is silently dropped
+// after a remote partner leaves mid-run, which is the user-visible bug behind
+// the "they go back to main menu without seeing why" report.
 function render() {
+  _renderInner();
+  _drawGlobalOverlays(renderer.ctx);
+}
+function _renderInner() {
   renderer.clear();
   // Reset critical canvas state each frame — guards against mid-render throw leaving stale state
   renderer.ctx.globalAlpha = 1.0;
@@ -6743,11 +7069,8 @@ function render() {
       charSelectBoxes.push({ x: leaveX, y: byy, w: btnW, h: btnH, action: 'mainMenu' });
       charSelectBoxes.push({ x: cancelX, y: byy, w: btnW, h: btnH, action: 'quit_cancel_cs' });
     }
-    // Disconnect popup MUST draw inside this block because the state
-    // render ends with `return;` and the post-frame pass (which used to
-    // draw the popup) never runs while gameState is charSelect. Same
-    // applies to lobby below.
-    if (_hsDisconnectPopup) _drawHsDisconnectPopup(renderer.ctx);
+    // Disconnect popup is drawn in _drawGlobalOverlays() (wrapped around
+    // the inner render) so we don't need an inline call here anymore.
     return;
   }
 
@@ -7065,10 +7388,8 @@ function render() {
       lobbyBoxes.push({ x: lvX, y: lvY, w: lvW, h: lvH, action: 'lobby_back' });
     }
 
-    // Disconnect popup — must draw here because the lobby render block
-    // returns before the post-frame passes (see charSelect above).
-    if (_hsDisconnectPopup) _drawHsDisconnectPopup(renderer.ctx);
-
+    // Disconnect popup is drawn in _drawGlobalOverlays() (wrapped around
+    // the inner render).
     return;
   }
 
@@ -7959,66 +8280,12 @@ function render() {
   // (bloom removed — ctx.filter blur was CPU-rasterized, costing 4-8ms/frame)
   // Chromatic aberration edge flash (combat only)
   if (gameState === 'playing' || gameState === 'paused') renderer.drawCAFlash();
-  // Hero-select / lobby disconnect popup — blocking modal so the remaining
-  // player explicitly acknowledges the session ended before returning.
-  // The popup also draws inside each of charSelect/lobby render blocks
-  // (which end with `return;` before this post-frame pass); this fallback
-  // covers any other state that happens to have the flag set.
-  if (_hsDisconnectPopup) _drawHsDisconnectPopup(renderer.ctx);
-  // Disconnect banner — draws in EVERY state (charSelect / lobby / map / playing /
-  // draft / shop / etc) so the remaining player always sees the session ended.
-  if (_remoteDisconnected && _remoteDisconnectTimer > 0) {
-    const ctx = renderer.ctx;
-    const fadeIn  = Math.min(1, (12 - _remoteDisconnectTimer) / 0.3);
-    const fadeOut = Math.min(1, _remoteDisconnectTimer / 2);
-    const k = Math.min(fadeIn, fadeOut);
-    const t = performance.now() / 1000;
-    const pulse = 0.85 + 0.15 * Math.sin(t * 4);
-    ctx.save();
-    ctx.globalAlpha = k * 0.97;
-    const bW = Math.min(720, canvas.width - 40), bH = 92, bX = canvas.width / 2 - bW / 2, bY = 90;
-    ctx.shadowColor = '#ff6644';
-    ctx.shadowBlur = 28 * pulse;
-    ctx.fillStyle = 'rgba(50,12,12,0.96)';
-    ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 14); ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = '#ff6644'; ctx.lineWidth = 3; ctx.stroke();
-    ctx.globalAlpha = k;
-    ctx.fillStyle = '#ffaa88';
-    ctx.font = 'bold 24px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('⚠  REMOTE PLAYER DISCONNECTED  ⚠', canvas.width / 2, bY + 38);
-    ctx.fillStyle = '#ffd0bb';
-    ctx.font = 'bold 14px monospace';
-    ctx.fillText('Session is over. Continuing solo — return to lobby to play together again.', canvas.width / 2, bY + 66);
-    ctx.restore();
-  }
-  // Out-of-sync banner: host and client disagree on run state after multiple
-  // heartbeats. Silent desyncs are the worst remote-play bug, so this renders
-  // in every state so the player sees it no matter where the mismatch starts.
-  if (_syncWarningVisible && net.role === 'client' && net.peers.size > 0) {
-    const ctx = renderer.ctx;
-    const t = performance.now() / 1000;
-    const pulse = 0.8 + 0.2 * Math.sin(t * 3.5);
-    ctx.save();
-    const bW = Math.min(680, canvas.width - 40), bH = 72;
-    const bX = canvas.width / 2 - bW / 2, bY = 190;
-    ctx.globalAlpha = 0.94;
-    ctx.shadowColor = '#ffcc33';
-    ctx.shadowBlur = 22 * pulse;
-    ctx.fillStyle = 'rgba(42,32,8,0.94)';
-    ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 10); ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 2; ctx.stroke();
-    ctx.fillStyle = '#ffe999';
-    ctx.font = 'bold 18px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('⚠  OUT OF SYNC WITH HOST  ⚠', canvas.width / 2, bY + 30);
-    ctx.fillStyle = '#ffeecc';
-    ctx.font = 'bold 12px monospace';
-    ctx.fillText(_syncMismatchReason || 'attempting to recover…', canvas.width / 2, bY + 54);
-    ctx.restore();
-  }
+  // Disconnect popup, "remote player disconnected" banner, and out-of-sync
+  // warning banner all live in _drawGlobalOverlays() which the render()
+  // wrapper calls AFTER _renderInner finishes — guaranteeing they paint on
+  // top regardless of which state-block early-returned. Don't re-add inline
+  // copies here; doing so would double-draw them on states like 'playing'
+  // that fall through to the post-frame pass.
   // RH2 multiplayer: universal "partner is waiting on you" badge for any
   // post-combat decision screen. Draws on top of draft / itemReward / shop /
   // rest / event / discard / upgrade so the local player always knows the

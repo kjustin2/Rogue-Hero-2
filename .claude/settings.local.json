@@ -15,7 +15,9 @@
       "Bash(git -C E:/Storage/SAAS/Rogue-Hero-2 diff HEAD -- Rogue-Hero-2/src/Input.js Rogue-Hero-2/src/Players.js Rogue-Hero-2/src/main.js Rogue-Hero-2/src/net/Snapshot.js)",
       "Bash(git *)",
       "Bash(node mp-disconnect-test.mjs)",
-      "Bash(node -c E:/Storage/SAAS/Rogue-Hero-2/Rogue-Hero-2/mp-local.mjs)"
+      "Bash(node -c E:/Storage/SAAS/Rogue-Hero-2/Rogue-Hero-2/mp-local.mjs)",
+      "Bash(awk *)",
+      "Bash(node mp-4player-test.mjs)"
     ]
   }
 }

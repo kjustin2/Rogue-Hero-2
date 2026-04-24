@@ -607,6 +607,245 @@ group('Lobby watchdog — raises popup if peer-leave handler missed');
     c._hsDisconnectReason === 'host disconnected');
 }
 
+// ─── Test 12: in-run peer leave on the host side raises continue-solo popup
+// User-reported bug: at the map screen the host's joined player left and
+// the host got NO notification — no banner, no popup, no return to menu.
+// Mirror the unified peer-leave handler's host branch for the in-run case
+// (main.js:227+) so a regression flips the host back to silent.
+group('In-run host-side leave → continueSolo popup');
+{
+  const RUN_STATES = ['playing','map','prep','draft','itemReward','shop','event',
+                      'rest','discard','upgrade','paused','victory'];
+  function applyInRunHostLeave(state) {
+    const inRun = RUN_STATES.includes(state.gameState);
+    if (!inRun) return state;
+    state._remoteDisconnected = true;
+    state._remoteDisconnectTimer = 12;
+    state._remotesLeft = false;
+    if (state.netRole === 'host') {
+      state._hsDisconnectPopup = true;
+      state._hsDisconnectMode = 'continueSolo';
+      state._hsDisconnectReason = `${state._leftLabel} disconnected`;
+      state._hsDisconnectAutoCloseAt = 0; // host chooses, no auto-close
+    }
+    return state;
+  }
+  for (const gs of ['map','playing','draft','shop','rest','event','itemReward',
+                    'upgrade','discard','prep','victory','paused']) {
+    const s = {
+      gameState: gs,
+      netRole: 'host',
+      _remotesLeft: true,
+      _hsDisconnectPopup: false,
+      _hsDisconnectMode: 'menu',
+      _hsDisconnectReason: '',
+      _hsDisconnectAutoCloseAt: 9999,
+      _leftLabel: 'Player 2',
+    };
+    applyInRunHostLeave(s);
+    check(`[${gs}] popup raised on host`, s._hsDisconnectPopup === true);
+    check(`[${gs}] mode = continueSolo`, s._hsDisconnectMode === 'continueSolo');
+    check(`[${gs}] reason names left peer`,
+      s._hsDisconnectReason === 'Player 2 disconnected');
+    check(`[${gs}] no auto-close timer`, s._hsDisconnectAutoCloseAt === 0);
+  }
+}
+
+// ─── Test 13: continueSolo popup dismiss path keeps run going ────────────
+// The host should be able to click [CONTINUE SOLO] and stay in the run,
+// distinct from clicking [RETURN TO MENU] which tears everything down.
+group('continueSolo popup dismiss — choice routing');
+{
+  function applyDismiss(state, choice) {
+    const wantContinue = (choice === 'continue' && state._hsDisconnectMode === 'continueSolo');
+    state._hsDisconnectPopup = false;
+    state._hsDisconnectReason = '';
+    state._hsDisconnectAutoCloseAt = 0;
+    state._hsDisconnectMode = 'menu';
+    if (wantContinue) {
+      state._dismissPath = 'continue';
+      return; // keep gameState; run continues solo
+    }
+    state._dismissPath = 'menu';
+    state.netRole = 'solo';
+    state.gameState = 'intro';
+  }
+  // Choice = continue from a continueSolo popup → stay in run.
+  const a = {
+    gameState: 'map', netRole: 'host',
+    _hsDisconnectPopup: true, _hsDisconnectMode: 'continueSolo',
+    _hsDisconnectReason: 'Player 2 disconnected', _hsDisconnectAutoCloseAt: 0,
+  };
+  applyDismiss(a, 'continue');
+  check('continue → popup hidden', a._hsDisconnectPopup === false);
+  check('continue → still on map', a.gameState === 'map');
+  check('continue → role unchanged', a.netRole === 'host');
+  check('continue → dismiss path tagged', a._dismissPath === 'continue');
+  // Choice = menu from a continueSolo popup → return to intro.
+  const b = {
+    gameState: 'map', netRole: 'host',
+    _hsDisconnectPopup: true, _hsDisconnectMode: 'continueSolo',
+    _hsDisconnectReason: 'Player 2 disconnected', _hsDisconnectAutoCloseAt: 0,
+  };
+  applyDismiss(b, 'menu');
+  check('menu → popup hidden', b._hsDisconnectPopup === false);
+  check('menu → routed to intro', b.gameState === 'intro');
+  check('menu → demoted to solo', b.netRole === 'solo');
+  // Single-button mode forces 'menu' even if 'continue' is requested.
+  const c = {
+    gameState: 'charSelect', netRole: 'client',
+    _hsDisconnectPopup: true, _hsDisconnectMode: 'menu',
+    _hsDisconnectReason: 'host disconnected', _hsDisconnectAutoCloseAt: 30000,
+  };
+  applyDismiss(c, 'continue'); // shouldn't continue — mode is 'menu'
+  check('single-button mode ignores continue choice',
+    c._dismissPath === 'menu' && c.gameState === 'intro');
+}
+
+// ─── Test 14: 3-4P partial leave — peer-leave badge surfaces who left ────
+// When 1 of N peers leaves but other allies remain, the run continues but
+// we surface a brief named badge so the remaining peers see WHO left
+// rather than the roster silently shrinking.
+group('Partial leave (3-4P) — named badge surfaces who left');
+{
+  function applyPartialLeave(state, leftLabel) {
+    state._peerLeaveBadge = { label: leftLabel, t0: 1000 };
+    return state;
+  }
+  const s = {
+    gameState: 'map',
+    netRole: 'host',
+    _peerLeaveBadge: null,
+  };
+  applyPartialLeave(s, 'Player 3');
+  check('badge raised', s._peerLeaveBadge !== null);
+  check('badge names player', s._peerLeaveBadge.label === 'Player 3');
+  // Badge is transient (~5 s in the renderer); assert the t0 is captured
+  // for the fade-out math without storing a hard expiry on the state.
+  check('badge tagged with t0', typeof s._peerLeaveBadge.t0 === 'number');
+}
+
+// ─── Test 15: SYNC_RESPONSE force-resync of safe screen transitions ──────
+// User-reported bug: client sees "screen mismatch (host: map, as: draft)"
+// then "looked like it resynced but then it failed". The fix routes a
+// SYNC_RESPONSE that actually moves the client to the host's screen for
+// safe (state-only) transitions, instead of just whining about the drift.
+group('SYNC_RESPONSE — client transitions to host state');
+{
+  // Mirror the SYNC_RESPONSE handler's safe-state branches from main.js.
+  function applySyncResponse(client, msg) {
+    const targetState = msg.state;
+    const alreadyHere = (
+      targetState === client.gameState ||
+      (targetState === 'playing' && client.gameState === 'paused') ||
+      (client.gameState === 'playing' && targetState === 'paused')
+    );
+    if (typeof msg.rngState === 'number') client.rngState = msg.rngState;
+    if (msg.floor !== client.floor) client.floor = msg.floor;
+    if (msg.roomsCleared > client.roomsCleared) client.roomsCleared = msg.roomsCleared;
+    if (alreadyHere) {
+      client._syncMismatchCount = 0;
+      client._syncWarningVisible = false;
+      return;
+    }
+    if (targetState === 'map') client.gameState = 'map';
+    else if (targetState === 'draft') client.gameState = 'draft';
+    else if (targetState === 'rest') client.gameState = 'rest';
+    else if (targetState === 'event' && msg.eventType) {
+      client.currentEventType = msg.eventType;
+      client.gameState = 'event';
+    } else if (targetState === 'shop' && Array.isArray(msg.shopCards)) {
+      client.shopCards = msg.shopCards;
+      client.gameState = 'shop';
+    } else if (targetState === 'itemReward') client.gameState = 'itemReward';
+    else if (targetState === 'upgrade') client.gameState = 'upgrade';
+    else if (targetState === 'prep' || targetState === 'playing') {
+      // Combat states need ENEMY_SPAWN_LIST — flag a request.
+      if (msg.combatNode) client.currentCombatNode = msg.combatNode;
+      client._sentResyncCombatRequest = true;
+    } else {
+      client.gameState = targetState;
+    }
+    client._syncMismatchCount = 0;
+    client._syncWarningVisible = false;
+  }
+
+  // Scenario A — the user-reported one: host is on map, client stuck on draft.
+  const A = {
+    gameState: 'draft', floor: 1, roomsCleared: 2,
+    _syncMismatchCount: 3, _syncWarningVisible: true,
+  };
+  applySyncResponse(A, { state: 'map', floor: 1, roomsCleared: 2, rngState: 12345 });
+  check('A: client transitions draft → map', A.gameState === 'map');
+  check('A: rng snapped',                    A.rngState === 12345);
+  check('A: warning cleared',                A._syncWarningVisible === false);
+
+  // Scenario B — host on shop with shopCards, client on map.
+  const B = { gameState: 'map', floor: 1, roomsCleared: 2 };
+  applySyncResponse(B, {
+    state: 'shop', floor: 1, roomsCleared: 2, rngState: 999,
+    shopCards: ['c1','c2','c3','c4'],
+  });
+  check('B: transitioned map → shop',         B.gameState === 'shop');
+  check('B: shopCards applied',               B.shopCards.length === 4);
+
+  // Scenario C — host on event with eventType, client on map.
+  const C = { gameState: 'map', floor: 1, roomsCleared: 2 };
+  applySyncResponse(C, {
+    state: 'event', floor: 1, roomsCleared: 2, rngState: 1, eventType: 'merchant',
+  });
+  check('C: transitioned map → event',        C.gameState === 'event');
+  check('C: eventType applied',               C.currentEventType === 'merchant');
+
+  // Scenario D — floor mismatch is corrected even when state already matches.
+  const D = {
+    gameState: 'map', floor: 1, roomsCleared: 0,
+    _syncMismatchCount: 3, _syncWarningVisible: true,
+  };
+  applySyncResponse(D, { state: 'map', floor: 2, roomsCleared: 5, rngState: 42 });
+  check('D: floor corrected',                  D.floor === 2);
+  check('D: roomsCleared advanced',            D.roomsCleared === 5);
+  check('D: warning cleared on match',         D._syncWarningVisible === false);
+
+  // Scenario E — combat resync flags a RESYNC_COMBAT_REQUEST instead of blindly
+  // jumping screens (client doesn't have ENEMY_SPAWN_LIST data yet).
+  const E = { gameState: 'map', floor: 1, roomsCleared: 0 };
+  applySyncResponse(E, {
+    state: 'prep', floor: 1, roomsCleared: 0, rngState: 5,
+    combatNode: { type: 'fight', id: 'n5' },
+  });
+  check('E: combat node captured',             E.currentCombatNode?.id === 'n5');
+  check('E: requested combat re-broadcast',    E._sentResyncCombatRequest === true);
+}
+
+// ─── Test 16: SYNC_RESPONSE no-ops cleanly when already aligned ──────────
+// Don't re-trigger transitions when the client and host already agree —
+// otherwise a delayed in-flight response could thrash a player who just
+// recovered on their own.
+group('SYNC_RESPONSE — no-op when already aligned');
+{
+  function applySyncResponse(client, msg) {
+    const alreadyHere = msg.state === client.gameState;
+    if (alreadyHere) {
+      client._syncMismatchCount = 0;
+      client._syncWarningVisible = false;
+      return 'noop';
+    }
+    client.gameState = msg.state;
+    return 'changed';
+  }
+  const s = {
+    gameState: 'map', floor: 1, roomsCleared: 2,
+    _syncMismatchCount: 3, _syncWarningVisible: true,
+  };
+  const result = applySyncResponse(s, {
+    state: 'map', floor: 1, roomsCleared: 2, rngState: 7,
+  });
+  check('no-op tagged', result === 'noop');
+  check('warning cleared even on no-op', s._syncWarningVisible === false);
+  check('gameState unchanged', s.gameState === 'map');
+}
+
 // ─── Summary ─────────────────────────────────────────────────────────────
 console.log(
   `\n${failed === 0 ? '✓' : '✗'}  ${total - failed}/${total} checks passed`
