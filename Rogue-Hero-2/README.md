@@ -20,6 +20,25 @@ npm install
 npm start
 ```
 
+## Testing Remote Co-op Locally (1–4 Players)
+
+Simulate multiple remote peers on a single machine. Each peer needs its own Chrome profile so WebRTC identity and localStorage stay distinct.
+
+```bash
+# Terminal 1 — dev server
+npm run serve
+
+# Terminal 2 — launch 4 tiled Chrome windows, each a separate peer
+npm run mp
+```
+
+- Default: 4 windows at `http://localhost:8000`, tiled 2×2 at 960×540.
+- Different count: `npm run mp -- 2` (two windows) or up to 8.
+- Different port: `npm run mp -- 4 9000`.
+- Chrome not auto-detected? Set `CHROME_PATH=/path/to/chrome` (or `msedge.exe`) and retry.
+
+In the game, the first window hosts ("Remote Co-op" → "Host Game"), grabs a 6-char room code, and the other three join with it. Profiles live in `%TEMP%\rh2-mp-p1` … `rh2-mp-p4`; delete them anytime to reset.
+
 ## How to Package for Distribution
 
 The game ships as standalone installers for Windows / macOS / Linux via Electron:

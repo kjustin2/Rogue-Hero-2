@@ -7149,47 +7149,80 @@ function render() {
     }
     const ctx = renderer.ctx;
     const ch = Characters[selectedCharId];
-    // Hero info bar — drawn inside the map header area
-    ctx.fillStyle = ch ? ch.color : '#aaa';
-    // Left: character name + HP
-    ctx.font = 'bold 16px monospace';
-    ctx.textAlign = 'left';
-    ctx.fillText(`${ch?.name || '?'}`, 18, 28);
-    const hpW = 160, hpH = 14;
-    ctx.fillStyle = '#331111';
-    ctx.fillRect(18, 34, hpW, hpH);
-    ctx.fillStyle = '#ee3333';
-    ctx.fillRect(18, 34, (player.hp / player.maxHp) * hpW, hpH);
-    ctx.strokeStyle = '#553333'; ctx.lineWidth = 1; ctx.strokeRect(18, 34, hpW, hpH);
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 11px monospace';
-    ctx.fillText(`${player.hp}/${player.maxHp} HP`, 18 + hpW + 8, 46);
-    // RH2: in multi-player co-op (local 2P or remote 2/3/4P), show every
-    // ally's HP bar stacked to the right of P1's.
-    for (let _pi = 1; _pi < players.count; _pi++) {
-      const p2 = players.list[_pi];
-      if (!p2) continue;
-      const p2X = 18 + hpW + 90 + (_pi - 1) * (hpW + 90);
-      const p2Ch = Characters[p2._charId || p2.charId || selectedCharId];
-      ctx.fillStyle = p2Ch ? p2Ch.color : '#ff9944';
-      ctx.font = 'bold 14px monospace';
+    // Hero info bar — drawn inside the map header area.
+    // 1–2 players: single horizontal row (leaves center clear for ACT title).
+    // 3–4 players: compact vertical stack on the left — wider rows would
+    // otherwise cross under the centered "ACT N" label (see RunManager.js).
+    const compactStack = players.count >= 3;
+    if (!compactStack) {
+      ctx.fillStyle = ch ? ch.color : '#aaa';
+      ctx.font = 'bold 16px monospace';
       ctx.textAlign = 'left';
-      ctx.fillText(`P${(p2.playerIndex || _pi) + 1} ${p2Ch?.name || ''}`, p2X, 28);
+      ctx.fillText(`${ch?.name || '?'}`, 18, 28);
+      const hpW = 160, hpH = 14;
       ctx.fillStyle = '#331111';
-      ctx.fillRect(p2X, 34, hpW, hpH);
-      const p2col = p2.hp > 0 ? '#ee3333' : '#553333';
-      ctx.fillStyle = p2col;
-      ctx.fillRect(p2X, 34, Math.max(0, p2.hp / Math.max(1, p2.maxHp)) * hpW, hpH);
-      ctx.strokeStyle = '#553333'; ctx.lineWidth = 1; ctx.strokeRect(p2X, 34, hpW, hpH);
+      ctx.fillRect(18, 34, hpW, hpH);
+      ctx.fillStyle = '#ee3333';
+      ctx.fillRect(18, 34, (player.hp / player.maxHp) * hpW, hpH);
+      ctx.strokeStyle = '#553333'; ctx.lineWidth = 1; ctx.strokeRect(18, 34, hpW, hpH);
       ctx.fillStyle = '#fff';
       ctx.font = 'bold 11px monospace';
-      ctx.fillText(`${Math.max(0, p2.hp)}/${p2.maxHp} HP${p2.downed ? '  ▼DOWN' : (!p2.alive ? '  ✖DEAD' : '')}`, p2X + hpW + 8, 46);
+      ctx.fillText(`${player.hp}/${player.maxHp} HP`, 18 + hpW + 8, 46);
+      for (let _pi = 1; _pi < players.count; _pi++) {
+        const p2 = players.list[_pi];
+        if (!p2) continue;
+        const p2X = 18 + hpW + 90 + (_pi - 1) * (hpW + 90);
+        const p2Ch = Characters[p2._charId || p2.charId || selectedCharId];
+        ctx.fillStyle = p2Ch ? p2Ch.color : '#ff9944';
+        ctx.font = 'bold 14px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`P${(p2.playerIndex || _pi) + 1} ${p2Ch?.name || ''}`, p2X, 28);
+        ctx.fillStyle = '#331111';
+        ctx.fillRect(p2X, 34, hpW, hpH);
+        const p2col = p2.hp > 0 ? '#ee3333' : '#553333';
+        ctx.fillStyle = p2col;
+        ctx.fillRect(p2X, 34, Math.max(0, p2.hp / Math.max(1, p2.maxHp)) * hpW, hpH);
+        ctx.strokeStyle = '#553333'; ctx.lineWidth = 1; ctx.strokeRect(p2X, 34, hpW, hpH);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 11px monospace';
+        ctx.fillText(`${Math.max(0, p2.hp)}/${p2.maxHp} HP${p2.downed ? '  ▼DOWN' : (!p2.alive ? '  ✖DEAD' : '')}`, p2X + hpW + 8, 46);
+      }
+    } else {
+      // Compact stack: each row = name (60px) + HP bar (120) + text (70) ≈ 260px,
+      // comfortably inside the canvas.width/2 - 100 clearance to the ACT label.
+      const hpW = 120, hpH = 11, rowH = 18;
+      const baseY = 22;
+      for (let _pi = 0; _pi < players.count; _pi++) {
+        const pp = _pi === 0 ? player : players.list[_pi];
+        if (!pp) continue;
+        const ppCh = Characters[pp._charId || pp.charId || (_pi === 0 ? selectedCharId : selectedCharId)];
+        const rowY = baseY + _pi * rowH;
+        const label = _pi === 0 ? (ppCh?.name || 'P1') : `P${(pp.playerIndex || _pi) + 1}`;
+        ctx.fillStyle = ppCh?.color || (_pi === 0 ? '#ee3333' : '#ff9944');
+        ctx.font = 'bold 11px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(label, 18, rowY + 9);
+        const barX = 72;
+        ctx.fillStyle = '#331111';
+        ctx.fillRect(barX, rowY, hpW, hpH);
+        const frac = Math.max(0, Math.min(1, pp.hp / Math.max(1, pp.maxHp)));
+        ctx.fillStyle = pp.hp > 0 ? '#ee3333' : '#553333';
+        ctx.fillRect(barX, rowY, hpW * frac, hpH);
+        ctx.strokeStyle = '#553333'; ctx.lineWidth = 1; ctx.strokeRect(barX, rowY, hpW, hpH);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 10px monospace';
+        const status = pp.downed ? ' ▼' : (!pp.alive ? ' ✖' : '');
+        ctx.fillText(`${Math.max(0, pp.hp)}/${pp.maxHp}${status}`, barX + hpW + 6, rowY + 9);
+      }
     }
     ctx.fillStyle = '#666';
     ctx.font = '11px monospace';
     const layersLeft = runManager.getLayersToEnd();
     const depthLabel = layersLeft <= 1 ? 'BOSS NEXT!' : `${layersLeft - 1} room(s) to boss`;
-    ctx.fillText(`Act ${runManager.floor}  ·  ${DIFFICULTY_NAMES[selectedDifficulty]}  ·  ${depthLabel}`, 18, 62);
+    // Compact stack already pushes the depth caption below the last row.
+    const depthY = compactStack ? 22 + players.count * 18 + 10 : 62;
+    ctx.textAlign = 'left';
+    ctx.fillText(`Act ${runManager.floor}  ·  ${DIFFICULTY_NAMES[selectedDifficulty]}  ·  ${depthLabel}`, 18, depthY);
 
     // Right: cards & relics info
     ctx.textAlign = 'right';
@@ -7850,42 +7883,69 @@ function render() {
     drawDraftScreen();
   } else if (gameState === 'prep') {
     ui.drawPrepScreen(renderer.ctx);
-    // Remote MP: show a READY-UP banner with both players' status. Combat
-    // only starts when BOTH players have hit ENTER / FIGHT.
+    // Remote MP: READY-UP banner. One pill per player (2–4 peers), placed
+    // ABOVE the hand so it doesn't cover the cards the player is equipping.
     if (net.role !== 'solo' && net.peers.size > 0) {
       const ctx = renderer.ctx;
       const t = performance.now() / 1000;
       const dots = '.'.repeat((Math.floor(t * 2) % 4));
-      const meReady = _prepReadyLocal, themReady = _peerIsReady();
-      const bW = 580, bH = 80, bX = canvas.width / 2 - bW / 2, bY = canvas.height - 170;
+
+      // Assemble pills: local first, then each connected peer in player-index
+      // order so P1/P2/P3/P4 labels stay stable across runs.
+      const pills = [{
+        label: _myPlayerIndex != null ? `YOU (P${_myPlayerIndex + 1})` : 'YOU',
+        ready: _prepReadyLocal,
+      }];
+      const remote = [];
+      for (const [pid] of net.peers) {
+        remote.push({
+          idx: _peerToIndex.get(pid) ?? 99,
+          ready: !!_prepReadyByPeer.get(pid),
+        });
+      }
+      remote.sort((a, b) => a.idx - b.idx);
+      for (const r of remote) pills.push({ label: `P${(r.idx | 0) + 1}`, ready: r.ready });
+
+      const readyCount = pills.reduce((n, p) => n + (p.ready ? 1 : 0), 0);
+      const allReady = readyCount === pills.length;
+
+      // Adaptive pill sizing: 4P needs narrower pills so the row fits.
+      const pillW = pills.length <= 2 ? 200 : (pills.length === 3 ? 160 : 140);
+      const pillH = 30, pillGap = 12;
+      const pillsTotal = pillW * pills.length + pillGap * (pills.length - 1);
+      const bW = Math.max(580, pillsTotal + 40);
+      const bH = 80;
+      // Hand top lives at canvas.height - 214 (CARD_H 192 + 22 margin in
+      // ui._drawHand). Park the banner 12 px above that so cards stay clickable.
+      const HAND_TOP = canvas.height - 214;
+      const bX = canvas.width / 2 - bW / 2;
+      const bY = Math.max(120, HAND_TOP - bH - 12);
+
       ctx.save();
-      // Background
-      const allReady = meReady && themReady;
       ctx.fillStyle = allReady ? 'rgba(18,40,22,0.94)' : 'rgba(20,18,40,0.94)';
       ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 12); ctx.fill();
       ctx.strokeStyle = allReady ? '#66ff99' : '#aa88ff'; ctx.lineWidth = 2; ctx.stroke();
 
-      // Title
       ctx.fillStyle = allReady ? '#aaffbb' : '#ddccff';
       ctx.font = 'bold 18px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(allReady ? 'STARTING COMBAT…' : 'BOTH PLAYERS MUST READY UP' + dots, canvas.width / 2, bY + 26);
+      const title = allReady
+        ? 'STARTING COMBAT…'
+        : `ALL PLAYERS MUST READY UP  (${readyCount}/${pills.length})${dots}`;
+      ctx.fillText(title, canvas.width / 2, bY + 26);
 
-      // Two status pills side-by-side
-      const pillW = 200, pillH = 30, pillGap = 16;
-      const pillsTotal = pillW * 2 + pillGap;
       const pillsX = canvas.width / 2 - pillsTotal / 2;
       const pillY = bY + 40;
-      const _drawPill = (px, label, isReady) => {
-        ctx.fillStyle = isReady ? 'rgba(40,90,50,0.95)' : 'rgba(60,40,40,0.6)';
+      for (let i = 0; i < pills.length; i++) {
+        const p = pills[i];
+        const px = pillsX + i * (pillW + pillGap);
+        ctx.fillStyle = p.ready ? 'rgba(40,90,50,0.95)' : 'rgba(60,40,40,0.6)';
         ctx.beginPath(); ctx.roundRect(px, pillY, pillW, pillH, 6); ctx.fill();
-        ctx.strokeStyle = isReady ? '#66ff99' : '#665577'; ctx.lineWidth = 1.5; ctx.stroke();
-        ctx.fillStyle = isReady ? '#ccffd6' : '#aa99bb';
+        ctx.strokeStyle = p.ready ? '#66ff99' : '#665577'; ctx.lineWidth = 1.5; ctx.stroke();
+        ctx.fillStyle = p.ready ? '#ccffd6' : '#aa99bb';
         ctx.font = 'bold 13px monospace';
-        ctx.fillText((isReady ? '✓ ' : '◯ ') + label, px + pillW / 2, pillY + 20);
-      };
-      _drawPill(pillsX, meReady ? 'YOU READY' : 'YOU — PRESS ENTER', meReady);
-      _drawPill(pillsX + pillW + pillGap, themReady ? 'PARTNER READY' : 'PARTNER — WAITING', themReady);
+        ctx.fillText((p.ready ? '✓ ' : '◯ ') + p.label, px + pillW / 2, pillY + 20);
+      }
 
       ctx.restore();
     }
