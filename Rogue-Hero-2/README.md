@@ -22,57 +22,102 @@ npm start
 
 ## Debug Mode
 
-The game exposes a scriptable debug surface on `window._dev` as soon as the page boots (see `src/DevConsole.js`). Open the browser DevTools console on any running instance and drive the game programmatically.
+The game exposes a scriptable debug surface on `window._dev` as soon as the page boots (see `src/DevConsole.js`). Everything below runs inside the browser's **DevTools Console**.
 
-**In-game debug overlays:**
+**Opening the DevTools Console:**
+
+| Environment | Shortcut |
+|---|---|
+| Chrome / Edge / Brave / Firefox (Windows, Linux) | `F12` or `Ctrl+Shift+I`, then click **Console** |
+| Chrome / Edge / Safari (macOS) | `Cmd+Option+I` (Safari: enable "Show Develop menu" in Settings → Advanced first), then click **Console** |
+| Electron desktop app (`npm start`) | `Ctrl+Shift+I` (Windows/Linux) or `Cmd+Option+I` (macOS), or from the top-menu **View → Toggle Developer Tools** |
+| Mobile Chrome | `chrome://inspect` on desktop Chrome with the device USB-connected |
+
+Type `_dev` and press Enter to confirm the surface is loaded — you should see an object with `ready: true`.
+
+**In-game debug overlays** (work without opening the console):
 - `Ctrl+N` — network HUD (role, peer count, in/out bytes, rate, last 8 reliable events)
 - `Ctrl+P` — per-frame profile overlay
 - `F2` — toggle local 2-player co-op (also a button in the top-right of char select)
 
-**Common `_dev` commands** (paste into browser console):
+**Common `_dev` commands** — paste into the console:
+
 ```js
-// Start a deterministic run — skips intro / char select / lobby
-_dev.startRun('blade', 0, 12345);       // char, difficulty, seed
-_dev.startCoopRun('frost', 0, 777);     // same, but local 2P enabled
+// ── Start / skip screens ──────────────────────────────────────────
+_dev.startRun('blade', 0, 12345);        // char, difficulty (0-3), seed
+_dev.startCoopRun('frost', 0, 777);      // same, but local 2P enabled
 
-// Combat helpers
-_dev.godmode(true);                      // keep player HP pinned
+// Jump the game state machine anywhere
+_dev.setGameState('map');                // 'intro','charSelect','map','playing',
+                                         // 'prep','draft','itemReward','shop',
+                                         // 'upgrade','event','rest','stats','victory'
+
+// Jump to a specific floor on the run map
+_dev.setFloor(4);                        // set current floor (1-5)
+
+// ── Skip directly to any boss ─────────────────────────────────────
+_dev.listBosses();                       // list all 9 boss IDs
+_dev.bossArena('boss_brawler', 1);       // floor-1 boss
+_dev.bossArena('boss_conductor', 2);     // floor-2 boss
+_dev.bossArena('boss_necromancer', 3);   // floor-3 boss
+_dev.bossArena('boss_archivist', 3);     // Act-3 secret boss
+_dev.bossArena('boss_aurora', 5);        // RH2 final boss
+
+// ── Skip directly to a specific enemy fight ───────────────────────
+_dev.listEnemies();                      // all 30+ enemy class IDs
+_dev.spawnEnemy('tether_witch', 600, 300);
+_dev.spawnEnemy('iron_choir', 400, 400);
+_dev.killAll();                          // kill everything in the current room
+_dev.clearRoom();                        // advance past combat to the draft/map
+
+// ── Combat / player helpers ───────────────────────────────────────
+_dev.godmode(true);                      // pin HP at max each frame
 _dev.setMaxHp(9999);
-_dev.bossArena('boss_aurora', 3);        // spawn any boss
-_dev.grantAllRelics();                   // every relic
-_dev.forceVictory();                     // jump to the win screen
+_dev.setHp(5);                           // force low HP (test Last Rites, etc.)
+_dev.setAp(10);                          // fill AP pool
+_dev.setTempo(95);                       // jump tempo zone (0=cold, 50=flow, 90=critical, 100=auto-crash)
+_dev.forceVictory();                     // jump straight to the win screen
 
-// Card helpers
-_dev.grantCard('frenzy');
+// ── Card / relic helpers ──────────────────────────────────────────
+_dev.listCards();                        // every card ID in the registry (~191)
+_dev.cardTypes();                        // distinct card types (melee, shot, trap, etc.)
+_dev.firstCardOfType('sigil');           // one card ID per type
+_dev.grantCard('frenzy');                // add to deck
 _dev.playCard('frenzy', { x: 800, y: 400 });  // execute at a cursor position
-_dev.setTempo(95);                       // jump to critical zone
+_dev.listItems();                        // every relic ID (~33)
+_dev.grantRelic('berserker_heart');
+_dev.grantAllRelics();                   // grant every relic at once
 
-// Introspection
+// ── Introspection ─────────────────────────────────────────────────
 _dev.snapshot();                         // { gameState, player, enemies, ... }
-_dev.stateHash();                        // deterministic state digest
-_dev.stateSnapshot();                    // canonical state dict
+_dev.stateHash();                        // deterministic state digest (8-hex)
+_dev.stateSnapshot();                    // canonical state dict (what the hash covers)
 _dev.worldCounts();                      // { traps, orbs, echoes, sigils, ... }
-_dev.playersSnapshot();                  // per-player summary in local 2P
+_dev.playersSnapshot();                  // per-player summary (hp/coopMode/halo) in local 2P
+_dev.eventListenerCounts();              // EventBus listener counts — leak detection
+_dev.errors;                             // runtime errors the harness captured
 
-// Multiplayer bypass (skips the lobby UI)
+// ── Multiplayer bypass (skips the lobby UI) ───────────────────────
 const code = await _dev.mpHost({ difficulty: 0 });
-// …open another browser/profile and call:
+// …open another browser or profile (npm run mp spawns 4 Chrome profiles) and run:
 await _dev.mpJoin(code);
+_dev.peerCount;                          // 3 means full mesh in a 4-peer game
+_dev.netRole;                            // 'host', 'client', or 'solo'
 
-// RNG trace — pinpoint where two peers diverge
+// ── RNG trace — pinpoint where two peers diverge ──────────────────
 _dev.rngTraceStart();
-// … do stuff …
+// … reproduce the behaviour on both peers …
 _dev.rngTrace();                         // [{ v, s, c }, …] per consumption
 
-// Net record/replay — capture a reproducer for a live desync
+// ── Net record/replay — capture a reproducer for a live desync ────
 _dev.netRecordStart();
 // … reproduce the bug …
-const trace = _dev.netRecordStop();      // save this to a file
+const trace = _dev.netRecordStop();      // save via JSON.stringify(trace)
 // On a fresh instance:
 _dev.netPlayback(trace);
 ```
 
-The full API surface is documented inline in `src/DevConsole.js`.
+The full API surface (~60 methods) is documented inline in `src/DevConsole.js`.
 
 ## Automated Tests
 
