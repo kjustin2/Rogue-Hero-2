@@ -34,7 +34,10 @@
       "Bash(ls src/*.js)",
       "Bash(grep -v \"//\")",
       "Bash(wc -l /e/Storage/SAAS/Rogue-Hero/src/*.js)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(npm install *)",
+      "Bash(npx playwright *)",
+      "Bash(npm run *)"
     ]
   },
   "prefersReducedMotion": true

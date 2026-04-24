@@ -27,6 +27,7 @@ import { Lobby } from './net/Lobby.js';
 import { SnapshotDecoder } from './net/Snapshot.js';
 import { Reconcile } from './net/Reconcile.js';
 import { TetherWitch, MireToad, Bloomspawn, IronChoir, StaticHound, BossHollowKing, BossVaultEngine, BossAurora } from './EnemiesRH2.js';
+import { initDevConsole } from './DevConsole.js';
 
 // Expose defs for UI (avoids circular imports)
 window._itemDefs = ItemDefinitions;
@@ -9553,6 +9554,26 @@ window.addEventListener('beforeunload', () => {
       net.sendReliable('evt', { type: 'PEER_QUIT', reason: 'unload' });
     }
   } catch {}
+});
+
+// ── Dev/test harness (exposes window._dev) ─────────────────────
+// Safe to ship: only adds a programmatic surface — no behaviour changes.
+// See tests/smoke.spec.js for the Playwright smoke suite that drives it.
+initDevConsole({
+  getGameState: () => gameState,
+  setGameState: (v) => { gameState = v; window._gameState = v; },
+  getPlayer: () => player,
+  getEnemies: () => enemies,
+  getCurrentCombatNode: () => currentCombatNode,
+  setCurrentCombatNode: (v) => { currentCombatNode = v; },
+  getSelectedCharId: () => selectedCharId,
+  setSelectedCharId: (v) => { selectedCharId = v; },
+  setSelectedDifficulty: (v) => { selectedDifficulty = v; },
+  setLocalCoop: (v) => { localCoop = v; },
+  startNewRun,
+  spawnEnemies,
+  handleCombatClear,
+  tempo, deckManager, itemManager, runManager, input,
 });
 
 console.log('[Init] Game ready, starting engine.');
