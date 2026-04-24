@@ -58,6 +58,18 @@ export class InputManager {
 
     canvas.addEventListener('contextmenu', e => e.preventDefault());
 
+    // Mouse wheel cycles the selected card slot. Each discrete step emits a
+    // pseudo-key the main loop consumes the same way it does gamepad shoulder
+    // buttons. Accumulator smooths trackpad precision scrolling — tiny deltas
+    // wouldn't otherwise cross the threshold, but they still add up.
+    canvas.addEventListener('wheel', e => {
+      e.preventDefault();
+      this._wheelAccum = (this._wheelAccum || 0) + e.deltaY;
+      const step = 40;
+      while (this._wheelAccum >= step)  { this.justPressed.add('p1cardnext'); this._wheelAccum -= step; }
+      while (this._wheelAccum <= -step) { this.justPressed.add('p1cardprev'); this._wheelAccum += step; }
+    }, { passive: false });
+
     // Touch controls
     canvas.addEventListener('touchstart', e => {
       e.preventDefault();

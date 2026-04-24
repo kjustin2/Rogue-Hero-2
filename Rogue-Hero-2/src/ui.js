@@ -1602,7 +1602,8 @@ export class UI {
 
   // ───────────── EVENT SCREEN ─────────────
   // eventType: 'standard' | 'merchant' | 'blacksmith'
-  drawEventScreen(ctx, eventType) {
+  // player is optional — when provided, HP is shown since events can change it.
+  drawEventScreen(ctx, eventType, player) {
     ctx.fillStyle = 'rgba(0,0,0,0.9)';
     ctx.fillRect(0, 0, this.width, this.height);
 
@@ -1621,6 +1622,16 @@ export class UI {
     ctx.font = '15px monospace';
     ctx.fillText(subtitle, this.width / 2, 130);
 
+    // HP readout — event choices can heal, trade, or gamble HP, so the
+    // current value drives every decision on this screen.
+    if (player && typeof player.hp === 'number' && typeof player.maxHp === 'number') {
+      const lowHp = player.hp / Math.max(1, player.maxHp) <= 0.34;
+      ctx.fillStyle = lowHp ? '#ff6666' : '#9fe8a4';
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`♥ ${player.hp} / ${player.maxHp} HP`, this.width / 2, 158);
+    }
+
     let options;
     if (eventType === 'merchant') {
       options = [
@@ -1638,7 +1649,7 @@ export class UI {
       options = [
         { label: 'Trade 1 HP → Random Relic',       key: '1', color: '#ff6666' },
         { label: 'Rest: Heal 2 HP',                  key: '2', color: PAL.FLOWING },
-        { label: 'Gamble: 50% +2 HP or −1 HP',       key: '3', color: PAL.HOT },
+        { label: 'Gamble: 50% +4 HP or −1 HP',       key: '3', color: PAL.HOT },
       ];
     }
 

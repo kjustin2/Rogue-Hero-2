@@ -247,16 +247,50 @@ net.on('peer', (msg) => {
       _remoteRestVoteByPeer.delete(msg.peerId);
       const remotesLeft = players.list.some(p => p._isRemote);
       if (!remotesLeft) {
-        if (player) player._coopMode = false;
-        if (net.role === 'client') net.role = 'solo';
-        _remotePhaseDone = true;
-        _localPhaseDone = true;
-        _prepReadyLocal = true;
-        _prepReadyRemote = true;
-        _remotePhaseDoneByPeer.clear();
-        _prepReadyByPeer.clear();
-        _remoteMapVoteByPeer.clear();
-        _remoteRestVoteByPeer.clear();
+        if (net.role === 'client') {
+          // Client just lost its host mid-run. The host is authoritative for
+          // map generation, enemy state and RNG — a demotion to solo would
+          // either strand us on a half-generated map (e.g. the map screen
+          // before a node is committed) or desync vs. state we never owned.
+          // Tear the run down and route back to the main menu with the same
+          // blocking popup the lobby/char-select flows use.
+          _hsDisconnectPopup = true;
+          _hsDisconnectReason = 'host disconnected';
+          _hsDisconnectAutoCloseAt = performance.now() + 30000;
+          try { net.disconnect(); } catch {}
+          net.role = 'solo';
+          _lobbyPeers = [];
+          _remoteReady = false;
+          _clientReady = false;
+          players.list = players.list.filter(p => !p._isRemote);
+          if (player) player._coopMode = false;
+          _remotePhaseDone = true;
+          _localPhaseDone = true;
+          _prepReadyLocal = true;
+          _prepReadyRemote = true;
+          _remotePhaseDoneByPeer.clear();
+          _prepReadyByPeer.clear();
+          _remoteMapVoteByPeer.clear();
+          _remoteRestVoteByPeer.clear();
+          selectedCharId = null;
+          lobbyMode = 'menu';
+          lobbyStatusMsg = '';
+          gameState = 'intro';
+          audio.silenceMusic();
+          audio.playBGM('menu');
+        } else {
+          // Host lost its last remote ally — the host owns the sim, so we can
+          // continue solo. The 12 s banner above tells the user what happened.
+          if (player) player._coopMode = false;
+          _remotePhaseDone = true;
+          _localPhaseDone = true;
+          _prepReadyLocal = true;
+          _prepReadyRemote = true;
+          _remotePhaseDoneByPeer.clear();
+          _prepReadyByPeer.clear();
+          _remoteMapVoteByPeer.clear();
+          _remoteRestVoteByPeer.clear();
+        }
       } else {
         // With other allies still connected, just recompute aggregates so
         // gates open correctly if the departed peer was the last holdout.
@@ -567,6 +601,62 @@ net.on('evt', (msg, senderPeerId) => {
     // that sent this PONG back to us.
     if (senderPeerId) _lastPongByPeer.set(senderPeerId, performance.now());
 
+  } else if (type === 'SYNC_HEARTBEAT' && net.role === 'client') {
+    // Host periodically broadcasts authoritative run state. Compare to
+    // local state and surface any persistent mismatch so a silently desynced
+    // run (missed ROOM_CLEARED / MAP_NODE_CHOSEN / etc.) stops pretending
+    // everything is fine.
+    const hostState = msg.state;
+    const hostFloor = msg.floor | 0;
+    const hostRooms = msg.roomsCleared | 0;
+    // Paused is a local-only overlay over 'playing' — treat as a match.
+    const stateMatches = (
+      hostState === gameState ||
+      (hostState === 'playing' && gameState === 'paused') ||
+      (gameState === 'playing' && hostState === 'paused')
+    );
+    const floorMatches = hostFloor === (runManager.floor | 0);
+    const roomsMatch = hostRooms === (roomsCleared | 0);
+    if (stateMatches && floorMatches && roomsMatch) {
+      _syncMismatchCount = 0;
+      _syncMismatchReason = '';
+      _syncWarningVisible = false;
+    } else {
+      _syncMismatchCount++;
+      _syncMismatchReason = !stateMatches
+        ? `screen mismatch (host: ${hostState}, us: ${gameState})`
+        : !floorMatches
+          ? `floor mismatch (host: ${hostFloor}, us: ${runManager.floor | 0})`
+          : `rooms-cleared mismatch (host: ${hostRooms}, us: ${roomsCleared | 0})`;
+      // Two consecutive mismatched heartbeats (~6 s) → show the banner and
+      // ask the host to resend current state once, throttled to every 15 s.
+      if (_syncMismatchCount >= 2) {
+        _syncWarningVisible = true;
+        const nowMs = performance.now();
+        if (nowMs - _syncRecoveryRequestedAt > 15000) {
+          _syncRecoveryRequestedAt = nowMs;
+          console.warn('[Sync] mismatch detected:', _syncMismatchReason, '— requesting resync');
+          net.sendReliable('evt', { type: 'SYNC_REQUEST', reason: _syncMismatchReason });
+        }
+      }
+    }
+
+  } else if (type === 'SYNC_REQUEST') {
+    // Host-side: a client flagged itself out of sync. Re-broadcast the
+    // current authoritative heartbeat immediately — gives the client a
+    // fresh reference before the 3 s cadence would otherwise fire. We
+    // don't try to replay history; the client just resyncs its warning
+    // banner once both sides agree on state again.
+    if (net.role === 'host' && net.peers.size > 0) {
+      net.sendReliable('evt', {
+        type: 'SYNC_HEARTBEAT',
+        state: gameState,
+        floor: runManager.floor | 0,
+        roomsCleared: roomsCleared | 0,
+        enemiesAlive: gameState === 'playing' ? enemies.reduce((a, e) => a + (e && e.alive ? 1 : 0), 0) : 0,
+      });
+    }
+
   } else if (type === 'PHASE_DONE') {
     // Peer finished their post-combat decision phase. In 3–4P the map only
     // advances once EVERY peer has reported done (aggregated below).
@@ -843,6 +933,7 @@ net.on('evt', (msg, senderPeerId) => {
     // down the session immediately instead of waiting for WebRTC to notice
     // the closed channel (which can take many seconds on some networks).
     const inRun = ['playing','map','prep','draft','itemReward','shop','event','rest','discard','upgrade','paused','victory'].includes(gameState);
+    const wasClient = net.role === 'client';
     try { net.disconnect(); } catch {}
     net.role = 'solo';
     _lobbyPeers = []; _remoteReady = false; _clientReady = false; _resetPeerLobbyState();
@@ -866,10 +957,21 @@ net.on('evt', (msg, senderPeerId) => {
         _hsDisconnectReason = 'left the session';
         _hsDisconnectAutoCloseAt = performance.now() + 30000;
       }
+    } else if (wasClient) {
+      // Client can't continue a run the host was driving — bounce to the
+      // main menu with the same blocking popup used by lobby/charSelect.
+      _hsDisconnectPopup = true;
+      _hsDisconnectReason = 'host disconnected';
+      _hsDisconnectAutoCloseAt = performance.now() + 30000;
+      selectedCharId = null;
+      lobbyMode = 'menu';
+      lobbyStatusMsg = '';
+      gameState = 'intro';
+      audio.silenceMusic();
+      audio.playBGM('menu');
     }
-    // In-run: the existing "REMOTE PLAYER DISCONNECTED" banner renders for
-    // the next ~12 s and the player continues solo — matches the behaviour
-    // of a WebRTC-detected disconnect (see peer 'leave' handler above).
+    // Host in-run: the existing "REMOTE PLAYER DISCONNECTED" banner
+    // renders for ~12 s and the host continues solo.
   }
 });
 let localCoop = false;             // toggled by F2 in char select
@@ -968,6 +1070,16 @@ let _remoteReadyByPeer = new Map(); // peerId → boolean ready flag
 let _clientReady = false;        // client: local player has clicked READY in charSelect
 let _remoteDisconnected = false; // in-game: remote peer disconnected mid-run
 let _remoteDisconnectTimer = 0;  // seconds until banner auto-hides
+// Sync heartbeat: host broadcasts { state, floor, roomsCleared } every ~3 s
+// during runs; client compares to local state. A persistent mismatch surfaces
+// the out-of-sync banner so the session stops silently drifting. A first
+// mismatch also triggers a one-shot recovery request (SYNC_REQUEST → the host
+// resends the current state) so transient missed events can self-heal.
+let _syncHeartbeatAccum = 0;        // host-side send cadence
+let _syncMismatchCount = 0;         // consecutive mismatched heartbeats
+let _syncMismatchReason = '';       // short human label for the banner
+let _syncWarningVisible = false;    // banner gate — flips true after N mismatches
+let _syncRecoveryRequestedAt = 0;   // throttle SYNC_REQUEST (ms epoch)
 // Pre-run disconnect popup (charSelect / lobby): blocks until the player
 // acknowledges, then returns to intro. Separate from the in-run banner so
 // players actually notice they're alone before committing to a solo run.
@@ -2343,6 +2455,11 @@ function startNewRun(explicitSeed) {
   // new run if the previous run ended with a disconnect.
   _remoteDisconnected = false;
   _remoteDisconnectTimer = 0;
+  _syncHeartbeatAccum = 0;
+  _syncMismatchCount = 0;
+  _syncMismatchReason = '';
+  _syncWarningVisible = false;
+  _syncRecoveryRequestedAt = 0;
   _hsDisconnectPopup = false;
   _hsDisconnectReason = '';
   _hsDisconnectBoxes.length = 0;
@@ -2992,7 +3109,9 @@ function handleEvent(choiceIdx) {
         // NOTE: uses Math.random here instead of the seeded RNG because
         // only the picker rolls; consuming seeded RNG would desync the
         // peer's stream (they never roll this value on their side).
-        if (Math.random() < 0.5) { player.heal(2); }
+        // Payout tuned so gamble isn't strictly dominated by rest (+2):
+        // peak heal is 2× rest, the floor is a shallow -1.
+        if (Math.random() < 0.5) { player.heal(4); }
         else { player.hp = Math.max(1, player.hp - 1); }
         break;
     }
@@ -3242,6 +3361,25 @@ function update(logicDt, realDt) {
       }
       net.sendReliable('evt', { type: 'PING', t: nowMs });
     }
+    // Sync heartbeat — host broadcasts authoritative run state so each client
+    // can tell whether it has silently fallen behind (missed a ROOM_CLEARED,
+    // MAP_NODE_CHOSEN, or similar transition event). Runs during in-run
+    // states only, where gameState transitions matter.
+    if (!_prerun) {
+      _syncHeartbeatAccum += realDt;
+      if (_syncHeartbeatAccum >= 3.0) {
+        _syncHeartbeatAccum = 0;
+        net.sendReliable('evt', {
+          type: 'SYNC_HEARTBEAT',
+          state: gameState,
+          floor: runManager.floor | 0,
+          roomsCleared: roomsCleared | 0,
+          enemiesAlive: gameState === 'playing' ? enemies.reduce((a, e) => a + (e && e.alive ? 1 : 0), 0) : 0,
+        });
+      }
+    } else {
+      _syncHeartbeatAccum = 0;
+    }
     // Watchdog: check every ~500ms for peers that have gone silent. This
     // is the backstop for all the ways a peer can disappear without the
     // WebRTC stack ever telling us: tab crash, sleeping laptop, process
@@ -3395,6 +3533,31 @@ function update(logicDt, realDt) {
 
   // ── INTRO ──
   if (gameState === 'intro') {
+    // Disconnect modal blocks all intro input so a user bounced here from a
+    // remote-play drop explicitly acknowledges the notice before picking a
+    // mode. The catch-all at the end of the render pipeline draws the popup.
+    if (_hsDisconnectPopup) {
+      if (_hsDisconnectAutoCloseAt > 0 && performance.now() >= _hsDisconnectAutoCloseAt) {
+        _dismissHsDisconnect();
+        input.clearFrame();
+        return;
+      }
+      const click = input.consumeClick();
+      const keyOk = input.consumeKey('enter') || input.consumeKey('escape') || input.consumeKey(' ');
+      if (click) {
+        for (const b of _hsDisconnectBoxes) {
+          if (input.mouse.x >= b.x && input.mouse.x <= b.x + b.w &&
+              input.mouse.y >= b.y && input.mouse.y <= b.y + b.h) {
+            _dismissHsDisconnect();
+            break;
+          }
+        }
+      } else if (keyOk) {
+        _dismissHsDisconnect();
+      }
+      input.clearFrame();
+      return;
+    }
     // D-pad focus nudge (gamepad menu nav). Must run before consumeClick so
     // the user can tap D-pad to move onto a button, then A to click.
     if (_gpHandleMenuNav(introBoxes)) { input.clearFrame(); return; }
@@ -7157,7 +7320,7 @@ function render() {
 
   // ── EVENT ──
   if (gameState === 'event') {
-    ui.drawEventScreen(renderer.ctx, currentEventType);
+    ui.drawEventScreen(renderer.ctx, currentEventType, player);
     return;
   }
 
@@ -7450,7 +7613,7 @@ function render() {
 
   if (gameState === 'playing' || gameState === 'paused') {
     ui.selectedCardSlot = selectedCardSlot;
-    ui.selectedCardSlotP2 = (players.count > 1) ? selectedCardSlotP2 : null;
+    ui.selectedCardSlotP2 = (players.count > 1 && localCoop) ? selectedCardSlotP2 : null;
     ui.battleMode = true;
     // Flag whether any enemy overlaps the card zone or tempo bar zone so they can fade
     const _cardZoneY = canvas.height - 192 - 22;
@@ -7768,6 +7931,32 @@ function render() {
     ctx.fillStyle = '#ffd0bb';
     ctx.font = 'bold 14px monospace';
     ctx.fillText('Session is over. Continuing solo — return to lobby to play together again.', canvas.width / 2, bY + 66);
+    ctx.restore();
+  }
+  // Out-of-sync banner: host and client disagree on run state after multiple
+  // heartbeats. Silent desyncs are the worst remote-play bug, so this renders
+  // in every state so the player sees it no matter where the mismatch starts.
+  if (_syncWarningVisible && net.role === 'client' && net.peers.size > 0) {
+    const ctx = renderer.ctx;
+    const t = performance.now() / 1000;
+    const pulse = 0.8 + 0.2 * Math.sin(t * 3.5);
+    ctx.save();
+    const bW = Math.min(680, canvas.width - 40), bH = 72;
+    const bX = canvas.width / 2 - bW / 2, bY = 190;
+    ctx.globalAlpha = 0.94;
+    ctx.shadowColor = '#ffcc33';
+    ctx.shadowBlur = 22 * pulse;
+    ctx.fillStyle = 'rgba(42,32,8,0.94)';
+    ctx.beginPath(); ctx.roundRect(bX, bY, bW, bH, 10); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#ffcc33'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ffe999';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚠  OUT OF SYNC WITH HOST  ⚠', canvas.width / 2, bY + 30);
+    ctx.fillStyle = '#ffeecc';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText(_syncMismatchReason || 'attempting to recover…', canvas.width / 2, bY + 54);
     ctx.restore();
   }
   // RH2 multiplayer: universal "partner is waiting on you" badge for any
