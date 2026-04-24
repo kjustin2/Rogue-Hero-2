@@ -1698,13 +1698,17 @@ export class BossNecromancer extends Enemy {
     this.projectileManager = null;
     this.spawnTimer = 0.8;
 
-    // Register once in constructor — NOT in updateLogic (would leak a new listener every frame)
-    events.on('CRASH_ATTACK', () => {
+    // Register once in constructor — NOT in updateLogic (would leak a new listener every frame).
+    // Stored as a bound handler so updateLogic's death branch can unsubscribe;
+    // otherwise killAll() + room respawn leaks one listener per boss cycle
+    // (the listener closure captures `this`, keeping the dead boss pinned).
+    this._onCrashAttack = () => {
       if (this.alive && this.shieldActive) {
         this.shieldActive = false;
         events.emit('SCREEN_SHAKE', { duration: 0.3, intensity: 0.5 });
       }
-    });
+    };
+    events.on('CRASH_ATTACK', this._onCrashAttack);
   }
 
   takeDamage(amount, tempo, allEnemies) {
@@ -1712,9 +1716,18 @@ export class BossNecromancer extends Enemy {
     return super.takeDamage(amount);
   }
 
+  // Called by main.js when the boss dies, and by spawnEnemies() when the
+  // enemy array is discarded while still containing this boss. Idempotent.
+  cleanup() {
+    if (this._onCrashAttack) {
+      events.off('CRASH_ATTACK', this._onCrashAttack);
+      this._onCrashAttack = null;
+    }
+  }
+
   updateLogic(dt, player, tempo, roomMap, allEnemies, projMgr) {
     this.projectileManager = projMgr;
-    if (!this.alive) return;
+    if (!this.alive) { this.cleanup(); return; }
     if (this.updateSpawn(dt)) return;
     this.hitFlash = Math.max(0, this.hitFlash - dt);
     this._angle += dt * 1.2;
@@ -2846,11 +2859,16 @@ export class BossArchivist extends Enemy {
     events.on('CARD_PLAYED', this._onCardPlayed);
   }
 
-  updateLogic(dt, player, tempo, roomMap, allEnemies, projMgr) {
-    if (!this.alive) {
+  // Called by main.js on death and on enemy-array sweep. Idempotent.
+  cleanup() {
+    if (this._onCardPlayed) {
       events.off('CARD_PLAYED', this._onCardPlayed);
-      return;
+      this._onCardPlayed = null;
     }
+  }
+
+  updateLogic(dt, player, tempo, roomMap, allEnemies, projMgr) {
+    if (!this.alive) { this.cleanup(); return; }
     if (this.updateSpawn(dt)) return;
     this.hitFlash = Math.max(0, this.hitFlash - dt);
     this._angle += dt * 1.1;

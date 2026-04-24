@@ -5,7 +5,7 @@
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node mp-smoke.mjs && node mp-disconnect-test.mjs && node mp-4player-test.mjs",
+    "test": "node mp-smoke.mjs && node mp-disconnect-test.mjs && node mp-4player-test.mjs && node mp-desync-test.mjs",
     "test:mp4": "node mp-4player-test.mjs",
     "test:smoke": "playwright test -c tests/playwright.config.js",
     "test:smoke:headed": "playwright test -c tests/playwright.config.js --headed",

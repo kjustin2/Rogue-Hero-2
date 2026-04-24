@@ -47,8 +47,11 @@ export class Player extends Entity {
     this.hitFlash = Math.max(0, this.hitFlash - dt);
     this.attackCooldown = Math.max(0, this.attackCooldown - dt);
     this.dodgeCooldown = Math.max(0, this.dodgeCooldown - dt);
-    // BUG-01: oathComboWindow holds the combo timer while Berserker's Oath stacks remain
-    if (!this.oathComboWindow) this.comboTimer -= dt;
+    // BUG-01: oathComboWindow holds the combo timer while Berserker's Oath stacks remain.
+    // Clamp the decrement at 0 so post-reset frames don't drive the timer
+    // negative (previously visible as "comboTimer = -0.06" after a room
+    // transition, breaking `comboTimer === 0` post-reset invariants).
+    if (!this.oathComboWindow) this.comboTimer = Math.max(0, this.comboTimer - dt);
     if (this.comboTimer <= 0) this.comboCount = 0;
 
     // AP regen (Corruptor aura reduces by 60%)

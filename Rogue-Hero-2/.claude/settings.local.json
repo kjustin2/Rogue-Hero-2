@@ -37,7 +37,11 @@
       "Bash(python3:*)",
       "Bash(npm install *)",
       "Bash(npx playwright *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(node mp-desync-test.mjs)",
+      "Bash(node mp-smoke.mjs)",
+      "Bash(node mp-disconnect-test.mjs)",
+      "Bash(node mp-4player-test.mjs)"
     ]
   },
   "prefersReducedMotion": true

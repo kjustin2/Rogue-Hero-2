@@ -20,12 +20,30 @@ export class RunManager {
   // combat path never consumes, and the next-floor generateMap() drifts.
   _createRng(seed) {
     this._rngState = seed | 0;
+    const self = this;
     return () => {
-      this._rngState = (this._rngState + 0x6D2B79F5) | 0;
-      let v = this._rngState;
+      self._rngState = (self._rngState + 0x6D2B79F5) | 0;
+      let v = self._rngState;
       v = Math.imul(v ^ (v >>> 15), v | 1);
       v ^= v + Math.imul(v ^ (v >>> 7), v | 61);
-      return ((v ^ (v >>> 14)) >>> 0) / 4294967296;
+      const out = ((v ^ (v >>> 14)) >>> 0) / 4294967296;
+      // Dev RNG trace (opt-in, set by _dev.rngTraceStart()). Guarded on a
+      // single boolean — zero-cost when disabled. Records post-state so a
+      // diff between two peers pinpoints the exact offending consumer.
+      if (self._rngTraceOn && self._rngTrace) {
+        let caller = '';
+        try {
+          const stack = (new Error()).stack;
+          if (stack) {
+            // Skip this arrow + the Error.stack line; grab the next frame.
+            const lines = stack.split('\n');
+            // Chromium: first line is "Error"; frame 2 is the caller.
+            caller = (lines[2] || lines[1] || '').trim();
+          }
+        } catch {}
+        self._rngTrace.push({ v: out, s: self._rngState | 0, c: caller });
+      }
+      return out;
     };
   }
 

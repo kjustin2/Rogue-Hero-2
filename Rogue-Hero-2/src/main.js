@@ -140,6 +140,7 @@ const tempo = new TempoSystem();
 const particles = new ParticleSystem();
 const audio = new AudioSynthesizer();
 const projectiles = new ProjectileManager();
+window._projectiles = projectiles; // exposed for _dev.projectileCount()
 const combat = new CombatManager(tempo, particles, audio, projectiles);
 const room = new RoomManager(canvas.width, canvas.height);
 const deckManager = new DeckManager();
@@ -168,6 +169,8 @@ const net = new Net({ role: 'solo' });
 // without importing main.js and creating a cycle.
 window._net = net;
 const lobby = new Lobby(net);
+window._lobby = lobby;            // exposed for _dev.mpHost/mpJoin bypass helpers
+window._eventBus = events;        // exposed for _dev.eventListenerCounts leak detection
 const hostSim = new HostSim(net);
 const snapDecoder = new SnapshotDecoder();
 const reconcile = new Reconcile();
@@ -460,7 +463,12 @@ net.on('evt', (msg, senderPeerId) => {
 
   } else if (type === 'ROOM_CLEARED') {
     if (net.role !== 'client') return;
-    // Force-clear any remaining local enemies and mirror host's state transition
+    // Force-clear any remaining local enemies and mirror host's state transition.
+    // cleanup() unsubscribes any listeners bosses registered in their constructor
+    // (see spawnEnemies() for the matching sweep).
+    for (const e of enemies) {
+      if (e && typeof e.cleanup === 'function') { try { e.cleanup(); } catch {} }
+    }
     enemies = [];
     roomsCleared++;
     audio.silenceMusic();
@@ -557,7 +565,11 @@ net.on('evt', (msg, senderPeerId) => {
     // Mark the remote placeholder as downed so local revive logic + UI work.
     // Route to the sender's slot so 3–4 player games mark the RIGHT ally.
     const rp = _remotePlayerFor(senderPeerId);
-    if (rp) {
+    // Idempotency guard: a duplicate/retry PLAYER_DOWNED on an already-
+    // downed placeholder used to reset reviveProgress to 0 mid-revive,
+    // silently stalling the ally attempting the pickup. Skip if already
+    // downed or dead so state in flight stays intact.
+    if (rp && !rp.downed && rp.alive) {
       rp.downed = true;
       rp.hp = 0;
       rp.reviveProgress = 0;
@@ -583,11 +595,14 @@ net.on('evt', (msg, senderPeerId) => {
 
   } else if (type === 'PLAYER_REVIVED') {
     const rp = _remotePlayerFor(senderPeerId);
-    if (rp) {
-      rp.downed = false;
-      rp.reviveProgress = 0;
-      rp.hp = Math.max(1, Math.round(rp.maxHp * 0.3));
-    }
+    // Guard against stray/duplicate revive messages — without this, a
+    // PLAYER_REVIVED that arrives after the remote has already been re-
+    // synced via another path (e.g. full state resync, late out-of-order
+    // delivery) would slam the living player's HP back down to 30% of max.
+    if (!rp || !rp.downed) return;
+    rp.downed = false;
+    rp.reviveProgress = 0;
+    rp.hp = Math.max(1, Math.round(rp.maxHp * 0.3));
 
   } else if (type === 'MAP_VOTE') {
     // Peer voted on a map node. Track per-peer so 3–4P doesn't short-circuit
@@ -1080,6 +1095,12 @@ net.on('evt', (msg, senderPeerId) => {
     const payload = { ...(p || msg) };
     delete payload.type; delete payload.name;
     payload._netOrigin = 'remote';
+    // Thread the sender's peer id so orb/trap/etc handlers can bind the
+    // spawn's owner to the RIGHT placeholder in 3–4P. Before this tag
+    // the local SPAWN_ORBS handler just grabbed `players.list.find(_isRemote)`
+    // and picked whichever remote was listed first, visually attaching
+    // every ally's orbs to the same one.
+    payload._netSender = senderPeerId;
     events.emit(type, payload);
 
   } else if (type === 'NET_PROJECTILE_SPAWN') {
@@ -2205,6 +2226,10 @@ let echoes = [];
 let sigils = [];
 let groundWaves = [];
 let beamFlashes = [];
+// Exposed for DevConsole/test introspection. These arrays are mutated in
+// place (traps.length = 0, not traps = []) so the reference stays valid
+// across room transitions — safe to hold here.
+window._world = { traps, orbs, echoes, sigils, groundWaves, beamFlashes, killEffects };
 let channelState = null;
 let _lastCardPlayed = null; // for aftershock echo
 
@@ -2508,10 +2533,15 @@ events.on('SPAWN_TRAP', (data) => {
 events.on('SPAWN_ORBS', (data) => {
   const { count, radius, damage, life, speed, color, freeze, spiral } = data;
   const _netRemote = data._netOrigin === 'remote';
-  // Remote-origin orbs must orbit the remote player, not our local one.
+  // Remote-origin orbs must orbit the peer who cast them — in 3–4P the
+  // "first _isRemote" shortcut bound every ally's orbs to the same
+  // placeholder. The net demux threads `_netSender` (the sender peer id)
+  // so we can resolve the correct placeholder via _remotePlayerFor().
   let _ownerRef = null;
   if (_netRemote && players && players.list) {
-    _ownerRef = players.list.find(pl => pl && pl._isRemote) || null;
+    _ownerRef = _remotePlayerFor(data._netSender)
+      || players.list.find(pl => pl && pl._isRemote)
+      || null;
   }
   for (let i = 0; i < count; i++) {
     orbs.push({
@@ -2859,6 +2889,16 @@ function startNewRun(explicitSeed) {
 }
 
 function spawnEnemies(node) {
+  // Fire any per-enemy cleanup before discarding the array. Bosses that
+  // register EventBus listeners in their constructor (BossNecromancer's
+  // CRASH_ATTACK, BossArchivist's CARD_PLAYED) rely on cleanup() to
+  // unsubscribe. Without this, an abandoned boss (e.g. room swept while
+  // still alive) leaks one listener per encounter.
+  for (const e of enemies) {
+    if (e && typeof e.cleanup === 'function') {
+      try { e.cleanup(); } catch {}
+    }
+  }
   enemies = [];
   const f = runManager.floor;
   // IDs are assigned at the END of this function (after all enemies are pushed)
@@ -4913,12 +4953,20 @@ function update(logicDt, realDt) {
     }
   }
 
-  // Vanguard Guard stack decay
+  // Vanguard Guard stack decay. Only tick the timer while stacks exist —
+  // previously this incremented every frame regardless, so after a room
+  // transition (stacks reset to 0) the timer grew unboundedly. Harmless in
+  // gameplay but confused leak-detection tests and would eventually hit
+  // float precision after extreme runtimes.
   if (Characters[selectedCharId]?.passives?.ironGuard) {
     if (player.guardStacks === undefined) player.guardStacks = 0;
-    player._guardDecayTimer = (player._guardDecayTimer || 0) + logicDt;
-    if (player._guardDecayTimer >= 3.0 && player.guardStacks > 0) {
-      player.guardStacks--;
+    if (player.guardStacks > 0) {
+      player._guardDecayTimer = (player._guardDecayTimer || 0) + logicDt;
+      if (player._guardDecayTimer >= 3.0) {
+        player.guardStacks--;
+        player._guardDecayTimer = 0;
+      }
+    } else if (player._guardDecayTimer) {
       player._guardDecayTimer = 0;
     }
   }
@@ -9573,7 +9621,7 @@ initDevConsole({
   startNewRun,
   spawnEnemies,
   handleCombatClear,
-  tempo, deckManager, itemManager, runManager, input,
+  tempo, deckManager, itemManager, runManager, input, combat,
 });
 
 console.log('[Init] Game ready, starting engine.');

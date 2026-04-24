@@ -24,6 +24,13 @@ export class Players {
     // host-assigned indices, not just insertion order). Only fill in a new
     // index when the caller didn't specify one.
     if (typeof player.playerIndex !== 'number') player.playerIndex = this.list.length;
+    // Stable id for snapshot reconciliation + state-hash. In local 2P the
+    // HostSim never ticks (no peers), so if we don't assign here, P2 ends
+    // up with id=undefined which silently breaks anything that reads
+    // player.id directly (snapshot idToByte returns 0, stateHash groups
+    // undefined players under one slot, etc). Only fill if the caller
+    // didn't set it.
+    if (!player.id) player.id = 'p' + player.playerIndex;
     player.haloColor   = opts.haloColor || player.haloColor ||
                          PLAYER_HALO_COLORS[player.playerIndex % PLAYER_HALO_COLORS.length];
     player.netRole     = opts.netRole || player.netRole || 'local';
