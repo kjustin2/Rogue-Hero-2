@@ -1130,7 +1130,10 @@ export class Phantom extends Enemy {
 
     const dx = player.x - this.x, dy = player.y - this.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const spd = 230 * this.spdMult();
+    // Tuning: Phantom chase 230 → 195. Was outpacing every base-speed
+    // character so kiting was impossible; small nerf restores counterplay
+    // without breaking the "fast harasser" identity.
+    const spd = 195 * this.spdMult();
 
     if (this.state === 'idle' && dist < 750 && !player._phantomInkActive) this.state = 'chase';
 
@@ -1148,15 +1151,16 @@ export class Phantom extends Enemy {
       this.telegraphTimer -= dt;
       if (this.telegraphTimer <= 0) {
         if (dist <= 65) events.emit('ENEMY_MELEE_HIT', { damage: 1, source: this });
-        this.attackCooldown = 0.7;
+        this.attackCooldown = 0.8;
         this.state = 'chase';
       }
     }
 
-    // Blink
+    // Blink — slowed slightly so the player has more room to react between
+    // teleports (was 0.7–1.2s, now 0.85–1.4s).
     this.blinkTimer -= dt;
     if (this.blinkTimer <= 0) {
-      this.blinkTimer = 0.7 + Math.random() * 0.5;
+      this.blinkTimer = 0.85 + Math.random() * 0.55;
       this.invulnTimer = 0.2;
       const angle = Math.atan2(dy, dx) + (Math.random() - 0.5) * 1.2;
       const bDist = 80 + Math.random() * 80;
@@ -1567,7 +1571,9 @@ export class BossConductor extends Enemy {
 // ── ECHO BOSS (Floor 3 — Final) ────────────────────────────────
 export class BossEcho extends Enemy {
   constructor(x, y) {
-    super(x, y, 38, 700, 'boss_echo');
+    // F3 boss — bumped from 700 → 950 HP. Floor 3 was clearing too quickly;
+    // Echo is a midpoint boss and should outlast a couple of well-timed dumps.
+    super(x, y, 38, 950, 'boss_echo');
     this.fireTimer = 2.2;
     this.phase = 1;
     this.bossTempoVal = 0;
@@ -1599,36 +1605,40 @@ export class BossEcho extends Enemy {
 
     const dx = player.x - this.x, dy = player.y - this.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const spd = (this.phase >= 2 ? 110 : 75) * (0.7 + (tempo.value / 100) * 0.8) * this.spdMult();
+    // Echo (F3) chase. Earlier passes were 75/110, then 90/130; this pass
+    // makes it actually chase. 170/220 puts P1 above base player walk
+    // speed and P2+ near a dodge sprint, so retreat windows shrink without
+    // becoming unreactable (tempo modulator still gates it 0.7×–1.5×).
+    const spd = (this.phase >= 2 ? 220 : 170) * (0.7 + (tempo.value / 100) * 0.8) * this.spdMult();
 
     if (dist > this.r + player.r + 8) {
       this.x += (dx / dist) * spd * dt;
       this.y += (dy / dist) * spd * dt;
     } else if (this.attackCooldown <= 0) {
-      this.attackCooldown = 1.0;
-      events.emit('ENEMY_MELEE_HIT', { damage: 1, source: this });
+      this.attackCooldown = 0.7;
+      events.emit('ENEMY_MELEE_HIT', { damage: 2, source: this });
     }
 
-    const fireRate = this.phase >= 3 ? 1.1 : (this.phase === 2 ? 1.5 : 2.0);
+    const fireRate = this.phase >= 3 ? 0.9 : (this.phase === 2 ? 1.25 : 1.7);
     this.fireTimer -= dt;
     if (this.fireTimer <= 0) {
       this.fireTimer = fireRate;
       if (this.projectileManager) {
-        const shots = this.phase >= 3 ? 4 : (this.phase === 2 ? 3 : 2);
-        this.projectileManager.spawnSpread(this.x, this.y, player.x, player.y, shots, 0.32, 240, 1, '#cc44cc', 'echo');
+        const shots = this.phase >= 3 ? 5 : (this.phase === 2 ? 4 : 3);
+        this.projectileManager.spawnSpread(this.x, this.y, player.x, player.y, shots, 0.32, 270, 1, '#cc44cc', 'echo');
       }
     }
 
     // Boss Tempo bar (phase 2+)
     if (this.phase >= 2) {
-      const riseRate = this.phase >= 3 ? 35 : 20;
+      const riseRate = this.phase >= 3 ? 42 : 26;
       this.bossTempoVal += riseRate * dt;
       if (this.bossTempoVal >= 100) {
         this.bossTempoVal = 45;
         const cr = 90;
         const pdx = player.x - this.x, pdy = player.y - this.y;
         if (pdx * pdx + pdy * pdy < (cr + player.r) * (cr + player.r)) {
-          events.emit('ENEMY_MELEE_HIT', { damage: 1, source: this });
+          events.emit('ENEMY_MELEE_HIT', { damage: 2, source: this });
         }
         events.emit('SCREEN_SHAKE', { duration: 0.2, intensity: 0.4 });
         events.emit('PLAY_SOUND', 'crash');
@@ -1846,11 +1856,11 @@ export class BossApex extends Enemy {
   constructor(x, y) {
     super(x, y, 42, 1000, 'boss_apex');
     this.phase = 1;
-    this.fireTimer = 2.0;
+    this.fireTimer = 1.2;
     this.crashTimer = 8.0;
     this.summonTimer = 20.0;
     this._angle = 0;
-    this.dashTimer = 3.0;
+    this.dashTimer = 1.5;
     this.dashActive = false;
     this.dashDirX = 0;
     this.dashDirY = 0;
@@ -1885,11 +1895,12 @@ export class BossApex extends Enemy {
     const dx = player.x - this.x, dy = player.y - this.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
 
-    // Phase 1: Melee Rush
+    // Phase 1: Melee Rush — aggressive chase speed + faster dash cadence so
+    // Apex actually closes on the player instead of being kited.
     if (this.phase === 1) {
       this.dashTimer -= dt;
       if (this.dashTimer <= 0 && !this.dashActive && dist > 1) {
-        this.dashTimer = 3.5;
+        this.dashTimer = 2.2;
         this.dashDirX = dx / dist;
         this.dashDirY = dy / dist;
         this.dashActive = true;
@@ -1897,15 +1908,15 @@ export class BossApex extends Enemy {
       }
       if (this.dashActive) {
         this.dashDur -= dt;
-        this.x += this.dashDirX * 550 * dt;
-        this.y += this.dashDirY * 550 * dt;
+        this.x += this.dashDirX * 700 * dt;
+        this.y += this.dashDirY * 700 * dt;
         if (this.dashDur <= 0) this.dashActive = false;
         if (dist < this.r + player.r + 6 && this.attackCooldownTimer <= 0) {
           this.attackCooldownTimer = 0.6;
           events.emit('ENEMY_MELEE_HIT', { damage: 3, source: this });
         }
       } else {
-        const spd = 120 * this.spdMult();
+        const spd = 175 * this.spdMult();
         if (dist > this.r + player.r) {
           this.x += (dx / dist) * spd * dt;
           this.y += (dy / dist) * spd * dt;
@@ -1916,9 +1927,9 @@ export class BossApex extends Enemy {
       }
     }
 
-    // Phase 2: Projectile Storm
+    // Phase 2: Projectile Storm — faster strafing + tighter fire cadence.
     if (this.phase === 2) {
-      const spd = 80 * this.spdMult();
+      const spd = 130 * this.spdMult();
       if (dist < 220) {
         this.x -= (dx / dist) * spd * dt;
         this.y -= (dy / dist) * spd * dt;
@@ -1928,16 +1939,16 @@ export class BossApex extends Enemy {
       }
       this.fireTimer -= dt;
       if (this.fireTimer <= 0) {
-        this.fireTimer = 1.2;
+        this.fireTimer = 0.7;
         if (this.projectileManager) {
           this.projectileManager.spawnSpread(this.x, this.y, player.x, player.y, 6, 0.5, 260, 2, '#ff4400', 'apex');
         }
       }
     }
 
-    // Phase 3: All attacks + summons
+    // Phase 3: All attacks + summons — faster chase + faster ring volleys.
     if (this.phase === 3) {
-      const spd = 100 * this.spdMult();
+      const spd = 165 * this.spdMult();
       if (dist > this.r + player.r) {
         this.x += (dx / dist) * spd * dt;
         this.y += (dy / dist) * spd * dt;
@@ -1947,7 +1958,7 @@ export class BossApex extends Enemy {
       }
       this.fireTimer -= dt;
       if (this.fireTimer <= 0) {
-        this.fireTimer = 1.8;
+        this.fireTimer = 1.0;
         if (this.projectileManager) {
           for (let i = 0; i < 8; i++) {
             const angle = (i / 8) * Math.PI * 2 + this._angle;
@@ -2187,7 +2198,10 @@ export class Stalker extends Enemy {
 
     if (this.state === 'chase') {
       this.isVisible = false;
-      const spd = 155 * this.spdMult();
+      // Tuning: Stalker circle 155 → 130 and sprint 300 → 260. Sprint was
+      // unreactable when combined with the invisibility cloak; now the
+      // telegraph is meaningful before the lunge.
+      const spd = 130 * this.spdMult();
       this.circleAngle += dt * 0.8;
       const targetX = player.x + Math.cos(this.circleAngle) * 250;
       const targetY = player.y + Math.sin(this.circleAngle) * 250;
@@ -2210,7 +2224,7 @@ export class Stalker extends Enemy {
         // Sprint at player
         const sdx = player.x - this.x, sdy = player.y - this.y;
         const sdist = Math.sqrt(sdx*sdx+sdy*sdy) || 1;
-        const sprintSpd = 300;
+        const sprintSpd = 260;
         const sprintTime = 0.6;
         // Teleport toward player quickly
         const travelDist = Math.min(sdist, sprintSpd * sprintTime);
@@ -2220,7 +2234,7 @@ export class Stalker extends Enemy {
         if (Math.sqrt(newDx*newDx+newDy*newDy) < this.r + 20) {
           events.emit('ENEMY_MELEE_HIT', { damage: 3, source: this });
         }
-        this.attackCooldown = 1.4;
+        this.attackCooldown = 1.5;
         this.state = 'chase';
         this.isVisible = false;
       }
@@ -2845,27 +2859,42 @@ export class Sentinel extends Enemy {
 // Copies the last card the player played and mirrors its attack pattern.
 export class BossArchivist extends Enemy {
   constructor(x, y) {
-    super(x, y, 34, 800, 'boss_archivist');
+    // F-end boss — bumped 800 → 1100 HP and tightened cadence. Also loud-
+    // ened the "I just copied your card" tell; previously the only signal
+    // was a small text label which players missed.
+    super(x, y, 34, 1100, 'boss_archivist');
     this.phase = 1;
     this._angle = 0;
-    this._attackTimer = 2.5;
+    this._attackTimer = 2.0;
     this._telegraphing = false;
     this._telegraphTimer = 0;
-    this._telegraphDuration = 1.6;
+    this._telegraphDuration = 1.3;
     this._attackCooldown = 0;
     this._copiedColor = '#aa88ff';
     this._copiedName = '???';
     this._copiedType = null;
+    // Brief flash + floating-text timer when a card is copied. Drives the
+    // unmistakable "STOLEN!" pop and a colour-pulse around the boss so the
+    // player can see exactly when their input was being mirrored.
+    this._copyFlashTimer = 0;
 
     this._onCardPlayed = ({ cardType, cardColor, cardName }) => {
       this._copiedColor = cardColor || '#aa88ff';
       this._copiedName = cardName || '???';
       this._copiedType = cardType || null;
+      // 0.6 s pulse + a floating "STOLEN!" damage-number-style text so the
+      // copy event is impossible to miss. Particles spawned in main via the
+      // ENEMY_COPIED_CARD event so we don't import particles into Enemy.js.
+      this._copyFlashTimer = 0.6;
+      events.emit('ENEMY_COPIED_CARD', { x: this.x, y: this.y - this.r - 24, name: cardName || '???', color: this._copiedColor });
+      events.emit('PLAY_SOUND', 'sigil');
     };
     events.on('CARD_PLAYED', this._onCardPlayed);
   }
 
-  // Called by main.js on death and on enemy-array sweep. Idempotent.
+  // Called by main.js on death and on enemy-array sweep. Idempotent — the
+  // duplicate-cleanup() bug that lived here before would clobber the
+  // null-out guard and re-fire events.off twice.
   cleanup() {
     if (this._onCardPlayed) {
       events.off('CARD_PLAYED', this._onCardPlayed);
@@ -2877,6 +2906,7 @@ export class BossArchivist extends Enemy {
     if (!this.alive) { this.cleanup(); return; }
     if (this.updateSpawn(dt)) return;
     this.hitFlash = Math.max(0, this.hitFlash - dt);
+    this._copyFlashTimer = Math.max(0, this._copyFlashTimer - dt);
     this._angle += dt * 1.1;
     if (this.staggerTimer > 0) { this.staggerTimer -= dt; return; }
 
@@ -2884,13 +2914,13 @@ export class BossArchivist extends Enemy {
       this.phase = 2;
       events.emit('SCREEN_SHAKE', { duration: 0.4, intensity: 0.6 });
       events.emit('PLAY_SOUND', 'crash');
-      events.emit('PHASE_TRANSITION', { phase: 2 }); // IDEA-04
+      events.emit('PHASE_TRANSITION', { phase: 2 });
     }
     if (this.phase === 2 && this.hp <= this.maxHp * 0.25) {
       this.phase = 3;
       events.emit('SCREEN_SHAKE', { duration: 0.5, intensity: 0.9 });
       events.emit('PLAY_SOUND', 'crash');
-      events.emit('PHASE_TRANSITION', { phase: 3 }); // IDEA-04
+      events.emit('PHASE_TRANSITION', { phase: 3 });
     }
 
     const dx = player.x - this.x, dy = player.y - this.y;
@@ -2901,14 +2931,15 @@ export class BossArchivist extends Enemy {
       if (this._telegraphTimer <= 0) {
         this._telegraphing = false;
         this._doAttack(player, projMgr, dist, dx, dy);
-        this._attackTimer = 2.2 - this.phase * 0.25;
+        // Faster cadence per phase: 1.7 / 1.45 / 1.2.
+        this._attackTimer = 1.95 - this.phase * 0.25;
       }
       return;
     }
 
     // Orbit around player
     const targetDist = 200 + this.phase * 20;
-    const spd = (85 + this.phase * 18) * this.spdMult();
+    const spd = (95 + this.phase * 22) * this.spdMult();
     if (dist > targetDist + 30) {
       this.x += (dx / dist) * spd * dt;
       this.y += (dy / dist) * spd * dt;
@@ -2917,8 +2948,8 @@ export class BossArchivist extends Enemy {
       this.y -= (dy / dist) * spd * dt;
     } else {
       const perp = { x: -dy / dist, y: dx / dist };
-      this.x += perp.x * spd * 0.55 * dt;
-      this.y += perp.y * spd * 0.55 * dt;
+      this.x += perp.x * spd * 0.6 * dt;
+      this.y += perp.y * spd * 0.6 * dt;
     }
 
     this._attackTimer -= dt;
@@ -2930,53 +2961,97 @@ export class BossArchivist extends Enemy {
     if (roomMap) { const c = roomMap.clamp(this.x, this.y, this.r); this.x = c.x; this.y = c.y; }
   }
 
-  // BUG-07: cleanup listener so bleed-kill doesn't leave a stale event subscription
-  cleanup() {
-    events.off('CARD_PLAYED', this._onCardPlayed);
-  }
-
   _doAttack(player, projMgr, dist, dx, dy) {
     if (!projMgr) return;
-    const count = this.phase === 3 ? 7 : (this.phase === 2 ? 5 : 3);
+    // Bumped projectile counts and damage. Pre-buff Archivist fired 3/5/7
+    // shots at 2 damage each — soft for an end-act boss. Now 4/6/8 at 3
+    // damage scaling with phase so a copied [BEAM] / [PROJECTILE] cast
+    // actually pressures.
+    const count = this.phase === 3 ? 8 : (this.phase === 2 ? 6 : 4);
+    const projDmg = 2 + this.phase;          // 3 / 4 / 5
+    const projSpeed = 260 + this.phase * 12; // 272 / 284 / 296
     const rangedTypes = new Set(['shot', 'projectile', 'beam', 'ground', 'orbit', 'trap', 'echo', 'sigil']);
     if (this._copiedType && rangedTypes.has(this._copiedType)) {
-      // Radial burst
-      for (let i = 0; i < count + 2; i++) {
-        const angle = (i / (count + 2)) * Math.PI * 2 + this._angle;
-        projMgr.spawn(this.x, this.y, Math.cos(angle), Math.sin(angle), 250, 2, this._copiedColor, 'archivist');
+      // Radial burst — denser ring matches the "boss is mirroring you" feel.
+      const radialCount = count + 3;
+      for (let i = 0; i < radialCount; i++) {
+        const angle = (i / radialCount) * Math.PI * 2 + this._angle;
+        projMgr.spawn(this.x, this.y, Math.cos(angle), Math.sin(angle), projSpeed, projDmg, this._copiedColor, 'archivist');
+      }
+      // Phase 3 follow-up: a second offset ring for crossfire patterns.
+      if (this.phase === 3) {
+        const offset = Math.PI / radialCount;
+        for (let i = 0; i < radialCount; i++) {
+          const angle = (i / radialCount) * Math.PI * 2 + this._angle + offset;
+          projMgr.spawn(this.x, this.y, Math.cos(angle), Math.sin(angle), projSpeed * 0.8, projDmg, this._copiedColor, 'archivist');
+        }
       }
     } else {
-      // Aimed spread toward player
+      // Aimed spread toward player.
       const baseAngle = Math.atan2(player.y - this.y, player.x - this.x);
       for (let i = 0; i < count; i++) {
-        const angle = baseAngle + (i - (count - 1) / 2) * 0.38;
-        projMgr.spawn(this.x, this.y, Math.cos(angle), Math.sin(angle), 240, 2, this._copiedColor, 'archivist');
+        const angle = baseAngle + (i - (count - 1) / 2) * 0.34;
+        projMgr.spawn(this.x, this.y, Math.cos(angle), Math.sin(angle), projSpeed, projDmg, this._copiedColor, 'archivist');
       }
       if (dist < this.r + 70) {
-        events.emit('ENEMY_MELEE_HIT', { damage: 3 + this.phase, source: this });
+        events.emit('ENEMY_MELEE_HIT', { damage: 4 + this.phase, source: this });
       }
     }
+    events.emit('PLAY_SOUND', 'hit');
+    events.emit('SCREEN_SHAKE', { duration: 0.18, intensity: 0.3 });
   }
 
   drawTelegraph(ctx, now) {
     if (!this._telegraphing) return;
     const pct = 1 - (this._telegraphTimer / this._telegraphDuration);
     ctx.beginPath();
-    ctx.arc(this.x, this.y, this.r + 15 + pct * 10, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(170,100,255,${0.2 + pct * 0.5})`;
-    ctx.lineWidth = 2 + pct * 2;
+    ctx.arc(this.x, this.y, this.r + 15 + pct * 14, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(170,100,255,${0.2 + pct * 0.55})`;
+    ctx.lineWidth = 2 + pct * 3;
     ctx.stroke();
+    // Inner pulse uses the copied card's colour so the player sees what is
+    // about to be replayed at them. Strobes faster as the cast nears.
     if (this._copiedType) {
+      const strobe = (Math.sin(now * (10 + pct * 30)) + 1) * 0.5;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.r + 6, 0, Math.PI * 2);
+      ctx.strokeStyle = this._copiedColor;
+      ctx.globalAlpha = 0.4 + strobe * 0.5;
+      ctx.lineWidth = 4;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
       ctx.fillStyle = this._copiedColor;
-      ctx.font = 'bold 10px monospace';
+      ctx.font = 'bold 11px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(`COPYING: ${this._copiedName}`, this.x, this.y - this.r - 34);
+      ctx.fillText(`▶ COPYING: ${this._copiedName.toUpperCase()}`, this.x, this.y - this.r - 36);
+      // Hint at the upcoming pattern (radial vs aimed) so the player can
+      // pre-position. Uses the same "ranged → radial burst" rule that the
+      // _doAttack branch uses.
+      const radialTypes = new Set(['shot', 'projectile', 'beam', 'ground', 'orbit', 'trap', 'echo', 'sigil']);
+      const tag = radialTypes.has(this._copiedType) ? 'RADIAL BURST' : 'AIMED SPREAD';
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '9px monospace';
+      ctx.fillText(tag, this.x, this.y - this.r - 22);
     }
   }
 
   draw(ctx, now) {
     if (!this.alive) return;
     const pr = this.r + 12 + Math.sin(this._angle * 2) * 5;
+    // Copy-flash: a thick coloured ring snaps in for 0.6 s every time a new
+    // card is captured. Combined with the floating "STOLEN!" text spawned
+    // by main.js, this is the load-bearing tell for "your last card is now
+    // his". Outer ring kept its idle-orbit visual on top.
+    if (this._copyFlashTimer > 0) {
+      const t = this._copyFlashTimer / 0.6;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, pr + 10 + (1 - t) * 30, 0, Math.PI * 2);
+      ctx.strokeStyle = this._copiedColor;
+      ctx.globalAlpha = t * 0.9;
+      ctx.lineWidth = 6;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
     ctx.beginPath();
     ctx.arc(this.x, this.y, pr, 0, Math.PI * 2);
     ctx.strokeStyle = this._copiedType ? this._copiedColor : `rgba(170,100,255,0.4)`;
@@ -2987,9 +3062,9 @@ export class BossArchivist extends Enemy {
 
     if (this._copiedType) {
       ctx.fillStyle = this._copiedColor;
-      ctx.font = 'bold 9px monospace';
+      ctx.font = 'bold 10px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(`[${this._copiedName}]`, this.x, this.y + 5);
+      ctx.fillText(`▣ STOLEN: ${this._copiedName}`, this.x, this.y + 5);
     }
   }
 }

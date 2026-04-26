@@ -65,6 +65,21 @@ export function rangeLabel(r) {
   return 'Sniper';
 }
 
+// Card damage label — shows the EFFECTIVE total damage when a card has
+// scaling effects (multi-hit, multiple pulses, dynamic-from-tempo, etc).
+// Without this the UI shows the per-tick damage and players don't know
+// the card hits for 3× that. Used wherever a card is rendered (hand,
+// shop, draft, stats, upgrade preview).
+export function damageLabel(def) {
+  if (!def) return '';
+  if (def.tempoBlade) return 'TEMPO DMG';
+  if (def.ironRetort) return `${def.damage}+8/STK DMG`;
+  if (def.multiHit && def.multiHit > 1) return `${def.damage}×${def.multiHit} DMG`;
+  if (def.pulses && def.pulses > 1)   return `${def.damage}×${def.pulses} DMG`;
+  if (def.damage > 0) return `${def.damage} DMG`;
+  return '';
+}
+
 // ── Color Palette ────────────────────────────────────────────────
 export const PAL = {
   COLD:       '#4a9eff',
@@ -895,11 +910,15 @@ export class UI {
         ctx.font = 'bold 11px monospace';
         ctx.fillText(def.type.toUpperCase(), x + CARD_W / 2, y + 70);
 
-        // Damage (prominent so the player knows what each card hits for)
-        if (def.damage > 0) {
+        // Damage (prominent so the player knows what each card hits for).
+        // damageLabel handles multi-hit / pulse / tempo-scaling so the
+        // visible number matches the card's actual output, not just the
+        // per-tick value.
+        const _dmgLbl = damageLabel(def);
+        if (_dmgLbl) {
           ctx.fillStyle = canAfford ? '#ff8855' : '#553322';
           ctx.font = 'bold 13px monospace';
-          ctx.fillText(`${def.damage} DMG`, x + CARD_W / 2, y + 84);
+          ctx.fillText(_dmgLbl, x + CARD_W / 2, y + 84);
         }
         // Range — abstract label, not raw pixels
         ctx.fillStyle = canAfford ? '#888' : '#444';
@@ -1185,10 +1204,11 @@ export class UI {
     ctx.font = '11px monospace';
     ctx.fillText((def.tempoShift > 0 ? '+' : '') + def.tempoShift + ' Tempo', tx + TW / 2, ty + 62);
 
-    if (def.damage > 0) {
+    const _draftDmg = damageLabel(def);
+    if (_draftDmg) {
       ctx.fillStyle = '#ff9988';
       ctx.font = 'bold 13px monospace';
-      ctx.fillText(`${def.damage} DMG  ·  ${rangeLabel(def.range)}`, tx + TW / 2, ty + 82);
+      ctx.fillText(`${_draftDmg}  ·  ${rangeLabel(def.range)}`, tx + TW / 2, ty + 82);
     }
 
     ctx.fillStyle = rarCol;
@@ -1726,10 +1746,11 @@ export class UI {
       ctx.fillStyle = def.tempoShift > 0 ? PAL.HOT : PAL.COLD;
       ctx.font = '14px monospace';
       ctx.fillText(`${def.tempoShift > 0 ? '+' : ''}${def.tempoShift} Tempo`, x + CARD_W / 2, y + 107);
-      if (def.damage > 0) {
+      const _shopDmg = damageLabel(def);
+      if (_shopDmg) {
         ctx.fillStyle = '#ff9988';
         ctx.font = '14px monospace';
-        ctx.fillText(`${def.damage} DMG`, x + CARD_W / 2, y + 125);
+        ctx.fillText(_shopDmg, x + CARD_W / 2, y + 125);
       }
       if (def.hpCost || def.selfDamage || def.cursed) {
         ctx.fillStyle = '#ff4455';
@@ -2135,7 +2156,7 @@ export class UI {
       ctx.fillText(cardGlyph(def.type), x + CARD_W - 20, y + 26);
       ctx.fillStyle = '#ff8855';
       ctx.font = 'bold 18px monospace';
-      ctx.fillText(`${def.damage} DMG`, x + CARD_W / 2, y + 62);
+      ctx.fillText(damageLabel(def) || '0 DMG', x + CARD_W / 2, y + 62);
       ctx.fillStyle = '#44aaff';
       ctx.font = '15px monospace';
       ctx.fillText(`${def.cost} AP  ·  ${rangeLabel(def.range)}`, x + CARD_W / 2, y + 84);

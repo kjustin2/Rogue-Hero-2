@@ -2561,6 +2561,16 @@ events.on('PHASE_TRANSITION', ({ phase }) => {
   slowMoScale = 0.1;
 });
 
+// Archivist-only: amplify the "I just copied your card" tell. The boss
+// emits this every time CARD_PLAYED fires on its watch, so the timing is
+// 1:1 with the play. Without an obvious pop here players didn't realise
+// what was being mirrored back at them in the next telegraph window.
+events.on('ENEMY_COPIED_CARD', ({ x, y, name }) => {
+  particles.spawnDamageNumber(x, y, `STOLEN: ${name}`);
+  if (particles.spawnBurst) particles.spawnBurst(x, y, '#cc88ff');
+  events.emit('SCREEN_SHAKE', { duration: 0.12, intensity: 0.2 });
+});
+
 events.on('ZONE_TRANSITION', ({ oldZone, newZone }) => {
   particles.spawnZonePulse(tempo.stateColor());
   particles.spawnStateLabel(newZone, tempo.stateColor());
@@ -4951,14 +4961,20 @@ function update(logicDt, realDt) {
       events.emit('PLAY_SOUND', 'miss');
     } else {
       const cardId = deckManager.hand[selectedCardSlot];
-      if (cardId) {
+      // '__wide' is the placeholder slot of a 2-wide card — clicking it
+      // returns null from getCardDef and used to crash on def.cost. Quiet
+      // skip; the actual card lives in the slot to the left.
+      if (cardId && cardId !== '__wide') {
         const def = deckManager.getCardDef(cardId);
+        if (!def) {
+          events.emit('PLAY_SOUND', 'miss');
+        }
         // Downed players are restricted to the same cost ceiling P2 already
         // honoured (see player.canPlayCardWhileDowned). Without this gate,
         // P1 in co-op could keep spamming any card after going down — which
         // both broke the design intent and confused the peer (who could
         // see traps / orbs / damage spawn from the downed ally).
-        if (player.downed && !player.canPlayCardWhileDowned(def)) {
+        else if (player.downed && !player.canPlayCardWhileDowned(def)) {
           particles.spawnDamageNumber(player.x, player.y - 30, 'DOWNED!');
           events.emit('PLAY_SOUND', 'miss');
         } else if (player.budget >= def.cost) {
@@ -4986,9 +5002,12 @@ function update(logicDt, realDt) {
       if (p2v && p2v.mouse.justClicked && p2.alive && !p2.downed && !p2.silenced) {
         p2v.mouse.justClicked = false;
         const cardId2 = deckManager.hand[selectedCardSlotP2];
-        if (cardId2) {
+        // Same '__wide' / null-def guard as the P1 path above.
+        if (cardId2 && cardId2 !== '__wide') {
           const def2 = deckManager.getCardDef(cardId2);
-          if (p2.budget >= def2.cost) {
+          if (!def2) {
+            events.emit('PLAY_SOUND', 'miss');
+          } else if (p2.budget >= def2.cost) {
             combat.executeCard(p2, def2, p2v.mouse);
             runStats.cardsPlayed++;
             if (def2.type !== 'echo') _lastCardPlayed = def2;
@@ -5472,6 +5491,11 @@ function update(logicDt, realDt) {
   // Channel: handle while mouse held
   if (channelState && input.mouse.leftDown) {
     const ch = channelState;
+    // Defensive: if the channel was started with a card def that has since
+    // been cleared (e.g. deck wipe / replace mid-channel), bail out cleanly
+    // instead of crashing on ch.def.apDrainRate.
+    if (!ch.def) { channelState = null; }
+    else {
     ch.apTimer = (ch.apTimer || 0) + logicDt;
     ch.tickTimer = (ch.tickTimer || 0) + logicDt;
     // AP drain
@@ -5486,6 +5510,7 @@ function update(logicDt, realDt) {
     if (channelState && ch.tickTimer >= tickRate) {
       ch.tickTimer -= tickRate;
       _fireChannelTick(ch, ch.dmgMult);
+    }
     }
   } else if (!input.mouse.leftDown) {
     channelState = null;

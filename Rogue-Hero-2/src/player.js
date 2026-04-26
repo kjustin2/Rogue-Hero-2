@@ -131,8 +131,12 @@ export class Player extends Entity {
           const hasMovement = this.vx !== 0 || this.vy !== 0;
           if (preferMovement && hasMovement) {
             const len = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-            this.vx = (this.vx / len) * spd * 2.5;
-            this.vy = (this.vy / len) * spd * 2.5;
+            // len > 0 guards against vx/vy summing to a sub-EPSILON length
+            // that would NaN the velocity through 0/0.
+            if (len > 0) {
+              this.vx = (this.vx / len) * spd * 2.5;
+              this.vy = (this.vy / len) * spd * 2.5;
+            }
           } else {
             const dmx = input.mouse.x - this.x, dmy = input.mouse.y - this.y;
             const dist = Math.sqrt(dmx * dmx + dmy * dmy);
@@ -141,8 +145,10 @@ export class Player extends Entity {
               this.vy = (dmy / dist) * spd * 2.5;
             } else if (hasMovement) {
               const len = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
-              this.vx = (this.vx / len) * spd * 2.5;
-              this.vy = (this.vy / len) * spd * 2.5;
+              if (len > 0) {
+                this.vx = (this.vx / len) * spd * 2.5;
+                this.vy = (this.vy / len) * spd * 2.5;
+              }
             }
           }
           events.emit('DODGE');
@@ -241,6 +247,18 @@ export class Player extends Entity {
 
   draw(ctx, tempo) {
     if (!this.alive) return;
+    // Defensive: a single bad frame (NaN from divide-by-zero somewhere in
+    // movement/knockback) used to wedge the loop forever — animated body
+    // cosmetics (e.g. body_lava's createRadialGradient) throw on non-finite
+    // input and the next frame inherits the same NaN. Clamp here so the
+    // game can recover, and warn once for the postmortem.
+    if (!Number.isFinite(this.x) || !Number.isFinite(this.y) || !Number.isFinite(this.r) || this.r <= 0) {
+      if (!this._naNWarned) { console.warn('[Player] non-finite coords detected, resetting to canvas centre'); this._naNWarned = true; }
+      this.x = (window.CANVAS_W || 960) / 2;
+      this.y = (window.CANVAS_H || 720) / 2;
+      this.r = 14;
+      this.vx = 0; this.vy = 0;
+    }
     const eq = window._equippedCosmetics;
     const t = performance.now() / 1000;
 

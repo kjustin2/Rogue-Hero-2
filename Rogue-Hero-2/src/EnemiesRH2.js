@@ -234,9 +234,16 @@ export class StaticHound extends Enemy {
 // 3 phases: chase / spawn clones / "controls invert" (8 s window)
 export class BossHollowKing extends Enemy {
   constructor(x, y) {
-    super(x, y, 28, 350, 'boss_hollow_king');
+    // F4 boss. Tuning history: 350 → 800 HP earlier; this revision
+    // amplifies aggression instead of HP. The fight should *feel* like a
+    // king relentlessly closing distance and summoning clones, not a
+    // damage sponge.
+    super(x, y, 28, 800, 'boss_hollow_king');
     this.phase = 1;
-    this.cloneSpawnTimer = 5;
+    this.cloneSpawnTimer = 3;       // first summon arrives sooner
+    this.lungeTimer = 4.5;          // P2+ lunge dash on a separate cadence
+    this._lungeCharge = 0;          // 0 = idle, >0 = charging telegraph
+    this._lungeDir = { x: 1, y: 0 };
   }
   updateLogic(dt, player, tempo, roomMap) {
     if (!this.alive) return;
@@ -254,28 +261,88 @@ export class BossHollowKing extends Enemy {
 
     const dx = player.x - this.x, dy = player.y - this.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > 60) {
-      const spd = (this.phase === 3 ? 220 : 140) * this.spdMult();
-      this.x += (dx / dist) * spd * dt;
-      this.y += (dy / dist) * spd * dt;
-    } else if (this.attackCooldown <= 0) {
-      events.emit('ENEMY_MELEE_HIT', { damage: 2, source: this });
-      this.attackCooldown = 0.9;
+
+    // Lunge attack (phase 2+): charge for 0.5 s, then sprint forward in
+    // a straight line for 0.35 s at high speed. Big tell, big damage on
+    // contact — the "I'm coming for you" payoff that the previous slow
+    // chase lacked.
+    if (this._lungeCharge > 0) {
+      this._lungeCharge -= dt;
+      if (this._lungeCharge <= 0) {
+        this._lungeActive = 0.35;
+        // Re-aim at the player at the moment of release; pre-release this
+        // is set when the charge starts so the player has ~0.5 s to dodge.
+      }
+    } else if (this._lungeActive > 0) {
+      const lspd = 520 * this.spdMult();
+      this.x += this._lungeDir.x * lspd * dt;
+      this.y += this._lungeDir.y * lspd * dt;
+      this._lungeActive -= dt;
+      // Hit-test along the lunge path.
+      if (dist < this.r + 30) {
+        events.emit('ENEMY_MELEE_HIT', { damage: 5, source: this });
+        events.emit('SCREEN_SHAKE', { duration: 0.25, intensity: 0.6 });
+        this._lungeActive = 0; // single-hit dash
+      }
+    } else {
+      // Regular pursuit. Faster baseline so the boss feels relentless even
+      // before P3 transition.
+      if (dist > 60) {
+        const spd = (this.phase === 3 ? 280 : (this.phase === 2 ? 195 : 160)) * this.spdMult();
+        this.x += (dx / dist) * spd * dt;
+        this.y += (dy / dist) * spd * dt;
+      } else if (this.attackCooldown <= 0) {
+        // Tighter melee cadence + heavier hits per phase. P3 swings ~1.7×/s.
+        events.emit('ENEMY_MELEE_HIT', { damage: this.phase >= 3 ? 4 : 3, source: this });
+        this.attackCooldown = this.phase >= 3 ? 0.55 : (this.phase === 2 ? 0.7 : 0.8);
+      }
+      // Charge a lunge from medium-far distance in P2+. Player sees the
+      // 0.5 s charge tell before the dash fires.
+      if (this.phase >= 2 && dist > 140 && dist < 480) {
+        this.lungeTimer -= dt;
+        if (this.lungeTimer <= 0) {
+          this.lungeTimer = this.phase >= 3 ? 3.5 : 4.5;
+          this._lungeCharge = 0.5;
+          const lDist = dist || 1;
+          this._lungeDir = { x: dx / lDist, y: dy / lDist };
+          events.emit('SCREEN_SHAKE', { duration: 0.15, intensity: 0.25 });
+          events.emit('PLAY_SOUND', 'sigil');
+        }
+      }
     }
 
     if (this.phase >= 2) {
       this.cloneSpawnTimer -= dt;
       if (this.cloneSpawnTimer <= 0) {
-        this.cloneSpawnTimer = 6;
-        events.emit('SPAWN_HOLLOW_CLONE', {
-          x: this.x + (Math.random() - 0.5) * 200,
-          y: this.y + (Math.random() - 0.5) * 200,
-        });
+        // Faster clone summons. In P3 the king is essentially summoning
+        // back-to-back.
+        this.cloneSpawnTimer = this.phase >= 3 ? 2.6 : 3.6;
+        // P3 spawns a pair to swarm the player while the king pursues.
+        const cloneCount = this.phase >= 3 ? 2 : 1;
+        for (let i = 0; i < cloneCount; i++) {
+          events.emit('SPAWN_HOLLOW_CLONE', {
+            x: this.x + (Math.random() - 0.5) * 220,
+            y: this.y + (Math.random() - 0.5) * 220,
+          });
+        }
       }
     }
     if (roomMap) { const c = roomMap.clamp(this.x, this.y, this.r); this.x = c.x; this.y = c.y; }
   }
-  drawBody(ctx, _l, _c, now) { super.drawBody(ctx, 'HOLLOW KING', '#660066', now); }
+  drawBody(ctx, _l, _c, now) {
+    // Lunge charge: bright crimson telegraph line so the dash has a
+    // visible "running start".
+    if (this._lungeCharge > 0) {
+      const t = 1 - this._lungeCharge / 0.5;
+      ctx.beginPath();
+      ctx.moveTo(this.x, this.y);
+      ctx.lineTo(this.x + this._lungeDir.x * (60 + t * 220), this.y + this._lungeDir.y * (60 + t * 220));
+      ctx.strokeStyle = `rgba(255,80,80,${0.4 + t * 0.5})`;
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    }
+    super.drawBody(ctx, 'HOLLOW KING', '#660066', now);
+  }
 }
 
 // ── BOSS: VAULT ENGINE ─────────────────────────────────────────────
@@ -289,6 +356,11 @@ export class BossVaultEngine extends Enemy {
       { angle: Math.PI, hp: 1 }, { angle: 3 * Math.PI / 2, hp: 1 },
     ];
     this.cycleTimer = 0;
+    // Drift target: a slot the boss tries to reach so it actively pursues
+    // the closest player instead of sitting at spawn waiting for someone
+    // to come to it. Repicked when reached or every ~2 s.
+    this._driftTarget = { x, y };
+    this._driftRepick = 0;
   }
   updateLogic(dt, player, _tempo, roomMap) {
     if (!this.alive) return;
@@ -312,6 +384,34 @@ export class BossVaultEngine extends Enemy {
         if (dx * dx + dy * dy < PULSE_RADIUS * PULSE_RADIUS) {
           events.emit('ENEMY_MELEE_HIT', { damage: 2, source: this, target: p });
         }
+      }
+    }
+    // Movement: pursue the nearest live player at a slow drift speed so
+    // the pulse zone stays threatening even if the players try to camp at
+    // long range. Pre-fix Vault Engine just sat at spawn — players could
+    // chip from outside the 220 px pulse forever.
+    const all = (window._players && window._players.list) || [player];
+    let target = null, bestD2 = Infinity;
+    for (const p of all) {
+      if (!p || !p.alive || p.downed) continue;
+      const dx = p.x - this.x, dy = p.y - this.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD2) { bestD2 = d2; target = p; }
+    }
+    if (target) {
+      const dx = target.x - this.x, dy = target.y - this.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      // Aggressive pursuit. Pre-buff the engine drifted at 70 px/s which
+      // still let players outpace it; 200 px/s is below most player base
+      // speeds (~290) so kiting is still possible, but the pulse zone now
+      // has real reach. Sprints harder when far away.
+      const baseSpd = dist > 320 ? 240 : 200;
+      const spd = baseSpd * this.spdMult();
+      // Stop closing inside 110 px — prevents the boss from glueing to a
+      // single player, which would make ranged kiting impossible.
+      if (dist > 110) {
+        this.x += (dx / dist) * spd * dt;
+        this.y += (dy / dist) * spd * dt;
       }
     }
     if (roomMap) { const c = roomMap.clamp(this.x, this.y, this.r); this.x = c.x; this.y = c.y; }
@@ -342,9 +442,21 @@ export class BossVaultEngine extends Enemy {
 // Telegraphs gravity wells centered on random alive players.
 export class BossAurora extends Enemy {
   constructor(x, y) {
-    super(x, y, 40, 600, 'boss_aurora');
-    this.wellTimer = 0;
+    // F5 (final) boss — pre-fix the wells fired ENEMY_MELEE_HIT WITHOUT
+    // checking whether the player was inside the circle, so the telegraph
+    // was meaningless ("hits me whether I'm in or out"). Also nerfed HP
+    // 600 → 480 since the broken telegraph was forcing players into mash
+    // builds to outpace it. Damage tuned to match the now-meaningful
+    // dodgeability.
+    super(x, y, 40, 480, 'boss_aurora');
+    this.wellTimer = 1.0;          // initial breathing room before first well
+    this.wellPeriod = 2.8;
+    this.wellDmg = 5;
     this.wells = [];
+    // Telegraph timing constants — exposed so the draw step can render a
+    // matching "fill" animation that grows as the well approaches detonate.
+    this.WELL_TELEGRAPH = 1.6;
+    this.WELL_RADIUS = 90;
   }
   updateLogic(dt, player, _tempo, roomMap) {
     if (!this.alive) return;
@@ -353,18 +465,41 @@ export class BossAurora extends Enemy {
     if (this.staggerTimer > 0) { this.staggerTimer -= dt; return; }
     this.wellTimer -= dt;
     if (this.wellTimer <= 0) {
-      this.wellTimer = 2.5;
+      this.wellTimer = this.wellPeriod;
       const _all = (window._players && window._players.list) || [player];
       const _standing = _all.filter(p => p && p.alive && !p.downed);
-      const ps = _standing.length ? _standing : _all; // fall back if everyone is downed
+      const ps = _standing.length ? _standing : _all;
       const target = ps[Math.floor(Math.random() * ps.length)];
-      if (target && target.alive) this.wells.push({ x: target.x, y: target.y, t: 1.6, r: 90 });
+      if (target && target.alive) {
+        this.wells.push({
+          x: target.x, y: target.y,
+          t: this.WELL_TELEGRAPH,
+          r: this.WELL_RADIUS,
+          // Lock in target colour so we can paint a personalised marker; helps
+          // 4P parties tell which player is the focus of an incoming well.
+          targetIdx: typeof target.playerIndex === 'number' ? target.playerIndex : 0,
+        });
+        events.emit('PLAY_SOUND', 'sigil');
+      }
     }
     for (let i = this.wells.length - 1; i >= 0; i--) {
       const w = this.wells[i];
       w.t -= dt;
       if (w.t <= 0) {
-        events.emit('ENEMY_MELEE_HIT', { damage: 3, source: this });
+        // Bug fix: only damage players ACTUALLY inside the well's radius.
+        // The pre-fix path emitted a generic ENEMY_MELEE_HIT that the global
+        // resolver routed to the local player regardless of position.
+        const _all = (window._players && window._players.list) || [player];
+        for (const p of _all) {
+          if (!p || !p.alive || p.downed) continue;
+          const ddx = p.x - w.x, ddy = p.y - w.y;
+          const tr = w.r + p.r;
+          if (ddx * ddx + ddy * ddy < tr * tr) {
+            events.emit('ENEMY_MELEE_HIT', { damage: this.wellDmg, source: this, target: p });
+          }
+        }
+        events.emit('SCREEN_SHAKE', { duration: 0.18, intensity: 0.35 });
+        events.emit('PLAY_SOUND', 'crash');
         this.wells.splice(i, 1);
       }
     }
@@ -376,11 +511,31 @@ export class BossAurora extends Enemy {
   }
   drawBody(ctx, _l, _c, now) {
     for (const w of this.wells) {
+      const total = this.WELL_TELEGRAPH;
+      const elapsed = total - w.t;
+      const tFrac = Math.max(0, Math.min(1, elapsed / total));
+      // Outer ring — boundary of the kill zone, drawn solid so it's
+      // unambiguous where the safe edge is.
       ctx.beginPath();
       ctx.arc(w.x, w.y, w.r, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(180,120,255,' + (0.3 + (1.6 - w.t) * 0.4) + ')';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = `rgba(220,150,255,${0.55 + tFrac * 0.4})`;
+      ctx.lineWidth = 3;
       ctx.stroke();
+      // Inner fill — grows from 0 → full as the well approaches detonation.
+      // Gives a clear "imminent" tell so the player knows when to clear.
+      ctx.beginPath();
+      ctx.arc(w.x, w.y, w.r * tFrac, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(180,80,255,${0.18 + tFrac * 0.35})`;
+      ctx.fill();
+      // Last 0.35s: cross-hair style danger flash.
+      if (w.t < 0.35) {
+        const flash = (Math.sin(now * 30) + 1) * 0.5;
+        ctx.beginPath();
+        ctx.arc(w.x, w.y, w.r - 4, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255,80,180,${0.6 + flash * 0.4})`;
+        ctx.lineWidth = 5;
+        ctx.stroke();
+      }
     }
     super.drawBody(ctx, 'AURORA', '#cc88ff', now);
   }

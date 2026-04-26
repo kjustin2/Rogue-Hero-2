@@ -462,8 +462,10 @@ export class CombatManager {
           player.x += (dx / dist) * (dist - safeStop);
           player.y += (dy / dist) * (dist - safeStop);
         }
-        // Dash-through (BUG-02): overshoot to far side of enemy
-        if (cardDef.dashThrough) {
+        // Dash-through (BUG-02): overshoot to far side of enemy. dist > 0
+        // guard prevents NaN-poisoning player.x/y when player and enemy
+        // happen to be exactly coincident (this used to wedge rendering).
+        if (cardDef.dashThrough && dist > 0) {
           player.x += (dx / dist) * (nearest.r * 2 + player.r * 2 + 20);
           player.y += (dy / dist) * (nearest.r * 2 + player.r * 2 + 20);
         }
@@ -799,6 +801,11 @@ export class CombatManager {
     const len = Math.sqrt(dx * dx + dy * dy) || 1;
     const nx = dx / len, ny = dy / len;
     const beamWidth = cardDef.beamWidth || 8;
+    // Bug fix: beams used to ignore cardDef.range entirely — Sun Lance
+    // (range 280) and Pact Beam (range 360) were happily hitting enemies
+    // 700+ px away. Clamp the projection at the card's range so a "Mid"-
+    // range beam can't snipe across the room.
+    const beamRange = cardDef.range || 900;
 
     // For tempo_blade: damage = current Tempo value
     const dmg = cardDef.tempoBlade
@@ -812,6 +819,10 @@ export class CombatManager {
       const ex = e.x - px, ey = e.y - py;
       const proj = ex * nx + ey * ny;
       if (proj < 0) continue;
+      // Range gate: enemy centre must be within the beam's reach (with a
+      // small allowance for enemy radius so a half-overlapping target at
+      // the edge still counts).
+      if (proj > beamRange + e.r) continue;
       const perpDist = Math.abs(ex * ny - ey * nx);
       if (perpDist < e.r + beamWidth) hitList.push({ e, proj });
     }
@@ -830,10 +841,11 @@ export class CombatManager {
       if (!cardDef.beamPierce) break;
     }
 
-    // Visual: beam line flash via particles
+    // Visual: beam line flash via particles. Length matches actual range so
+    // the on-screen beam doesn't visually extend past where it can hit.
     events.emit('SPAWN_BEAM_FLASH', {
       x1: px, y1: py,
-      x2: px + nx * 900, y2: py + ny * 900,
+      x2: px + nx * beamRange, y2: py + ny * beamRange,
       color: cardColor, width: beamWidth
     });
 

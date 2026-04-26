@@ -836,8 +836,8 @@ export const CardDefinitions = {
   },
   shrapnel: {
     id: 'shrapnel', name: 'Shrapnel', cost: 1, tempoShift: 10, rarity: 'rare',
-    damage: 5, range: 100, type: 'utility', color: '#aa8833',
-    desc: 'Detonate any of your turrets — 80r AoE 14 dmg.',
+    damage: 14, range: 100, type: 'utility', color: '#aa8833',
+    desc: 'Detonate any of your turrets — 80r AoE.',
     bonusCard: true
   },
   iron_oath: {
