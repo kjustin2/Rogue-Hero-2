@@ -1088,14 +1088,7 @@ net.on('evt', (msg, senderPeerId) => {
         targetPlayerIdx !== player.playerIndex) return;
     const dmg = msg.damage || p?.damage || 0;
     if (dmg > 0 && player && player.alive) {
-      // Apply difficulty multiplier locally (host uses their own; we use ours
-      // — after GAME_STARTED they're in sync).
-      const scaled = Math.round(dmg * (DIFFICULTY_MODS[selectedDifficulty]?.dmgMult || 1));
-      player.takeDamage(scaled);
-      particles.spawnKillFlash('#ff2222');
-      events.emit('HIT_STOP', 0.08);
-      events.emit('SCREEN_SHAKE', { duration: 0.2, intensity: 0.4 });
-      renderer.triggerCA();
+      _applyForwardedDamage(player, dmg);
     }
 
   } else if (type === 'SPAWN_BEAM_FLASH'
@@ -1860,8 +1853,15 @@ function _hostAssignPeerIndex(peerId) {
   if (_peerToIndex.has(peerId)) return;
   const used = new Set([0, ..._peerToIndex.values()]);
   for (let i = 1; i <= 3; i++) {
-    if (!used.has(i)) { _peerToIndex.set(peerId, i); break; }
+    if (!used.has(i)) { _peerToIndex.set(peerId, i); return; }
   }
+  // No free slot — happens if a 5th peer reaches the connect handler past
+  // the 4-player cap. Log so the silent-no-assign case is visible; the
+  // PEER_INDEX_ASSIGN broadcast will skip them and main.js will fall back
+  // to the "first remote" lookup. Also defensively kick the extra peer so
+  // their _isRemote placeholder doesn't linger un-routable.
+  console.warn('[MP] No free peer index for', peerId, '— exceeds 4-player cap, ignoring');
+  try { net._cfRemovePeer?.(peerId); } catch {}
 }
 function _hostBroadcastPeerIndices() {
   if (net.role !== 'host' || net.peers.size === 0) return;
@@ -2291,6 +2291,76 @@ events.on('PLAYER_SHOT_HIT', ({ enemy, damage, freeze, clusterAoE, executeLowSho
     }
   }
 });
+
+// Apply damage forwarded from the host's PLAYER_HIT message to the local
+// player. Mirrors the passive/sigil/undying/last-rites pipeline that the
+// local ENEMY_MELEE_HIT path runs — without this the client took raw damage
+// and bypassed Iron Guard, Cold Damage Reduction, Blood Rune sigils, Wraith
+// Undying, and Last Rites. Parry is intentionally skipped — by the time the
+// PLAYER_HIT message arrives, the parry window has already closed locally.
+function _applyForwardedDamage(tgt, rawDamage) {
+  if (!tgt || !tgt.alive || rawDamage <= 0) return;
+  // Difficulty multiplier (host uses theirs; we use ours — kept in sync via
+  // GAME_STARTED so this matches the host's intended damage value).
+  let damage = Math.round(rawDamage * (DIFFICULTY_MODS[selectedDifficulty]?.dmgMult || 1));
+  // Blood Rune sigil trigger
+  if (tgt === player) {
+    for (let si = sigils.length - 1; si >= 0; si--) {
+      if (sigils[si].def.sigilTrigger === 'takeDamage' && !sigils[si].triggered) {
+        sigils[si].triggered = true;
+        tgt.heal(2);
+        tempo._add(30);
+        particles.spawnDamageNumber(tgt.x, tgt.y - 40, 'BLOOD RUNE!');
+        particles.spawnBurst(tgt.x, tgt.y, '#ff2255');
+      }
+    }
+  }
+  const charId = tgt._charId || selectedCharId;
+  const passives = Characters[charId]?.passives;
+  if (passives?.coldDamageReduction && tempo.value < 30) {
+    damage = Math.round(damage * (1 - passives.coldDamageReduction));
+  }
+  if (passives?.ironGuard && tgt.guardStacks > 0) {
+    const reduction = Math.min(damage, passives.guardDamageReduction || 2);
+    damage = Math.max(0, damage - reduction);
+    tgt.guardStacks--;
+    tgt._guardDecayTimer = 0;
+    particles.spawnDamageNumber(tgt.x, tgt.y - 20, 'GUARD');
+  }
+  tgt.takeDamage(damage);
+  if (passives?.ironGuard && damage > 0) {
+    if (tgt.guardStacks === undefined) tgt.guardStacks = 0;
+    tgt.guardStacks = Math.min(tgt.guardStacks + 1, passives.maxGuardStacks || 4);
+    tgt._guardDecayTimer = 0;
+  }
+  particles.spawnKillFlash('#ff2222');
+  events.emit('HIT_STOP', 0.08);
+  events.emit('SCREEN_SHAKE', { duration: 0.2, intensity: 0.4 });
+  renderer.triggerCA();
+  if (tgt !== player) return;
+  if (!player.alive) {
+    if (passives?.undying && !player._undyingUsed) {
+      player._undyingUsed = true;
+      player.hp = 1;
+      player.alive = true;
+      tempo._triggerAccidentalCrash();
+      particles.spawnCrashFlash();
+      particles.spawnDamageNumber(player.x, player.y - 40, 'UNDYING!');
+      return;
+    }
+    if (itemManager.onDeath(tempo.value, player)) {
+      console.log('[Items] Last Rites triggered — revived!');
+      return;
+    }
+    console.log(`[Event] Player DIED (forwarded) Floor ${runManager.floor}, ${roomsCleared} rooms`);
+    runStats.floor = runManager.floor;
+    runStats.finalDeck = [...deckManager.collection];
+    runStats.won = false;
+    checkRunUnlocks(false);
+    playerDeathTimer = 0.8;
+    input.clearFrame();
+  }
+}
 
 events.on('ENEMY_MELEE_HIT', ({ damage, source, target }) => {
   // RH2: route to the hit player (P1 or P2 in local co-op). Default to P1.
