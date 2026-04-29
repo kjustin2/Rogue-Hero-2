@@ -286,6 +286,7 @@ net.on('peer', (msg) => {
           _prepReadyByPeer.clear();
           _remoteMapVoteByPeer.clear();
           _remoteRestVoteByPeer.clear();
+          _pendingPhaseExit = null;
           selectedCharId = null;
           lobbyMode = 'menu';
           lobbyStatusMsg = '';
@@ -313,6 +314,7 @@ net.on('peer', (msg) => {
           _prepReadyByPeer.clear();
           _remoteMapVoteByPeer.clear();
           _remoteRestVoteByPeer.clear();
+          _pendingPhaseExit = null;
           // If the host was downed when the last ally vanished, no one can
           // revive them and _coopMode just flipped to false (so the wipe
           // detector ignores this player). Declare wipe immediately rather
@@ -326,6 +328,10 @@ net.on('peer', (msg) => {
         // rather than the roster silently shrinking.
         _peerLeaveBadge = { label: _leftLabel, t0: performance.now() / 1000 };
         _recomputeRemoteAggregates();
+        // If we were sitting at the phase-exit barrier waiting on the peer
+        // that just left, the remaining peers may already all be done — try
+        // resolving immediately so the screen doesn't stick.
+        _checkPhaseExit();
       }
       // Audio cue + screen shake so the disconnect is impossible to miss
       events.emit('PLAY_SOUND', 'crash');
@@ -478,6 +484,10 @@ net.on('evt', (msg, senderPeerId) => {
     roomsCleared++;
     audio.silenceMusic();
     _showScoreTicker();
+    // Mirror the host's per-room cosmetic gold reward. handleCombatClear runs
+    // only on host; without this the joined player would finish a full run
+    // with zero gold despite playing the whole session.
+    if (typeof msg.goldDelta === 'number') meta.addGold(msg.goldDelta);
     // Host consumes one RNG value for the floor-curse roll regardless of
     // difficulty (see handleCombatClear). Client MUST consume the same
     // value here or the RNG stream drifts, and every subsequent draft /
@@ -494,6 +504,16 @@ net.on('evt', (msg, senderPeerId) => {
       _pendingFloorBanner = runManager.floor;
     }
     if (msg.isVictory) {
+      // Host beat the final boss — mirror their victory state on the client.
+      // Without setting runStats.won = true, a client whose local player was
+      // downed/dead when the broadcast arrived would fall through to the
+      // "DEFEATED" overlay or land on the stats screen with won=false.
+      // Cancel any in-progress wipe / death timer so the victory screen
+      // can render uninterrupted.
+      runStats.won = true;
+      runStats.floor = (typeof msg.floor === 'number') ? msg.floor : runManager.floor;
+      runStats.finalDeck = [...deckManager.collection];
+      playerDeathTimer = 0;
       gameState = 'victory';
       _victoryAnimStart = null;
       _victoryReady = false;
@@ -531,6 +551,13 @@ net.on('evt', (msg, senderPeerId) => {
         if (particles.spawnFractureShards) particles.spawnFractureShards(e.x, e.y, e.color || '#ff8866');
       }
     }
+    // Joined players were missing per-kill cosmetic gold + kill-stat increments
+    // because the client never ran the 'KILL'-event listener path. Apply them
+    // directly here rather than re-emitting the event — re-emitting would
+    // also fire tempo.onKill() and any other listener which assumes the
+    // local player made the kill.
+    runStats.kills++;
+    meta.addGold(1);
 
   } else if (type === 'DAMAGE_DEALT' || type === 'DAMAGE_BATCH') {
     // Host receives damage events from clients and applies them authoritatively.
@@ -802,6 +829,15 @@ net.on('evt', (msg, senderPeerId) => {
         // RESYNC_COMBAT request below.
         if (msg.combatNode) currentCombatNode = msg.combatNode;
         net.sendReliable('evt', { type: 'RESYNC_COMBAT_REQUEST' });
+      } else if (targetState === 'cosmeticShop' || targetState === 'cosmeticPanel' ||
+                 targetState === 'tutorial' || targetState === 'charSelect' ||
+                 targetState === 'lobby' || targetState === 'intro') {
+        // Pre-game / per-machine UI screens have no networked meaning. If
+        // the host wandered into one (e.g. opened the cosmetic shop while
+        // a peer was in the lobby) we must NOT drag the client onto the
+        // same screen — that's the original "joined player's cosmetics
+        // opens when host opens" bug.
+        console.warn(`[Sync] ignored attempt to force-transition to pre-game state "${targetState}"`);
       } else {
         // victory / discard / unknown: best-effort transition.
         gameState = targetState;
@@ -851,6 +887,10 @@ net.on('evt', (msg, senderPeerId) => {
     // advances once EVERY peer has reported done (aggregated below).
     if (senderPeerId) _remotePhaseDoneByPeer.set(senderPeerId, true);
     _recomputeRemoteAggregates();
+    // If we've already cast our own PHASE_DONE and were waiting for peers,
+    // this incoming message may be the last one needed to resolve the
+    // barrier — try to advance now.
+    _checkPhaseExit();
 
   } else if (type === 'PREP_READY') {
     // Peer hit READY. Track per-peer so 3–4P waits for all clients; combat
@@ -1356,6 +1396,11 @@ let _localMapVote = null;
 let _remoteMapVote = null;
 let _remoteMapVoteByPeer = new Map();
 let _mapVoteFlash = 0; // brief celebration when the vote completes
+// PHASE_EXIT barrier — every decision phase (draft / itemReward / shop /
+// event / upgrade / discard) holds the local player on-screen after they've
+// picked until every peer has also committed. `_pendingPhaseExit.next` is
+// the gameState we'll transition to once the barrier resolves.
+let _pendingPhaseExit = null;
 // REST_VOTE / EVENT_VOTE — same idea, but on the choice made at a rest node
 // (heal / upgrade / fortify) or event (0 / 1 / 2). The resolved choice is
 // applied on both sides so players heal/buy/etc. in lock-step. This fixes
@@ -1945,6 +1990,46 @@ function _applyRestAction(action) {
     console.log('[Rest] Fortify buff set');
     gameState = 'map';
   }
+}
+
+// Decision-phase exit barrier. Called from every per-player pick handler in
+// place of a direct `gameState = ...` assignment. In solo, transitions
+// immediately. In MP, broadcasts PHASE_DONE, holds the local player on the
+// current screen with a "waiting for partner" overlay, and only transitions
+// once every peer has also reported done. Each player picks independently —
+// no vote comparison; this is a per-player barrier, not a shared vote.
+function _commitPhaseExit(nextState) {
+  if (!_isNetMp()) {
+    gameState = nextState;
+    return;
+  }
+  _pendingPhaseExit = { next: nextState };
+  _localPhaseDone = true;
+  net.sendReliable('evt', { type: 'PHASE_DONE' });
+  _checkPhaseExit();
+}
+function _checkPhaseExit() {
+  if (!_pendingPhaseExit) return;
+  if (!_isNetMp()) {
+    gameState = _pendingPhaseExit.next;
+    _pendingPhaseExit = null;
+    return;
+  }
+  for (const [pid] of net.peers) {
+    if (!_remotePhaseDoneByPeer.get(pid)) return;
+  }
+  const next = _pendingPhaseExit.next;
+  _pendingPhaseExit = null;
+  // Reset barrier flags so the NEXT decision phase (if any) starts fresh.
+  // Without this, a chained transition like draft→itemReward would inherit
+  // every peer's done flag from the just-resolved draft barrier, and the
+  // first pick on itemReward would skip the wait. Transitioning to 'map'
+  // is also fine — _syncNetPhase will re-set _localPhaseDone = true and
+  // re-broadcast PHASE_DONE on the map-entry path.
+  _localPhaseDone = false;
+  _remotePhaseDone = false;
+  _remotePhaseDoneByPeer.clear();
+  gameState = next;
 }
 
 // Deck state is PER-PLAYER. Draft / shop / discard / upgrade picks only
@@ -2800,6 +2885,9 @@ function _spawnEnemyFromSync(data) {
   if (typeof data.hp === 'number')    e.hp = data.hp;
   if (typeof data.maxHp === 'number') e.maxHp = data.maxHp;
   if (data.id) e.id = data.id;
+  // Mirror the host's wake-on-spawn so the client's local copy isn't stuck
+  // rendering an enemy in 'idle' pose if it ever falls back to local AI.
+  if (e.state === 'idle') e.state = 'chase';
   return e;
 }
 
@@ -2952,6 +3040,7 @@ function startNewRun(explicitSeed) {
   _localPhaseDone = true;
   _remotePhaseDone = true;
   _remotePhaseDoneByPeer.clear();
+  _pendingPhaseExit = null;
   _prepReadyLocal = false;
   _prepReadyRemote = false;
   _prepReadyByPeer.clear();
@@ -3149,6 +3238,14 @@ function spawnEnemies(node) {
     // Stable ID for KILL event sync — must match HostSim's scheme (e1, e2, …)
     if (!e.id) e.id = 'e' + _eid;
     _eid++;
+    // Wake the enemy so combat starts aggressive on the very first frame.
+    // Previously every enemy started in 'idle' and only flipped to 'chase'
+    // when the player walked inside their per-class detection range — which
+    // could be larger than half the room, leaving enemies frozen in corners
+    // until the player approached. Forcing 'chase' at spawn fixes that
+    // without breaking Phantom Ink (updateTimers still resets to 'idle'
+    // while the player is dodging with the relic equipped).
+    if (e.state === 'idle') e.state = 'chase';
   }
   // Dynamic-spawn ID allocator starts one past the last static ID so
   // Splitter children (and future mid-fight spawns) never collide with
@@ -3294,16 +3391,18 @@ function pickDraft(idx) {
   const cardId = draftChoices[idx];
   console.log(`[Draft] Picked "${cardId}"`);
   tryAddCard(cardId, () => {
-    // After draft — offer item reward every other room, upgrade every 3 rooms
+    // After draft — offer item reward every other room, upgrade every 3 rooms.
+    // Each chained transition fires its own per-player barrier; in MP the
+    // local player holds at the current screen until every peer commits.
     if (roomsCleared % 2 === 0) {
       itemChoices = itemManager.generateChoices(3, selectedCharId, players.count > 1);
-      if (itemChoices.length > 0) { gameState = 'itemReward'; ui.resetItemReward(); return; }
+      if (itemChoices.length > 0) { ui.resetItemReward(); _commitPhaseExit('itemReward'); return; }
     }
     if (roomsCleared > 0 && roomsCleared % 3 === 0) {
       upgradeChoices = deckManager.getUpgradeChoices();
-      if (upgradeChoices.length > 0) { gameState = 'upgrade'; return; }
+      if (upgradeChoices.length > 0) { _commitPhaseExit('upgrade'); return; }
     }
-    gameState = 'map';
+    _commitPhaseExit('map');
   });
 }
 
@@ -3390,10 +3489,14 @@ function handleCombatClear() {
   audio.silenceMusic();
   audio.playBGM('map');
 
-  // Gold reward for room clear
-  if (currentCombatNode && currentCombatNode.type === 'boss') meta.addGold(25);
-  else if (currentCombatNode && currentCombatNode.type === 'elite') meta.addGold(12);
-  else meta.addGold(5);
+  // Gold reward for room clear. The amount is captured locally and also
+  // forwarded in ROOM_CLEARED below so joined players in remote MP accrue
+  // the same cosmetic gold as the host (previously only the host hit this
+  // path, leaving clients with nothing).
+  let _roomClearGold = 5;
+  if (currentCombatNode && currentCombatNode.type === 'boss') _roomClearGold = 25;
+  else if (currentCombatNode && currentCombatNode.type === 'elite') _roomClearGold = 12;
+  meta.addGold(_roomClearGold);
 
   // IDEA-12: assign new curse for Brutal mode on floor advance.
   // NET: always consume the RNG value even below Brutal so host and client
@@ -3419,7 +3522,7 @@ function handleCombatClear() {
       audio.silenceMusic();
       // Tell clients the run is won
       if (net.role === 'host' && net.peers.size > 0) {
-        net.sendReliable('evt', { type: 'ROOM_CLEARED', isVictory: true, nextState: 'victory', floor: runManager.floor });
+        net.sendReliable('evt', { type: 'ROOM_CLEARED', isVictory: true, nextState: 'victory', floor: runManager.floor, goldDelta: _roomClearGold });
       }
       input.clearFrame();
       currentCombatNode = null;
@@ -3450,6 +3553,7 @@ function handleCombatClear() {
     if (net.role === 'host' && net.peers.size > 0) {
       net.sendReliable('evt', {
         type: 'ROOM_CLEARED', isVictory: false, nextState: gameState, floor: runManager.floor,
+        goldDelta: _roomClearGold,
         // Belt-and-suspenders RNG snap after curse roll / generateMap /
         // pickBiomeForFloor / generateDraft have all run on host. Any
         // accidental divergence during those is corrected here so the
@@ -3606,7 +3710,7 @@ function handleEvent(choiceIdx) {
     switch (choiceIdx) {
       case 0: // Free upgrade
         upgradeChoices = deckManager.getUpgradeChoices();
-        if (upgradeChoices.length > 0) { gameState = 'upgrade'; return; }
+        if (upgradeChoices.length > 0) { _commitPhaseExit('upgrade'); return; }
         break;
       case 1: // Forge warmth — heal 1 HP
         player.heal(1);
@@ -3642,7 +3746,7 @@ function handleEvent(choiceIdx) {
         break;
     }
   }
-  gameState = 'map';
+  _commitPhaseExit('map');
 }
 
 // RH2: out-of-combat healing (rest nodes, events) heals every alive LOCAL
@@ -3749,6 +3853,10 @@ function _broadcastLocalAp() {
 }
 
 function _syncNetPhase() {
+  // Frame-poll the phase-exit barrier — covers the case where a peer's
+  // PHASE_DONE arrived just before we cast our own and the receive handler's
+  // call to _checkPhaseExit found _pendingPhaseExit still null.
+  _checkPhaseExit();
   if (_prevSyncState === gameState) {
     // Defensive: if we're sitting on the map and somehow _localPhaseDone
     // is still false, re-signal done. Landing on map IS the signal that
@@ -3778,6 +3886,18 @@ function _syncNetPhase() {
     _localPhaseDone = false;
     _remotePhaseDone = false;
     _remotePhaseDoneByPeer.clear();
+    _pendingPhaseExit = null;
+  }
+  // Entering a decision phase from outside (map, combat) starts a fresh
+  // barrier — clear any stale done flags carried over from the previous map
+  // screen. Decision-state-to-decision-state transitions (draft→discard,
+  // draft→upgrade chain) intentionally DO NOT reset, because they're a
+  // continuation of the same player's pick within one barrier.
+  if (decisionPhases.includes(gameState) && !decisionPhases.includes(_prevSyncState)) {
+    _localPhaseDone = false;
+    _remotePhaseDone = false;
+    _remotePhaseDoneByPeer.clear();
+    _pendingPhaseExit = null;
   }
   // Entering prep clears OUR ready flag for this round. Per-peer ready
   // state is event-driven and only cleared in _startCombatNow — that
@@ -3806,7 +3926,12 @@ function _syncNetPhase() {
 }
 
 function update(logicDt, realDt) {
-  runStats.elapsedTime += realDt;
+  // Run timer freezes once the run has resolved — prevents the elapsed-time
+  // readout on the victory / stats / defeat screens from creeping upward
+  // while the player reads it.
+  if (gameState === 'playing' || gameState === 'paused') {
+    runStats.elapsedTime += realDt;
+  }
   // Detect screen transitions so menu handlers can snap the gamepad cursor
   // onto a sensible default on first frame. We snapshot the previous state
   // here before any handler runs, and refresh the tracker so next frame's
@@ -3891,10 +4016,16 @@ function update(logicDt, realDt) {
   }
 
   // RTT heartbeat + liveness probe. Host pings every 1 s during pre-run
-  // (lobby/charSelect) so a vanished peer is evicted within ~5 s; every
-  // 2 s during runs to save bandwidth. Receiver always echoes with PONG.
-  // Solo / no-peer skips entirely.
-  const _prerun = gameState === 'lobby' || gameState === 'charSelect';
+  // (lobby/charSelect/tutorial/cosmetics) so a vanished peer is evicted
+  // within ~5 s; every 2 s during runs to save bandwidth. Receiver always
+  // echoes with PONG. Solo / no-peer skips entirely.
+  // The cosmetic / tutorial screens MUST be classed as pre-run so the
+  // host's SYNC_HEARTBEAT (which broadcasts gameState) doesn't force the
+  // joined player into the host's cosmetic shop via SYNC_RESPONSE. Those
+  // are pre-game per-machine UIs and have no meaning across the network.
+  const _prerun = gameState === 'lobby' || gameState === 'charSelect'
+    || gameState === 'cosmeticShop' || gameState === 'cosmeticPanel'
+    || gameState === 'tutorial' || gameState === 'intro';
   if (net.role === 'host' && net.peers.size > 0) {
     _rttPingTimer -= realDt;
     if (_rttPingTimer <= 0) {
@@ -4692,8 +4823,10 @@ function update(logicDt, realDt) {
 
   // ── EVENT ──
   if (gameState === 'event') {
+    // Escape skips the event without taking any choice — must still go through
+    // the per-player barrier so peers don't desync.
     if (_gpHandleMenuNav(ui.eventBoxes)) { input.clearFrame(); return; }
-    if (input.consumeKey('escape')) { gameState = 'map'; input.clearFrame(); return; }
+    if (input.consumeKey('escape')) { _commitPhaseExit('map'); input.clearFrame(); return; }
     for (let i = 0; i < 3; i++) {
       if (input.consumeKey((i + 1).toString())) { handleEvent(i); break; }
     }
@@ -4709,13 +4842,15 @@ function update(logicDt, realDt) {
   if (gameState === 'shop') {
     // Include the Leave Shop button in the nav set so down from the card row
     // reaches it. handleShopClick still routes clicks by mouse position.
+    // Buying a card stays in shop (not gated). Only Leave / escape commits
+    // the per-player phase-exit barrier.
     const _shopNav = (ui.shopBoxes || []).slice();
     if (ui.leaveShopBox) _shopNav.push(ui.leaveShopBox);
     if (_gpHandleMenuNav(_shopNav)) { input.clearFrame(); return; }
-    if (input.consumeKey('escape') || input.consumeKey('enter')) { gameState = 'map'; input.clearFrame(); return; }
+    if (input.consumeKey('escape') || input.consumeKey('enter')) { _commitPhaseExit('map'); input.clearFrame(); return; }
     if (input.consumeClick()) {
       const cardId = ui.handleShopClick(input.mouse.x, input.mouse.y);
-      if (cardId === '__leave') { gameState = 'map'; input.clearFrame(); return; }
+      if (cardId === '__leave') { _commitPhaseExit('map'); input.clearFrame(); return; }
       else if (cardId && player.hp <= 1) {
         window._shopWarnUntil = performance.now() + 2200;
         window._shopWarnMsg = 'BUYING THIS CARD WOULD KILL YOU — REST FIRST';
@@ -4752,20 +4887,23 @@ function update(logicDt, realDt) {
           // Rest node burn: just remove, don't add a replacement
           console.log(`[Rest] Burned card "${discardId}"`);
           discardPendingCardId = null;
-          gameState = 'map';
+          _commitPhaseExit('map');
         } else {
           deckManager.addCard(discardPendingCardId);
           _broadcastDeckAdd(discardPendingCardId);
           shopCards = shopCards.filter(c => c !== discardPendingCardId); // BUG-08: remove from shop after discard
           console.log(`[Deck] Discarded "${discardId}", added "${discardPendingCardId}"`);
           if (window._discardCallback) {
+            // Callback (set by tryAddCard from draft / shop) handles the next
+            // chain step (itemReward / upgrade / map) and is responsible for
+            // calling _commitPhaseExit itself.
             const cb = window._discardCallback;
             window._discardCallback = null;
             discardPendingCardId = null;
             cb();
           } else {
             discardPendingCardId = null;
-            gameState = 'map';
+            _commitPhaseExit('map');
           }
         }
       }
@@ -4781,10 +4919,10 @@ function update(logicDt, realDt) {
     const _itemNav = (ui.itemBoxes || []).slice();
     if (ui.skipItemBox) _itemNav.push(ui.skipItemBox);
     if (_gpHandleMenuNav(_itemNav)) { input.clearFrame(); return; }
-    if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { gameState = 'map'; }
+    if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { _commitPhaseExit('map'); }
     if (input.consumeClick()) {
       const itemId = ui.handleItemClick(input.mouse.x, input.mouse.y);
-      if (itemId === '__skip') { gameState = 'map'; }
+      if (itemId === '__skip') { _commitPhaseExit('map'); }
       else if (itemId) {
         itemManager.add(itemId, player, tempo);
         runStats.itemsCollected++;
@@ -4792,9 +4930,9 @@ function update(logicDt, realDt) {
         // Check if upgrade is due
         if (roomsCleared > 0 && roomsCleared % 3 === 0) {
           upgradeChoices = deckManager.getUpgradeChoices();
-          if (upgradeChoices.length > 0) { gameState = 'upgrade'; input.clearFrame(); return; }
+          if (upgradeChoices.length > 0) { _commitPhaseExit('upgrade'); input.clearFrame(); return; }
         }
-        gameState = 'map';
+        _commitPhaseExit('map');
       }
     }
     input.clearFrame();
@@ -4808,16 +4946,16 @@ function update(logicDt, realDt) {
     const _upgNav = (ui.upgradeBoxes || []).slice();
     if (ui.skipUpgradeBox) _upgNav.push(ui.skipUpgradeBox);
     if (_gpHandleMenuNav(_upgNav)) { input.clearFrame(); return; }
-    if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { gameState = 'map'; }
+    if (input.consumeKey('enter') || input.consumeKey(' ') || input.consumeKey('escape')) { _commitPhaseExit('map'); }
     if (input.consumeClick()) {
       const cardId = ui.handleUpgradeClick(input.mouse.x, input.mouse.y);
-      if (cardId === '__skip') { gameState = 'map'; }
+      if (cardId === '__skip') { _commitPhaseExit('map'); }
       else if (cardId) {
         // Per-player upgrade — do NOT broadcast. See DECK_CARD_UPGRADED
         // comment in net.on('evt') for rationale.
         deckManager.upgradeCard(cardId);
         events.emit('PLAY_SOUND', 'upgrade');
-        gameState = 'map';
+        _commitPhaseExit('map');
       }
     }
     input.clearFrame();
@@ -8488,14 +8626,19 @@ function _renderInner() {
   // top regardless of which state-block early-returned. Don't re-add inline
   // copies here; doing so would double-draw them on states like 'playing'
   // that fall through to the post-frame pass.
-  // RH2 multiplayer: universal "partner is waiting on you" badge for any
-  // post-combat decision screen. Draws on top of draft / itemReward / shop /
-  // rest / event / discard / upgrade so the local player always knows the
-  // partner has finished and the run is held up on them.
+  // RH2 multiplayer: universal sync-barrier badge for any post-combat
+  // decision screen. Two states:
+  //   1. Local hasn't picked yet but partner has → "PARTNER IS WAITING".
+  //   2. Local picked (committed via _commitPhaseExit) and is holding for
+  //      remaining peers → "YOU'RE READY — WAITING FOR PARTNER".
   if (net.role !== 'solo' && net.peers.size > 0) {
     const decisionStates = ['draft','itemReward','shop','rest','event','discard','upgrade'];
-    if (decisionStates.includes(gameState) && _remotePhaseDone && !_localPhaseDone) {
-      _drawPartnerWaitingBadge(renderer.ctx, '⌛  PARTNER IS WAITING — MAKE YOUR CHOICE');
+    if (decisionStates.includes(gameState)) {
+      if (_pendingPhaseExit && !_remotePhaseDone) {
+        _drawPartnerWaitingBadge(renderer.ctx, '✓  YOU\'RE READY — WAITING FOR PARTNER');
+      } else if (_remotePhaseDone && !_localPhaseDone) {
+        _drawPartnerWaitingBadge(renderer.ctx, '⌛  PARTNER IS WAITING — MAKE YOUR CHOICE');
+      }
     }
   }
   // Post-fight scoreboard ticker — short pop in upper-right after a clear.

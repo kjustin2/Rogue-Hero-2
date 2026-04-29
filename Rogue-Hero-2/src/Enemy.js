@@ -1946,9 +1946,11 @@ export class BossApex extends Enemy {
       }
     }
 
-    // Phase 3: All attacks + summons — faster chase + faster ring volleys.
+    // Phase 3: All attacks + summons — final-fury chase speed (must clearly
+    // out-close phase 1's 175) + tighter ring-volley cadence so the
+    // wall-of-bullets pressure scales with the new closing speed.
     if (this.phase === 3) {
-      const spd = 165 * this.spdMult();
+      const spd = 240 * this.spdMult();
       if (dist > this.r + player.r) {
         this.x += (dx / dist) * spd * dt;
         this.y += (dy / dist) * spd * dt;
@@ -1958,7 +1960,7 @@ export class BossApex extends Enemy {
       }
       this.fireTimer -= dt;
       if (this.fireTimer <= 0) {
-        this.fireTimer = 1.0;
+        this.fireTimer = 0.7;
         if (this.projectileManager) {
           for (let i = 0; i < 8; i++) {
             const angle = (i / 8) * Math.PI * 2 + this._angle;

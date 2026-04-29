@@ -455,8 +455,14 @@ export class BossAurora extends Enemy {
     this.wells = [];
     // Telegraph timing constants — exposed so the draw step can render a
     // matching "fill" animation that grows as the well approaches detonate.
-    this.WELL_TELEGRAPH = 1.6;
+    // Faster detonate so each well in a burst feels punishing instead of
+    // glacial — the player has roughly one dodge worth of time to clear.
+    this.WELL_TELEGRAPH = 1.0;
     this.WELL_RADIUS = 90;
+    // Burst spawn count — wells per cadence tick. One per alive player plus
+    // 1–2 predicted-intercept wells, capped so the screen stays readable.
+    this.WELL_BURST_MAX = 5;
+    this.WELL_BURST_MIN = 4;
   }
   updateLogic(dt, player, _tempo, roomMap) {
     if (!this.alive) return;
@@ -469,18 +475,58 @@ export class BossAurora extends Enemy {
       const _all = (window._players && window._players.list) || [player];
       const _standing = _all.filter(p => p && p.alive && !p.downed);
       const ps = _standing.length ? _standing : _all;
-      const target = ps[Math.floor(Math.random() * ps.length)];
-      if (target && target.alive) {
-        this.wells.push({
-          x: target.x, y: target.y,
+      // Burst spawn: one personal well centered on each alive player, plus
+      // predicted-intercept wells that lead the player's movement so kiting
+      // a straight line gets punished. Reject candidates that overlap an
+      // already-placed well from this burst by < WELL_RADIUS * 1.3.
+      const burstWells = [];
+      const minSepSq = (this.WELL_RADIUS * 1.3) ** 2;
+      const _tryPlace = (px, py, targetIdx) => {
+        for (const w of burstWells) {
+          const dx = w.x - px, dy = w.y - py;
+          if (dx * dx + dy * dy < minSepSq) return false;
+        }
+        burstWells.push({
+          x: px, y: py,
           t: this.WELL_TELEGRAPH,
           r: this.WELL_RADIUS,
-          // Lock in target colour so we can paint a personalised marker; helps
-          // 4P parties tell which player is the focus of an incoming well.
-          targetIdx: typeof target.playerIndex === 'number' ? target.playerIndex : 0,
+          targetIdx,
         });
-        events.emit('PLAY_SOUND', 'sigil');
+        return true;
+      };
+      // 1) Personal wells.
+      for (const p of ps) {
+        if (!p || !p.alive) continue;
+        const idx = typeof p.playerIndex === 'number' ? p.playerIndex : 0;
+        _tryPlace(p.x, p.y, idx);
+        if (burstWells.length >= this.WELL_BURST_MAX) break;
       }
+      // 2) Predicted-intercept wells until we hit the burst minimum. Use the
+      // player's velocity if available; fall back to a random angular offset.
+      let _safety = 12;
+      while (burstWells.length < this.WELL_BURST_MIN && _safety-- > 0) {
+        const t = ps[Math.floor(Math.random() * ps.length)];
+        if (!t) break;
+        const idx = typeof t.playerIndex === 'number' ? t.playerIndex : 0;
+        const vx = (typeof t.vx === 'number' ? t.vx : 0);
+        const vy = (typeof t.vy === 'number' ? t.vy : 0);
+        let px, py;
+        if (vx * vx + vy * vy > 4) {
+          // Lead by ~0.4s of travel.
+          px = t.x + vx * 0.4;
+          py = t.y + vy * 0.4;
+        } else {
+          // Stationary — place the extra well just outside the personal one
+          // so a "hold the line" defender still has to step.
+          const a = Math.random() * Math.PI * 2;
+          const r = 110 + Math.random() * 60;
+          px = t.x + Math.cos(a) * r;
+          py = t.y + Math.sin(a) * r;
+        }
+        _tryPlace(px, py, idx);
+      }
+      for (const w of burstWells) this.wells.push(w);
+      if (burstWells.length > 0) events.emit('PLAY_SOUND', 'sigil');
     }
     for (let i = this.wells.length - 1; i >= 0; i--) {
       const w = this.wells[i];

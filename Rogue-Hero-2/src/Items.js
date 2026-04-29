@@ -16,7 +16,7 @@ export const ItemDefinitions = {
   last_rites:     { id: 'last_rites',     name: 'Last Rites',     rarity: 'rare',     color: '#ff2222', desc: 'On death: auto-crash if Tempo ≥ 50, revive at 1 HP. Once per run.' },
   cold_blood:     { id: 'cold_blood',     name: 'Cold Blood',     rarity: 'common',   color: '#6688ff', desc: 'Kills while Cold restore 1 HP (once per room)' },
   deadweight:     { id: 'deadweight',     name: 'Deadweight',     rarity: 'common',   color: '#888888', desc: '+3 Max HP, −10% speed. Pure tank.' },
-  volatile_soles: { id: 'volatile_soles', name: 'Volatile Soles', rarity: 'uncommon', color: '#ff6600', desc: 'Auto-crash burst radius +60%' },
+  volatile_soles: { id: 'volatile_soles', name: 'Volatile Soles', rarity: 'uncommon', color: '#ff6600', desc: 'Auto-crash deals +25% damage' },
   time_warp:      { id: 'time_warp',      name: 'Time Warp',      rarity: 'rare',     color: '#aaccff', desc: 'Perfect dodge slow-mo lasts 3× as long' },
   phantom_ink:    { id: 'phantom_ink',    name: 'Phantom Ink',    rarity: 'uncommon', color: '#bb88ff', desc: 'Invisible to enemy aggro while dodging' },
   void_shard:     { id: 'void_shard',     name: 'Void Shard',     rarity: 'uncommon', color: '#224488', desc: 'Your projectiles pierce through 1 extra enemy' },
@@ -92,12 +92,17 @@ export class ItemManager {
         break;
     }
 
-    // Recompute crash radius bonus
+    // Recompute crash radius bonus (Surge Coil) and crash damage bonus
+    // (Volatile Soles). The two relics intentionally occupy distinct levers
+    // in the same crash-buff family — radius vs. damage — so stacking is a
+    // meaningful build choice rather than a duplicate +60%-radius pick.
     if (tempo) {
-      let mult = 1.0;
-      if (this.has('surge_coil'))     mult *= 1.6;
-      if (this.has('volatile_soles')) mult *= 1.6;
-      tempo.modifiers.crashRadiusBonus = mult;
+      let radMult = 1.0;
+      if (this.has('surge_coil'))     radMult *= 1.6;
+      tempo.modifiers.crashRadiusBonus = radMult;
+      let dmgMult = 1.0;
+      if (this.has('volatile_soles')) dmgMult *= 1.25;
+      tempo.modifiers.crashDamageBonus = dmgMult;
     }
     // Recompute decay rate
     if (tempo) {

@@ -12,7 +12,8 @@ export class TempoSystem {
     this.modifiers = {
       decayRate: 1,
       gainMult: 1,
-      crashRadiusBonus: 1
+      crashRadiusBonus: 1,
+      crashDamageBonus: 1
     };
     // Class passives (set by main.js on run start)
     this.classPassives = null;
@@ -163,7 +164,7 @@ export class TempoSystem {
   _triggerAccidentalCrash() {
     if (this.isCrashed) return;
     const radius = 100 * this.modifiers.crashRadiusBonus;
-    const dmg = Math.round(this.damageMultiplier() * 2.5 * 10);
+    const dmg = Math.round(this.damageMultiplier() * 2.5 * 10 * (this.modifiers.crashDamageBonus || 1));
     events.emit('REQUEST_PLAYER_POS_CRASH', { radius, dmg, accidental: true });
     this._doCrash(0.2, 0.4, 1.0);
   }
